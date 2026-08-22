@@ -1,0 +1,71 @@
+{
+  "name": "unused18n",
+  "version": "0.1.0",
+  "description": "Type-aware unused i18next dictionary linter for TypeScript projects.",
+  "keywords": [
+    "i18n",
+    "i18next",
+    "typescript",
+    "static-analysis",
+    "cli",
+    "linter"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "unused18n": "bin/run.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "pnpm clean && tsc -p tsconfig.build.json",
+    "check": "pnpm lint-ci && pnpm test:types && pnpm test",
+    "clean": "node --input-type=module -e \"import fs from 'node:fs'; fs.rmSync('dist', { recursive: true, force: true })\"",
+    "format": "biome format --write .",
+    "lint": "biome check .",
+    "lint-ci": "biome ci .",
+    "lint-fix": "biome check --write --unsafe .",
+    "prepack": "pnpm build",
+    "test": "pnpm build && node --test test/*.test.mjs",
+    "test-types": "tsc --noEmit"
+  },
+  "oclif": {
+    "bin": "unused18n",
+    "commands": {
+      "strategy": "single",
+      "target": "./dist/index.js"
+    },
+    "dirname": "unused18n",
+    "exitCodes": {
+      "default": 2,
+      "failedFlagParsing": 2,
+      "failedFlagValidation": 2,
+      "nonExistentFlag": 2,
+      "requiredArgs": 2,
+      "unexpectedArgs": 2
+    }
+  },
+  "dependencies": {
+    "@oclif/core": "4.14.0",
+    "typescript": "^5.9.2"
+  },
+  "devDependencies": {
+    "@arthurfiorette/biomejs-config": "2.0.1",
+    "@biomejs/biome": "2.5.9",
+    "@types/node": "^24.3.0"
+  },
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=22.18"
+  }
+}

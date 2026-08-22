@@ -1,0 +1,6 @@
+node_modules
+dist
+coverage
+*.log
+/.oclif
+oclif.manifest.json
