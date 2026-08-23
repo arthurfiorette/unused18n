@@ -1,5 +1,5 @@
 import path from 'node:path';
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 import { readDictionary, unwrapAlias, unwrapExpression } from './dictionary.js';
 import { DictionaryIndex } from './dictionary-index.js';
 import { type LoadedProject, loadProject } from './project.js';

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 import { DiagnosticCode } from './diagnostic-codes.js';
 
 /** One compiler graph shared by diagnostics, semantic analysis, and optional fixes. */

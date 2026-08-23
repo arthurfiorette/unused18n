@@ -2,7 +2,7 @@
 
 Type-aware unused i18next dictionary linter for TypeScript projects.
 
-`unused18n` creates one TypeScript `Program`, follows translation aliases and finite key types, and emits source-located TypeScript diagnostics. It is ESM-only and requires Node.js 22.18 or newer.
+`unused18n` creates one TypeScript program, follows translation aliases and finite key types, and reports unused keys at their dictionary declarations. It is ESM-only and requires Node.js 24 or newer.
 
 ## Install
 
@@ -12,11 +12,41 @@ pnpm add --save-dev unused18n
 
 ## Usage
 
+Given a default-exported dictionary:
+
+```ts
+// src/i18n/en.ts
+
+export default {
+  common: {
+    save: 'Save',
+    cancel: 'Cancel'
+  }
+};
+```
+
+Run:
+
 ```sh
-pnpm unused18n \
-  --project ./tsconfig.json \
-  --dictionary ./src/i18n/pt.ts \
-  --export dictionary
+pnpm unused18n lint \
+  --project=./tsconfig.json \
+  --dictionary=./src/i18n/en.ts \
+  --export=default
+```
+
+Named exports work too:
+
+```ts
+export const dictionary = {
+  common: { save: 'Save' }
+};
+```
+
+```sh
+pnpm unused18n lint \
+  --project=./tsconfig.json \
+  --dictionary=./src/i18n/en.ts \
+  --export=dictionary
 ```
 
 Flags:
@@ -24,44 +54,139 @@ Flags:
 ```text
 -p, --project <path>        tsconfig.json or its directory
 -d, --dictionary <path>     TypeScript dictionary source file
--e, --export <name>         exported dictionary variable
+-e, --export <name>         named export, or "default" for the default export
     --max-expansions <n>    finite string-union expansion limit (default: 1000)
     --remove                remove every safely editable unused key
 ```
 
-The command exits with code `1` when unused keys remain or analysis produces an error. Dynamic keys that cannot be bounded statically are warning diagnostics but do not fail the command by themselves. Invalid flags exit with code `2`.
+Run `unused18n help` for command help or `unused18n autocomplete` to install shell completion for Bash, Zsh, or PowerShell. Completion-aware invocations use `unused18n lint`; bare `unused18n --flags` calls remain supported for compatibility.
 
-## Remove
+## Supported patterns
 
-`--remove` deletes unused object properties directly from the dictionary source. Edits are planned atomically, checked against the original text, and applied without printing the AST, so unrelated formatting and comments remain untouched.
+### Literals and finite keys
 
-Removal is refused when a key comes from an array, computed property, imported/shared object, spread, or ambiguous overwrite. If any unused key is unsafe, the file is left unchanged and the command exits `1` with an error diagnostic.
-
-## Diagnostics API
+Literal, conditional, asserted, concatenated, and finite template-literal keys are resolved:
 
 ```ts
-import { lint } from 'unused18n'
+const { t } = useTranslation();
 
-for (const diagnostic of lint({
-  project: './tsconfig.json',
-  dictionary: './src/i18n/pt.ts',
-  dictionaryExport: 'dictionary',
-})) {
-  // Every result is a standard TypeScript Diagnostic.
-  console.log(diagnostic)
+t('common.save');
+t(isEditing ? 'form.update' : 'form.create');
+t(apiKey as 'errors.notFound' | 'errors.unauthorized');
+
+function statusLabel(status: 'pending' | 'complete') {
+  return t(`status.${status}`);
 }
 ```
 
-The generator also yields tsconfig, compiler-option, and source syntax diagnostics before running dictionary analysis. Source edits happen only while the generator is consumed.
+Finite values can also flow through helpers, maps, indexed access, and reassigned local variables.
 
-## Supported Usage
+### Aliases, prefixes, and custom hooks
 
-- Literal, conditional, asserted, concatenated, and template-literal keys
-- Finite string unions inferred from parameters, helpers, maps, and indexed access
-- `useTranslation()` aliases, custom hooks, and `keyPrefix`
-- Direct `i18n.t()` calls and `<Trans i18nKey>`
-- Translation functions passed through helpers and wrappers
-- `returnObjects: true`, property access, destructuring, enumeration, and spreads
-- Direct dictionary access
+Hook aliases, destructured translators, `keyPrefix`, and wrappers around `useTranslation()` retain their translation provenance:
 
-Review unresolved runtime-key warnings before deleting related dictionary prefixes.
+```ts
+import { useTranslation as useI18n } from 'react-i18next';
+
+const { t: commonT } = useI18n(undefined, { keyPrefix: 'common' });
+commonT('save');
+
+function useCheckoutTranslation() {
+  return useI18n(undefined, { keyPrefix: 'checkout' });
+}
+
+const { t: checkoutT } = useCheckoutTranslation();
+checkoutT('title');
+```
+
+Custom hooks may return the translation result directly or expose the translator inside another object.
+
+### Components and forwarded translators
+
+`Trans` aliases and translation functions passed through typed helpers are followed:
+
+```tsx
+import { Trans as Message, useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
+
+const { t } = useTranslation();
+
+function translateButton(
+  translate: TFunction,
+  key: 'buttons.save' | 'buttons.cancel'
+) {
+  return translate(key);
+}
+
+translateButton(t, 'buttons.save');
+
+export function EmptyState() {
+  return <Message i18nKey='empty.title' />;
+}
+```
+
+### Object translations and dictionary access
+
+Object-returning translations track the properties that are actually consumed:
+
+```ts
+const dashboard = t('dashboard', {
+  returnObjects: true
+}) as typeof dictionary.dashboard;
+
+dashboard.title;
+const { description } = dashboard;
+```
+
+Direct dictionary access, destructuring, spreads, enumeration, and finite indexed access are also recognized:
+
+```ts
+dictionary.common.save;
+const { cancel } = dictionary.common;
+Object.keys(dictionary.categories);
+```
+
+Unbounded runtime keys produce source-located warnings. They do not hide unrelated unused keys.
+
+## Removing unused keys
+
+```sh
+pnpm unused18n lint \
+  --project=. \
+  --dictionary=./src/i18n/en.ts \
+  --export=default \
+  --remove
+```
+
+`--remove` plans all edits before changing the dictionary, verifies the original source text, and deletes properties without reprinting the AST. Unrelated formatting and comments remain untouched.
+
+Removal is refused when an unused key comes from an array, computed property, imported or shared object, unresolved spread, or ambiguous overwrite. If any requested edit is unsafe, the file remains unchanged.
+
+## Exit codes
+
+- `0`: no unused keys remain, or every requested removal succeeded
+- `1`: unused keys remain or analysis/removal produced an error
+- `2`: CLI arguments or flags are invalid
+- `127`: the requested Oclif command does not exist
+
+Unresolved runtime-key warnings alone do not fail the command.
+
+## Programmatic usage
+
+Use `lint()` when diagnostics need to be consumed by another tool instead of printed by the CLI:
+
+```ts
+import { DiagnosticCode, lint } from 'unused18n';
+
+for (const diagnostic of lint({
+  project: './tsconfig.json',
+  dictionary: './src/i18n/en.ts',
+  dictionaryExport: 'default'
+})) {
+  if (diagnostic.code === DiagnosticCode.UnusedKey) {
+    console.log(diagnostic.file?.fileName, diagnostic.messageText);
+  }
+}
+```
+
+`lint()` is a lazy generator. Consuming it loads the project, analyzes usage, and optionally applies `remove: true`. It yields standard TypeScript diagnostics, including project configuration and syntax errors that prevent safe analysis.

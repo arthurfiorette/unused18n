@@ -10,7 +10,18 @@
     "cli",
     "linter"
   ],
+  "homepage": "https://github.com/arthurfiorette/unused18n#readme",
+  "bugs": {
+    "url": "https://github.com/arthurfiorette/unused18n/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arthurfiorette/unused18n.git"
+  },
+  "funding": "https://github.com/arthurfiorette/unused18n?sponsor=1",
   "license": "MIT",
+  "author": "Arthur Fiorette <me@arthur.place>",
+  "sideEffects": false,
   "type": "module",
   "exports": {
     ".": {
@@ -21,16 +32,9 @@
   "bin": {
     "unused18n": "bin/run.js"
   },
-  "files": [
-    "bin",
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
   "scripts": {
     "build": "pnpm clean && tsc -p tsconfig.build.json",
-    "check": "pnpm lint-ci && pnpm test:types && pnpm test",
-    "clean": "node --input-type=module -e \"import fs from 'node:fs'; fs.rmSync('dist', { recursive: true, force: true })\"",
+    "check": "pnpm lint-ci && pnpm test-types && pnpm test",
     "format": "biome format --write .",
     "lint": "biome check .",
     "lint-ci": "biome ci .",
@@ -42,7 +46,8 @@
   "oclif": {
     "bin": "unused18n",
     "commands": {
-      "strategy": "single",
+      "identifier": "COMMANDS",
+      "strategy": "explicit",
       "target": "./dist/index.js"
     },
     "dirname": "unused18n",
@@ -53,19 +58,34 @@
       "nonExistentFlag": 2,
       "requiredArgs": 2,
       "unexpectedArgs": 2
-    }
+    },
+    "plugins": [
+      "@oclif/plugin-autocomplete",
+      "@oclif/plugin-help",
+      "@oclif/plugin-not-found",
+      "@oclif/plugin-warn-if-update-available"
+    ]
   },
   "dependencies": {
     "@oclif/core": "4.14.0",
-    "typescript": "^5.9.2"
+    "@oclif/plugin-autocomplete": "^3.2.56",
+    "@oclif/plugin-help": "^6.2.58",
+    "@oclif/plugin-not-found": "^3.2.93",
+    "@oclif/plugin-warn-if-update-available": "^3.1.73",
+    "@typescript/typescript6": "^6.0.2"
   },
   "devDependencies": {
-    "@arthurfiorette/biomejs-config": "2.0.1",
-    "@biomejs/biome": "2.5.9",
-    "@types/node": "^24.3.0"
+    "@arthurfiorette/biomejs-config": "^2.0.1",
+    "@biomejs/biome": "^2.5.10",
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
   },
-  "packageManager": "pnpm@10.33.2",
-  "engines": {
-    "node": ">=22.18"
+  "packageManager": "pnpm@11.23.0",
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "onFail": "error",
+      "version": ">=24.16"
+    }
   }
 }

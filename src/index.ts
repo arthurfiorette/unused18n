@@ -1,5 +1,5 @@
 import { Command, Flags } from '@oclif/core';
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 import { DiagnosticCode, lint } from './lint.js';
 
 const formatHost: ts.FormatDiagnosticsHost = {
@@ -13,8 +13,8 @@ export default class Unused18n extends Command {
     'Lint a TypeScript i18next dictionary and report keys without statically recoverable usage.';
 
   static override examples = [
-    '<%= config.bin %> --project ./tsconfig.json --dictionary ./src/i18n/pt.ts --export dictionary',
-    '<%= config.bin %> --project . --dictionary ./src/i18n/pt.ts --export dictionary --remove'
+    '<%= config.bin %> lint --project ./tsconfig.json --dictionary ./src/i18n/pt.ts --export dictionary',
+    '<%= config.bin %> lint --project . --dictionary ./src/i18n/pt.ts --export dictionary --remove'
   ];
 
   static override flags = {
@@ -28,6 +28,7 @@ export default class Unused18n extends Command {
       char: 'e',
       helpValue: '<name>',
       required: true,
+      default: 'default',
       summary: 'Exported dictionary variable name'
     }),
     'max-expansions': Flags.integer({
@@ -59,7 +60,9 @@ export default class Unused18n extends Command {
       maxExpansions: flags['max-expansions'],
       remove: flags.remove
     })) {
-      this.logToStderr(ts.formatDiagnosticsWithColorAndContext([diagnostic], formatHost).trimEnd());
+      this.logToStderr(
+        ts.formatDiagnosticsWithColorAndContext([diagnostic], formatHost).trimEnd()
+      );
       if (
         diagnostic.category === ts.DiagnosticCategory.Error ||
         diagnostic.code === DiagnosticCode.UnusedKey
@@ -71,6 +74,8 @@ export default class Unused18n extends Command {
     if (failed) this.exit(1);
   }
 }
+
+export const COMMANDS = { lint: Unused18n };
 
 export type { LintOptions } from './lint.js';
 export { DiagnosticCode, lint };

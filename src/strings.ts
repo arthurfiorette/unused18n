@@ -1,4 +1,4 @@
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 import { unwrapAlias, unwrapExpression } from './dictionary.js';
 
 export interface StringResolution {

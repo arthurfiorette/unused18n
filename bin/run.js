@@ -2,4 +2,7 @@
 
 import { execute } from '@oclif/core';
 
-await execute({ dir: import.meta.url });
+const argv = process.argv.slice(2);
+const args = argv[0] && !argv[0].startsWith('-') ? argv : ['lint', ...argv];
+
+await execute({ args, dir: import.meta.url });

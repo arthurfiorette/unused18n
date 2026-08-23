@@ -1,5 +1,5 @@
 import path from 'node:path';
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 
 /** A condition that prevents a source property from being removed without ambiguity. */
 export type DictionaryRemovalBarrier =
@@ -31,7 +31,7 @@ export interface DictionaryKeySource {
 /** The flattened dictionary and source provenance needed for read-only removal planning. */
 export interface DictionaryInfo {
   readonly sourceFile: ts.SourceFile;
-  readonly declaration: ts.VariableDeclaration;
+  readonly declaration: ts.VariableDeclaration | ts.ExportAssignment;
   readonly symbol: ts.Symbol;
   readonly type: ts.Type;
   /** Active flattened keys after spreads and later properties have overwritten earlier values. */
@@ -62,26 +62,17 @@ export function readDictionary(
 
   const symbol = unwrapAlias(checker, exported);
   if (!symbol) throw new Error(`Export "${exportName}" could not be resolved`);
-  const declaration = symbol.declarations?.find(ts.isVariableDeclaration);
-  if (!declaration?.initializer) {
-    throw new Error(`Export "${exportName}" must resolve to an initialized variable declaration`);
+  const variableDeclaration = symbol.declarations?.find(ts.isVariableDeclaration);
+  const exportAssignment = symbol.declarations?.find(ts.isExportAssignment);
+  const declaration = variableDeclaration ?? exportAssignment;
+  const initializer = variableDeclaration?.initializer ?? exportAssignment?.expression;
+  if (!declaration || !initializer) {
+    throw new Error(`Export "${exportName}" must resolve to an initialized dictionary expression`);
   }
 
   const keySources = new Map<string, DictionaryKeySource>();
-  flattenExpression(
-    declaration.initializer,
-    [],
-    [],
-    keySources,
-    checker,
-    sourceFile,
-    new Set(),
-    false
-  );
-  if (
-    keySources.size === 0 &&
-    !isDictionaryContainer(declaration.initializer, checker, new Set())
-  ) {
+  flattenExpression(initializer, [], [], keySources, checker, sourceFile, new Set(), false);
+  if (keySources.size === 0 && !isDictionaryContainer(initializer, checker, new Set())) {
     throw new Error(`Dictionary export "${exportName}" must resolve to an object or array`);
   }
 
@@ -89,7 +80,7 @@ export function readDictionary(
     sourceFile,
     declaration,
     symbol,
-    type: checker.getTypeAtLocation(declaration.name),
+    type: checker.getTypeAtLocation(initializer),
     keys: new Set(keySources.keys()),
     keySources
   };

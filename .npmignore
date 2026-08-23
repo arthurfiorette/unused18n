@@ -1,0 +1,7 @@
+*
+!bin/
+!bin/**
+!dist/
+!dist/**
+!LICENSE
+!README.md

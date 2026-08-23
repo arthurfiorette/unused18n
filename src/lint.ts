@@ -1,5 +1,5 @@
 import path from 'node:path';
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 import { analyzeLoadedProject } from './analyzer.js';
 import { DiagnosticCode } from './diagnostic-codes.js';
 import type { DictionaryKeySource } from './dictionary.js';

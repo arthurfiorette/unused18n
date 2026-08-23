@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 import { readDictionary } from '../dist/dictionary.js';
 import { applyDictionaryRemoval, planDictionaryRemoval } from '../dist/dictionary-removal.js';
 

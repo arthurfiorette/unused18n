@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
+import ts from '@typescript/typescript6';
 import { DiagnosticCode, lint } from '../dist/index.js';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -39,6 +39,11 @@ test('lint is a lazy diagnostic generator', () => {
 
   assert.equal(result[Symbol.iterator](), result);
   assert.equal(typeof result.next, 'function');
+});
+
+test('build emits JavaScript and declaration source maps', () => {
+  assert.equal(fs.existsSync(path.join(projectFixture, '../../../dist/index.js.map')), true);
+  assert.equal(fs.existsSync(path.join(projectFixture, '../../../dist/index.d.ts.map')), true);
 });
 
 test('emits only statically unused dictionary leaves as warning diagnostics', () => {
@@ -93,6 +98,78 @@ test('yields native project diagnostics and stops before dictionary analysis', (
 
   assert.ok(result.length > 0);
   assert.ok(result.every(({ code }) => code !== DiagnosticCode.UnusedKey));
+});
+
+test('resolves a dictionary exported as the module default', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['*.ts'] }),
+    'dictionary.ts': `export default { used: 'used', unused: 'unused' }
+`,
+    'usage.ts': `import dictionary from './dictionary.js'
+dictionary.used
+`
+  });
+  const result = [
+    ...lint({
+      ...options(project),
+      dictionaryExport: 'default'
+    })
+  ];
+
+  assert.deepEqual(
+    result
+      .filter(({ code }) => code === DiagnosticCode.UnusedKey)
+      .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]),
+    ['unused']
+  );
+
+  const command = spawnSync(
+    process.execPath,
+    [
+      cli,
+      `--project=${project}`,
+      `--dictionary=${path.join(project, 'dictionary.ts')}`,
+      '--export=default'
+    ],
+    { encoding: 'utf8' }
+  );
+  assert.equal(command.status, 1);
+  assert.match(command.stderr, /Translation key "unused" is unused/);
+
+  const removed = [
+    ...lint({
+      ...options(project),
+      dictionaryExport: 'default',
+      remove: true
+    })
+  ];
+  assert.ok(removed.some(({ code }) => code === DiagnosticCode.RemovedKey));
+  assert.doesNotMatch(fs.readFileSync(path.join(project, 'dictionary.ts'), 'utf8'), /unused/);
+});
+
+test('resolves a default export that references a dictionary variable', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['*.ts'] }),
+    'dictionary.ts': `const dictionary = { used: 'used', unused: 'unused' }
+export default dictionary
+`,
+    'usage.ts': `import dictionary from './dictionary.js'
+dictionary.used
+`
+  });
+  const result = [
+    ...lint({
+      ...options(project),
+      dictionaryExport: 'default'
+    })
+  ];
+
+  assert.deepEqual(
+    result
+      .filter(({ code }) => code === DiagnosticCode.UnusedKey)
+      .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]),
+    ['unused']
+  );
 });
 
 test('--remove applies every safe edit and leaves no unused diagnostics', (t) => {
@@ -177,6 +254,22 @@ test('Oclif exits 1 for unused keys and 2 for invalid flags', () => {
   assert.match(unused.stderr, /TS95002/);
   assert.equal(invalid.status, 2);
   assert.match(invalid.stderr, /Missing required flag/);
+});
+
+test('Oclif exposes help, autocomplete, and unknown-command plugins', () => {
+  const help = spawnSync(process.execPath, [cli, 'help'], { encoding: 'utf8' });
+  const autocomplete = spawnSync(process.execPath, [cli, 'autocomplete', '--help'], {
+    encoding: 'utf8'
+  });
+  const unknown = spawnSync(process.execPath, [cli, 'unknown-command'], { encoding: 'utf8' });
+
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /autocomplete/);
+  assert.match(help.stdout, /lint/);
+  assert.equal(autocomplete.status, 0);
+  assert.match(autocomplete.stdout, /Display autocomplete installation instructions/);
+  assert.equal(unknown.status, 127);
+  assert.match(unknown.stderr, /is not a unused18n command/);
 });
 
 test('Oclif --remove fixes safe unused keys and exits 0', (t) => {
