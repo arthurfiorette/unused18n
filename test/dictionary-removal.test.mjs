@@ -246,3 +246,25 @@ test('rejects a stale plan before changing the source file', (t) => {
   );
   assert.equal(fs.readFileSync(dictionaryPath, 'utf8'), changed);
 });
+
+test('rejects a stale multi-file plan before changing either dictionary', (t) => {
+  const first = temporaryDictionary(t, `export const dictionary = { unused: 'first' }\n`);
+  const second = temporaryDictionary(t, `export const dictionary = { unused: 'second' }\n`);
+  const firstPlan = planDictionaryRemoval(openDictionary(first), new Set(['unused']));
+  const secondPlan = planDictionaryRemoval(openDictionary(second), new Set(['unused']));
+  assert.equal(firstPlan.ok, true);
+  assert.equal(secondPlan.ok, true);
+  const firstBefore = fs.readFileSync(first, 'utf8');
+  fs.writeFileSync(second, fs.readFileSync(second, 'utf8').replace('second', 'changed'));
+
+  assert.throws(() =>
+    applyDictionaryRemoval({
+      edits: [
+        ...(firstPlan.ok ? firstPlan.plan.edits : []),
+        ...(secondPlan.ok ? secondPlan.plan.edits : [])
+      ],
+      removedKeys: new Set(['unused'])
+    })
+  );
+  assert.equal(fs.readFileSync(first, 'utf8'), firstBefore);
+});

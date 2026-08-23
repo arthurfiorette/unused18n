@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import ts from '@typescript/typescript6';
@@ -119,16 +120,64 @@ export function applyDictionaryRemoval(plan: DictionaryRemovalPlan): void {
   }
 
   const temporaryFiles = new Map<string, string>();
+  const backupFiles = new Map<string, string>();
+  const installed = new Set<string>();
+  let committed = false;
   try {
     for (const [fileName, output] of outputs) {
-      const temporaryFile = `${fileName}.unused18n-${process.pid}-${Date.now()}.tmp`;
-      fs.writeFileSync(temporaryFile, output, 'utf8');
+      const temporaryFile = `${fileName}.unused18n-${randomUUID()}.tmp`;
+      fs.writeFileSync(temporaryFile, output, {
+        encoding: 'utf8',
+        mode: fs.statSync(fileName).mode,
+        flag: 'wx'
+      });
       temporaryFiles.set(fileName, temporaryFile);
     }
-    for (const [fileName, temporaryFile] of temporaryFiles) fs.renameSync(temporaryFile, fileName);
+    // Backups make ordinary multi-file commit failures reversible after every output is staged.
+    for (const fileName of temporaryFiles.keys()) {
+      const backupFile = `${fileName}.unused18n-${randomUUID()}.bak`;
+      fs.renameSync(fileName, backupFile);
+      backupFiles.set(fileName, backupFile);
+    }
+    for (const [fileName, temporaryFile] of temporaryFiles) {
+      fs.renameSync(temporaryFile, fileName);
+      installed.add(fileName);
+    }
+    committed = true;
+    for (const backupFile of backupFiles.values()) {
+      try {
+        fs.unlinkSync(backupFile);
+      } catch {
+        // A committed destination remains authoritative; a leftover backup is safer than rollback.
+      }
+    }
+  } catch (error) {
+    for (const fileName of installed) {
+      if (fs.existsSync(fileName)) fs.unlinkSync(fileName);
+    }
+    const restoreErrors: unknown[] = [];
+    for (const [fileName, backupFile] of [...backupFiles].reverse()) {
+      try {
+        if (fs.existsSync(backupFile)) fs.renameSync(backupFile, fileName);
+      } catch (restoreError) {
+        restoreErrors.push(restoreError);
+      }
+    }
+    if (restoreErrors.length > 0)
+      throw new AggregateError([error, ...restoreErrors], 'Dictionary rollback failed');
+    throw error;
   } finally {
     for (const temporaryFile of temporaryFiles.values()) {
       if (fs.existsSync(temporaryFile)) fs.unlinkSync(temporaryFile);
+    }
+    if (committed) {
+      for (const backupFile of backupFiles.values()) {
+        try {
+          if (fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
+        } catch {
+          // Preserve the successfully installed output even when backup cleanup is unavailable.
+        }
+      }
     }
   }
 }

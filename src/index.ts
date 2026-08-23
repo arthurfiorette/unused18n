@@ -30,7 +30,8 @@ const cliFlags = {
   dictionary: Flags.string({
     char: 'd',
     helpValue: '<path>',
-    summary: 'TypeScript or JSON source file containing the dictionary'
+    multiple: true,
+    summary: 'TypeScript or JSON dictionary path or glob; repeat for multiple patterns'
   }),
   export: Flags.string({
     char: 'e',
@@ -59,7 +60,7 @@ type ConfigurableCliFlag = Exclude<keyof typeof cliFlags, 'config' | 'version'>;
 // Both directions are checked so adding either a config field or configurable flag breaks typecheck.
 const configFlagNames = {
   project: 'project',
-  dictionary: 'dictionary',
+  dictionaries: 'dictionary',
   dictionaryExport: 'export',
   maxExpansions: 'max-expansions',
   remove: 'remove',
@@ -79,8 +80,8 @@ export default class Unused18n extends Command {
     'Lint a TypeScript or JSON i18next dictionary and report keys without statically recoverable usage.';
 
   static override examples = [
-    '<%= config.bin %> lint --project ./tsconfig.json --dictionary ./src/i18n/pt.ts --export dictionary',
-    '<%= config.bin %> lint --project . --dictionary ./src/i18n/en.json --remove'
+    '<%= config.bin %> lint --project ./tsconfig.json --dictionary "./src/i18n/*.json"',
+    '<%= config.bin %> lint --project . --dictionary ./src/i18n/en.ts --export dictionary --remove'
   ];
 
   static override flags = cliFlags;
@@ -95,13 +96,13 @@ export default class Unused18n extends Command {
     }
 
     const project = flags.project ?? fileConfig.project;
-    const dictionary = flags.dictionary ?? fileConfig.dictionary;
+    const dictionaries = flags.dictionary ?? fileConfig.dictionaries;
     if (!project)
       this.error('Missing required option: provide --project or set "project" in config.', {
         exit: 2
       });
-    if (!dictionary) {
-      this.error('Missing required option: provide --dictionary or set "dictionary" in config.', {
+    if (!dictionaries) {
+      this.error('Missing required option: provide --dictionary or set "dictionaries" in config.', {
         exit: 2
       });
     }
@@ -116,7 +117,7 @@ export default class Unused18n extends Command {
 
     const lintOptions = {
       project,
-      dictionary,
+      dictionaries,
       dictionaryExport,
       maxExpansions,
       remove,

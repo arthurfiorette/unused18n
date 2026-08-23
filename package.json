@@ -41,7 +41,7 @@
     "lint-ci": "biome ci .",
     "lint-fix": "biome check --write --unsafe .",
     "prepack": "pnpm build",
-    "schema": "ts-json-schema-generator -p src/types.ts -t Unused18nConfig -f tsconfig.json -o schema.json && biome format --write schema.json",
+    "schema": "ts-json-schema-generator -p src/types.ts -t Unused18nConfig -f tsconfig.json -o schema.json --id Unused18nConfig --minify",
     "test": "pnpm build && node --test test/*.test.mjs",
     "test-types": "tsc --noEmit"
   },
@@ -69,7 +69,7 @@
     ]
   },
   "dependencies": {
-    "@oclif/core": "4.14.0",
+    "@oclif/core": "^4.14.0",
     "@oclif/plugin-autocomplete": "^3.2.56",
     "@oclif/plugin-help": "^6.2.58",
     "@oclif/plugin-not-found": "^3.2.93",

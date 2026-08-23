@@ -1,0 +1,6 @@
+{
+  "$schema": "./node_modules/unused18n/schema.json",
+  "project": "../locales/tsconfig.json",
+  "dictionaries": "../locales/??.json",
+  "cache": false
+}

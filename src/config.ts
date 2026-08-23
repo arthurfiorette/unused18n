@@ -10,7 +10,9 @@ type ConfigValidator = (value: unknown) => boolean;
 const configValidators = {
   $schema: isNonEmptyString,
   project: isNonEmptyString,
-  dictionary: isNonEmptyString,
+  dictionaries: (value) =>
+    isNonEmptyString(value) ||
+    (Array.isArray(value) && value.length > 0 && value.every(isNonEmptyString)),
   dictionaryExport: isNonEmptyString,
   maxExpansions: (value) => typeof value === 'number' && Number.isInteger(value) && value > 0,
   remove: (value) => typeof value === 'boolean',
@@ -65,7 +67,14 @@ export function loadConfig(explicitPath?: string, cwd = process.cwd()): LoadedCo
     config: {
       ...config,
       ...(config.project ? { project: path.resolve(directory, config.project) } : {}),
-      ...(config.dictionary ? { dictionary: path.resolve(directory, config.dictionary) } : {}),
+      ...(config.dictionaries
+        ? {
+            dictionaries: (Array.isArray(config.dictionaries)
+              ? config.dictionaries
+              : [config.dictionaries]
+            ).map((pattern) => path.resolve(directory, pattern))
+          }
+        : {}),
       ...(config.cacheDir ? { cacheDir: path.resolve(directory, config.cacheDir) } : {})
     },
     fileName

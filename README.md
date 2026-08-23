@@ -55,6 +55,18 @@ src/i18n/en.json:4:5 - warning TS95001: Translation key "common.cancel" is unuse
 
 TypeScript exports must resolve statically to an object or array. Application files must be included in the selected TypeScript project. JSON dictionaries work without enabling `resolveJsonModule` in your `tsconfig.json`.
 
+### Multiple locales
+
+Use a glob to analyze every locale dictionary with one TypeScript source pass:
+
+```sh
+npx unused18n lint \
+  --project=./tsconfig.json \
+  --dictionary='./src/i18n/*.json'
+```
+
+Matched files are deduplicated and sorted. The filename stem supplies the locale, so `pt-BR.json` uses `pt-BR` plural rules. Dictionaries may have different physical keys: `t('item', { count })` can use `_one` and `_other` in English while using `_zero`, `_two`, `_few`, and `_many` where those categories exist. Literal `context` values compose before plural suffixes, and `ordinal: true` uses `_ordinal_<category>` variants. When a specific variant is absent, analysis follows the existing i18next fallback chain without reinterpreting literal suffix-like keys.
+
 ## Supported patterns
 
 ### Literals and finite keys
@@ -141,13 +153,13 @@ Create `.unused18nrc` in the directory where the CLI runs:
 {
   "$schema": "./node_modules/unused18n/schema.json",
   "project": "./tsconfig.json",
-  "dictionary": "./src/i18n/en.json",
+  "dictionaries": "./src/i18n/*.json",
   "maxExpansions": 1000,
   "cache": true
 }
 ```
 
-The bundled schema documents every option and provides editor validation and completion. Relative `project`, `dictionary`, and `cacheDir` paths resolve from the config file directory. CLI flags override config values.
+The bundled schema documents every option and provides editor validation and completion. Relative `project`, `dictionaries`, and `cacheDir` paths resolve from the config file directory. `dictionaries` accepts one path/glob or an array. CLI flags override config values.
 
 Use `--config=<path>` to load a different JSON file. Without it, `unused18n` looks for `.unused18nrc` in the current working directory. A missing default config is ignored.
 
@@ -157,7 +169,7 @@ Use `--config=<path>` to load a different JSON file. Without it, `unused18n` loo
 | ------------------------- | ------------------------------------------------------------- |
 | `--config <path>`         | Load JSON options from this file instead of `.unused18nrc`    |
 | `-p, --project <path>`    | Required by flag or config. `tsconfig.json` path or directory |
-| `-d, --dictionary <path>` | Required by flag or config. TypeScript or JSON dictionary     |
+| `-d, --dictionary <path>` | Required by flag or config. Repeatable dictionary path/glob  |
 | `-e, --export <name>`     | TypeScript export name; defaults to `default`                 |
 | `--[no-]remove`           | Enable or override config-file removal                        |
 | `--max-expansions <n>`    | Maximum number of finite key combinations; defaults to `1000` |
@@ -186,7 +198,7 @@ import { DiagnosticCode, lint } from 'unused18n';
 
 for (const diagnostic of lint({
   project: './tsconfig.json',
-  dictionary: './src/i18n/en.json'
+  dictionaries: './src/i18n/*.json'
 })) {
   if (diagnostic.code === DiagnosticCode.UnusedKey) {
     console.log(diagnostic.file?.fileName, diagnostic.messageText);
@@ -199,7 +211,8 @@ for (const diagnostic of lint({
 | Option             | Type                          | Default                                              |
 | ------------------ | ----------------------------- | ---------------------------------------------------- |
 | `project`          | `string`                      | Required                                             |
-| `dictionary`       | `string`                      | Required                                             |
+| `dictionaries`     | `string \| string[]`           | Required                                             |
+| `dictionary`       | `string`                      | Deprecated single-dictionary alias                   |
 | `dictionaryExport` | `string`                      | `'default'`                                          |
 | `maxExpansions`    | `number`                      | `1000`                                               |
 | `remove`           | `boolean`                     | `false`                                              |

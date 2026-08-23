@@ -15,11 +15,13 @@ export interface Unused18nConfig {
    */
   project?: string;
   /**
-   * TypeScript or strict JSON dictionary file. Relative values resolve from `.unused18nrc`.
+   * Dictionary path or glob, or an array of patterns. Relative values resolve from `.unused18nrc`.
+   * Matched filenames provide locale names, for example `pt-BR.json` becomes `pt-BR`.
    * @minLength 1
-   * @examples ["./src/i18n/en.json", "./src/i18n/en.ts"]
+   * @minItems 1
+   * @examples ["./src/i18n/*.json", ["./src/i18n/*.json", "./packages/{site,admin}/locales/*.json"]]
    */
-  dictionary?: string;
+  dictionaries?: string | string[];
   /**
    * Export containing a TypeScript dictionary. JSON dictionaries always use `default`.
    * @minLength 1

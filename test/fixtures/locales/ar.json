@@ -1,0 +1,17 @@
+{
+  "item_zero": "Zero",
+  "item_one": "One",
+  "item_two": "Two",
+  "item_few": "Few",
+  "item_many": "Many",
+  "item_other": "Other",
+  "anyItem_zero": "Zero dynamic",
+  "anyItem_one": "One dynamic",
+  "anyItem_two": "Two dynamic",
+  "anyItem_few": "Few dynamic",
+  "anyItem_many": "Many dynamic",
+  "anyItem_other": "Other dynamic",
+  "friend_male_one": "Friend",
+  "status_one": "Status",
+  "unused": "Unused"
+}

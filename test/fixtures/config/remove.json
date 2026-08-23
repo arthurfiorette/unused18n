@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/unused18n/schema.json",
   "project": "./project/tsconfig.json",
-  "dictionary": "./project/dictionary.ts",
+  "dictionaries": "./project/dictionary.ts",
   "remove": true,
   "cache": false
 }

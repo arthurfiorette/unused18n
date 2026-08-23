@@ -1,7 +1,9 @@
 import path from 'node:path';
 import ts from '@typescript/typescript6';
+import type { DictionaryTarget } from './dictionaries.js';
 import { readDictionary, unwrapAlias, unwrapExpression } from './dictionary.js';
 import { DictionaryIndex } from './dictionary-index.js';
+import { expandI18nextCandidates, type TranslationVariantOptions } from './i18next-candidates.js';
 import { type LoadedProject, loadProject } from './project.js';
 import {
   createStringResolver,
@@ -28,6 +30,7 @@ interface TranslationHookWrapper {
 
 interface ObjectResolution extends StringResolution {
   origin: 'translation' | 'dictionary';
+  dictionaryIds?: ReadonlySet<string>;
 }
 
 /**
@@ -43,6 +46,7 @@ export interface LoadedProjectAnalysis {
 
 /** Dictionary-expanded observation that can be serialized without compiler object identities. */
 export interface UsageFact {
+  dictionaryId: string;
   key: string;
   confidence: 'used' | 'possibly-used';
   evidence: UsageEvidence;
@@ -58,8 +62,19 @@ export interface SourceUsageFacts {
 /** Reuse is prepared only after cache invalidation proves excluded components unchanged. */
 export interface AnalysisReuse {
   dictionary?: ReturnType<typeof readDictionary>;
+  dictionaries?: LoadedDictionaryTarget[];
   cachedFacts?: ReadonlyMap<string, SourceUsageFacts>;
   filesToAnalyze?: ReadonlySet<string>;
+}
+
+export interface LoadedDictionaryTarget extends DictionaryTarget {
+  info: ReturnType<typeof readDictionary>;
+}
+
+export interface LoadedProjectManyAnalysis {
+  analyses: Array<{ target: LoadedDictionaryTarget; result: AnalysisResult }>;
+  sourceFacts: SourceUsageFacts[];
+  unresolvedReferences: UsageEvidence[];
 }
 
 /** Creates the compatibility Program for API callers that do not already own one. */
@@ -78,11 +93,45 @@ export function analyzeLoadedProject(
   options: AnalyzeOptions,
   reuse: AnalysisReuse = {}
 ): LoadedProjectAnalysis {
-  const includeEvidence = options.includeEvidence ?? true;
   const dictionaryPath = path.resolve(options.dictionary);
-  const dictionary =
+  const info =
     reuse.dictionary ?? readDictionary(program, checker, dictionaryPath, options.dictionaryExport);
-  const dictionaryKeys = [...dictionary.keys];
+  const target: LoadedDictionaryTarget = {
+    id: `${dictionaryPath}\0${options.dictionaryExport}`,
+    path: dictionaryPath,
+    exportName: options.dictionaryExport,
+    locale: path.basename(dictionaryPath, path.extname(dictionaryPath)),
+    info
+  };
+  const many = analyzeLoadedProjectMany({ program, checker, configPath }, [target], options, {
+    ...reuse,
+    dictionaries: [target]
+  });
+  return {
+    dictionary: info,
+    sourceFacts: many.sourceFacts,
+    result: many.analyses[0]!.result
+  };
+}
+
+/** Traverses source once and replays dictionary-targeted facts into each locale result. */
+export function analyzeLoadedProjectMany(
+  { program, checker, configPath }: LoadedProject,
+  targets: LoadedDictionaryTarget[],
+  options: Pick<AnalyzeOptions, 'includeEvidence' | 'maxExpansions' | 'project'>,
+  reuse: AnalysisReuse = {}
+): LoadedProjectManyAnalysis {
+  const includeEvidence = options.includeEvidence ?? true;
+  const dictionaries = reuse.dictionaries ?? targets;
+  const firstDictionary = dictionaries[0];
+  if (!firstDictionary) throw new Error('At least one dictionary is required');
+  const dictionaryKeys = [...new Set(dictionaries.flatMap(({ info }) => [...info.keys]))];
+  // Existing object-resolution code needs a union shape; final facts remain dictionary-targeted.
+  const dictionary = {
+    ...firstDictionary.info,
+    keys: new Set(dictionaryKeys),
+    keySources: new Map(dictionaries.flatMap(({ info }) => [...info.keySources]))
+  };
   const dictionaryPrefixes = new Set<string>();
   const keysByTopLevel = new Map<string, string[]>();
   for (const key of dictionaryKeys) {
@@ -117,7 +166,7 @@ export function analyzeLoadedProject(
     freshFacts.set(fileName, { fileName, facts: [], unresolvedReferences: [] });
   }
   const objectCache = new WeakMap<ts.Expression, ObjectResolution | null>();
-  const dictionaryTypeCache = new WeakMap<ts.Type, boolean>();
+  const dictionaryTypeCache = new WeakMap<ts.Type, ReadonlySet<string>>();
   let translationHookCache = new WeakMap<ts.CallExpression, StringResolution | null>();
 
   // The first pass establishes direct translator provenance needed to recognize hooks that expose
@@ -133,7 +182,12 @@ export function analyzeLoadedProject(
   for (const sourceFile of analysisSourceFiles) visitSource(sourceFile);
 
   // Fresh and cached runs share this replay boundary so classification joins remain identical.
-  const dictionaryIndex = DictionaryIndex.create(dictionaryKeys, includeEvidence);
+  const dictionaryIndexes = new Map(
+    dictionaries.map((target) => [
+      target.id,
+      DictionaryIndex.create([...target.info.keys], includeEvidence)
+    ])
+  );
   const unresolvedReferences: UsageEvidence[] = [];
   const unresolvedIdentities = new Set<string>();
   const sourceFacts = sourceFiles.map((sourceFile) => {
@@ -145,11 +199,9 @@ export function analyzeLoadedProject(
         unresolvedReferences: []
       };
     for (const fact of facts.facts) {
-      dictionaryIndex.markExact(
-        fact.key,
-        fact.confidence,
-        includeEvidence ? fact.evidence : undefined
-      );
+      dictionaryIndexes
+        .get(fact.dictionaryId)
+        ?.markExact(fact.key, fact.confidence, includeEvidence ? fact.evidence : undefined);
     }
     for (const evidence of facts.unresolvedReferences) {
       const identity = evidenceIdentity(evidence);
@@ -160,24 +212,28 @@ export function analyzeLoadedProject(
     return facts;
   });
 
-  const keys = dictionaryIndex.toKeyAnalysis();
-
   return {
-    dictionary,
     sourceFacts,
-    result: {
-      dictionary: dictionaryPath,
-      dictionaryExport: options.dictionaryExport,
-      keys,
-      unresolvedReferences,
-      summary: {
-        total: keys.length,
-        used: keys.filter((entry) => entry.status === 'used').length,
-        possiblyUsed: keys.filter((entry) => entry.status === 'possibly-used').length,
-        unused: keys.filter((entry) => entry.status === 'unused').length,
-        unresolvedReferences: unresolvedReferences.length
-      }
-    }
+    unresolvedReferences,
+    analyses: dictionaries.map((target) => {
+      const keys = dictionaryIndexes.get(target.id)!.toKeyAnalysis();
+      return {
+        target,
+        result: {
+          dictionary: target.path,
+          dictionaryExport: target.exportName,
+          keys,
+          unresolvedReferences,
+          summary: {
+            total: keys.length,
+            used: keys.filter((entry) => entry.status === 'used').length,
+            possiblyUsed: keys.filter((entry) => entry.status === 'possibly-used').length,
+            unused: keys.filter((entry) => entry.status === 'unused').length,
+            unresolvedReferences: unresolvedReferences.length
+          }
+        }
+      };
+    })
   };
 
   function discoverTranslationHookWrappers(): void {
@@ -414,15 +470,16 @@ export function analyzeLoadedProject(
         }
         return;
       }
-      markResolution(resolution, call, 'Translation call');
+      markTranslationResolution(resolution, translationOptions(call), call, 'Translation call');
       return;
     }
 
     const wrapper = wrappers.get(normalizedSymbol(call.expression) as ts.Symbol);
     const argument = wrapper ? call.arguments[wrapper.keyParameter] : undefined;
     if (wrapper && argument) {
-      markResolution(
+      markTranslationResolution(
         prepend(wrapper.prefix, strings.resolve(argument)),
+        {},
         call,
         'Translation wrapper call'
       );
@@ -480,11 +537,22 @@ export function analyzeLoadedProject(
 
     const exactLeaves = [...object.values].filter((key) => dictionary.keys.has(key));
     if (exactLeaves.length > 0) {
-      markKeys(exactLeaves, 'used', expression, `${object.origin} object property access`);
+      markKeys(
+        exactLeaves,
+        'used',
+        expression,
+        `${object.origin} object property access`,
+        object.dictionaryIds
+      );
     }
 
     for (const pattern of object.patterns) {
-      markPattern(pattern, expression, `${object.origin} object dynamic property access`);
+      markPattern(
+        pattern,
+        expression,
+        `${object.origin} object dynamic property access`,
+        object.dictionaryIds
+      );
     }
 
     if (exactLeaves.length === object.values.size && object.patterns.size === 0) return;
@@ -492,7 +560,12 @@ export function analyzeLoadedProject(
 
     for (const value of object.values) {
       if (!dictionary.keys.has(value) && hasDescendants(value)) {
-        markSubtree(value, expression, `${object.origin} object subtree escapes static analysis`);
+        markSubtree(
+          value,
+          expression,
+          `${object.origin} object subtree escapes static analysis`,
+          object.dictionaryIds
+        );
       }
     }
   }
@@ -540,7 +613,13 @@ export function analyzeLoadedProject(
       } else {
         const leaves = [...child.values].filter((key) => dictionary.keys.has(key));
         if (leaves.length > 0)
-          markKeys(leaves, 'used', element, 'Destructured translation property');
+          markKeys(
+            leaves,
+            'used',
+            element,
+            'Destructured translation property',
+            child.dictionaryIds
+          );
         else markSubtrees(child, element, 'Destructured translation subtree');
       }
     }
@@ -589,14 +668,19 @@ export function analyzeLoadedProject(
         if (result) return result;
       }
 
-      if (isDictionaryType(checker.getTypeAtLocation(expression))) {
-        return { ...exact(''), origin: 'dictionary' };
+      const dictionaryIds = dictionaryIdsForType(checker.getTypeAtLocation(expression));
+      if (dictionaryIds.size > 0) {
+        return { ...exact(''), origin: 'dictionary', dictionaryIds };
       }
     }
 
     if (ts.isIdentifier(expression)) {
-      if (normalizedSymbol(expression) === dictionary.symbol) {
-        return { ...exact(''), origin: 'dictionary' };
+      const symbol = normalizedSymbol(expression);
+      const dictionaryIds = new Set(
+        dictionaries.filter(({ info }) => symbol === info.symbol).map(({ id }) => id)
+      );
+      if (dictionaryIds.size > 0) {
+        return { ...exact(''), origin: 'dictionary', dictionaryIds };
       }
       const declaration = normalizedSymbol(expression)?.declarations?.find(
         ts.isVariableDeclaration
@@ -627,11 +711,20 @@ export function analyzeLoadedProject(
       for (const value of base.values) result.patterns.add(joinKey(value, '*'));
       for (const pattern of base.patterns) result.patterns.add(joinKey(pattern, '*'));
     }
-    return { ...result, origin: base.origin };
+    return {
+      ...result,
+      origin: base.origin,
+      ...(base.dictionaryIds ? { dictionaryIds: base.dictionaryIds } : {})
+    };
   }
 
   function mergeObjects(a: ObjectResolution, b: ObjectResolution): ObjectResolution {
-    return { ...merge(a, b), origin: a.origin === b.origin ? a.origin : 'translation' };
+    const dictionaryIds = new Set([...(a.dictionaryIds ?? []), ...(b.dictionaryIds ?? [])]);
+    return {
+      ...merge(a, b),
+      origin: a.origin === b.origin ? a.origin : 'translation',
+      ...(dictionaryIds.size > 0 ? { dictionaryIds } : {})
+    };
   }
 
   function translatorPrefix(expression: ts.Expression): StringResolution | undefined {
@@ -877,22 +970,125 @@ export function analyzeLoadedProject(
     }
   }
 
-  function markSubtrees(resolution: StringResolution, node: ts.Node, reason: string): void {
-    for (const value of resolution.values) markSubtree(value, node, reason);
-    for (const pattern of resolution.patterns) markPattern(`${pattern}*`, node, reason);
+  function markTranslationResolution(
+    resolution: StringResolution,
+    variants: TranslationVariantOptions,
+    node: ts.Node,
+    reason: string
+  ): void {
+    const expansion = expandI18nextCandidates(
+      resolution,
+      variants,
+      dictionaries.map(({ id, locale, info }) => ({ id, locale, keys: info.keys }))
+    );
+    const facts = factsForNode(node);
+    for (const observation of expansion.observations) {
+      facts.facts.push({
+        dictionaryId: observation.dictionaryId,
+        key: observation.key,
+        confidence: observation.confidence,
+        evidence: evidenceFor(node, observation.confidence, reason)
+      });
+    }
+    if (expansion.unresolved) {
+      const evidence = evidenceFor(node, 'possibly-used', `${reason}: unresolved runtime options`);
+      if (
+        !facts.unresolvedReferences.some(
+          (entry) => evidenceIdentity(entry) === evidenceIdentity(evidence)
+        )
+      ) {
+        facts.unresolvedReferences.push(evidence);
+      }
+    }
+    if (!resolution.complete && resolution.patterns.size === 0) {
+      const evidence = evidenceFor(node, 'possibly-used', `${reason}: unresolved runtime key`);
+      if (
+        !facts.unresolvedReferences.some(
+          (entry) => evidenceIdentity(entry) === evidenceIdentity(evidence)
+        )
+      ) {
+        facts.unresolvedReferences.push(evidence);
+      }
+    }
   }
 
-  function markSubtree(prefix: string, node: ts.Node, reason: string): void {
+  function translationOptions(call: ts.CallExpression): TranslationVariantOptions {
+    const options = call.arguments[1];
+    if (!options) return {};
+    const count = optionExpression(options, 'count');
+    const context = optionExpression(options, 'context');
+    const ordinal = optionExpression(options, 'ordinal');
+    return {
+      ...(count === undefined
+        ? {}
+        : count === null
+          ? { count: null }
+          : countType(checker.getTypeAtLocation(count)) === 'number'
+            ? { count: strings.resolve(count) }
+            : countType(checker.getTypeAtLocation(count)) === 'unknown'
+              ? { count: null }
+              : {}),
+      ...(context === undefined
+        ? {}
+        : { context: context === null ? null : strings.resolve(context) }),
+      ...(ordinal === undefined
+        ? {}
+        : {
+            ordinal:
+              ordinal === null
+                ? null
+                : ordinal.kind === ts.SyntaxKind.TrueKeyword
+                  ? true
+                  : ordinal.kind === ts.SyntaxKind.FalseKeyword
+                    ? false
+                    : null
+          })
+    };
+  }
+
+  function countType(type: ts.Type): 'number' | 'none' | 'unknown' {
+    if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return 'unknown';
+    if (type.isUnion()) {
+      const kinds = new Set(type.types.map(countType));
+      if (kinds.has('unknown') || (kinds.has('number') && kinds.has('none'))) return 'unknown';
+      return kinds.has('number') ? 'number' : 'none';
+    }
+    return type.flags & (ts.TypeFlags.Number | ts.TypeFlags.NumberLiteral) ? 'number' : 'none';
+  }
+
+  function markSubtrees(
+    resolution: StringResolution & { dictionaryIds?: ReadonlySet<string> },
+    node: ts.Node,
+    reason: string
+  ): void {
+    for (const value of resolution.values)
+      markSubtree(value, node, reason, resolution.dictionaryIds);
+    for (const pattern of resolution.patterns)
+      markPattern(`${pattern}*`, node, reason, resolution.dictionaryIds);
+  }
+
+  function markSubtree(
+    prefix: string,
+    node: ts.Node,
+    reason: string,
+    dictionaryIds?: ReadonlySet<string>
+  ): void {
     const normalized = prefix ? `${prefix}.` : '';
     markKeys(
       candidatesForPrefix(prefix).filter((key) => key.startsWith(normalized)),
       'possibly-used',
       node,
-      reason
+      reason,
+      dictionaryIds
     );
   }
 
-  function markPattern(pattern: string, node: ts.Node, reason: string): void {
+  function markPattern(
+    pattern: string,
+    node: ts.Node,
+    reason: string,
+    dictionaryIds?: ReadonlySet<string>
+  ): void {
     const matcher = globMatcher(pattern);
     const staticPrefix = pattern.slice(
       0,
@@ -902,7 +1098,8 @@ export function analyzeLoadedProject(
       candidatesForPrefix(staticPrefix).filter((key) => matcher.test(key)),
       'possibly-used',
       node,
-      reason
+      reason,
+      dictionaryIds
     );
   }
 
@@ -910,13 +1107,17 @@ export function analyzeLoadedProject(
     candidateKeys: string[],
     confidence: 'used' | 'possibly-used',
     node: ts.Node,
-    reason: string
+    reason: string,
+    dictionaryIds?: ReadonlySet<string>
   ): void {
     const evidence = evidenceFor(node, confidence, reason);
     const facts = factsForNode(node);
     for (const key of candidateKeys) {
-      if (!dictionary.keys.has(key)) continue;
-      facts.facts.push({ key, confidence, evidence });
+      for (const target of dictionaries) {
+        if (dictionaryIds && !dictionaryIds.has(target.id)) continue;
+        if (!target.info.keys.has(key)) continue;
+        facts.facts.push({ dictionaryId: target.id, key, confidence, evidence });
+      }
     }
   }
 
@@ -975,26 +1176,30 @@ export function analyzeLoadedProject(
     return undefined;
   }
 
-  function isDictionaryType(type: ts.Type): boolean {
+  function dictionaryIdsForType(type: ts.Type): ReadonlySet<string> {
     const cached = dictionaryTypeCache.get(type);
     if (cached !== undefined) return cached;
-    const result = computeIsDictionaryType(type);
+    const result = computeDictionaryIdsForType(type);
     dictionaryTypeCache.set(type, result);
     return result;
   }
 
-  function computeIsDictionaryType(type: ts.Type): boolean {
-    if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) return false;
-    if (type === dictionary.type) return true;
+  function computeDictionaryIdsForType(type: ts.Type): ReadonlySet<string> {
+    if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never))
+      return new Set();
+    const ids = new Set<string>();
+    for (const target of dictionaries) {
+      if (type === target.info.type) ids.add(target.id);
 
-    const typeSymbol = unwrapAlias(checker, type.aliasSymbol ?? type.getSymbol());
-    const dictionarySymbol = unwrapAlias(
-      checker,
-      dictionary.type.aliasSymbol ?? dictionary.type.getSymbol()
-    );
-    if (typeSymbol && dictionarySymbol && typeSymbol === dictionarySymbol) return true;
+      const typeSymbol = unwrapAlias(checker, type.aliasSymbol ?? type.getSymbol());
+      const dictionarySymbol = unwrapAlias(
+        checker,
+        target.info.type.aliasSymbol ?? target.info.type.getSymbol()
+      );
+      if (typeSymbol && dictionarySymbol && typeSymbol === dictionarySymbol) ids.add(target.id);
+    }
 
-    return false;
+    return ids;
   }
 
   function hasDescendants(prefix: string): boolean {

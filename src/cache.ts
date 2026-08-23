@@ -2,13 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import ts from '@typescript/typescript6';
-import type { AnalysisReuse, SourceUsageFacts } from './analyzer.js';
-import type { DictionaryInfo } from './dictionary.js';
+import type { AnalysisReuse, LoadedDictionaryTarget, SourceUsageFacts } from './analyzer.js';
 import type { LoadedProject } from './project.js';
 
 // Bump either version whenever persisted shape or analyzer semantics would make old facts unsafe.
-const CACHE_SCHEMA_VERSION = 1;
-const ANALYSIS_ALGORITHM_VERSION = 1;
+const CACHE_SCHEMA_VERSION = 2;
+const ANALYSIS_ALGORITHM_VERSION = 2;
 const MAX_CACHE_BYTES = 64 * 1024 * 1024;
 
 /** Cache observability stays separate from TypeScript diagnostics and never affects lint status. */
@@ -63,7 +62,7 @@ const packageVersion = readPackageVersion();
 /** Keeps different projects, dictionaries, and exports from sharing compiler or analysis state. */
 export function resolveCachePaths(
   project: string,
-  dictionary: string,
+  dictionaries: readonly string[],
   dictionaryExport: string,
   cacheDir?: string
 ): CachePaths {
@@ -79,7 +78,7 @@ export function resolveCachePaths(
   const identity = hash(
     canonicalJson({
       project: configPath,
-      dictionary: path.resolve(dictionary),
+      dictionaries: dictionaries.map((dictionary) => path.resolve(dictionary)).sort(comparePaths),
       dictionaryExport
     })
   );
@@ -100,17 +99,22 @@ export function ensureCacheDirectory(paths: CachePaths): void {
  */
 export function prepareAnalysisCache(
   loaded: LoadedProject,
-  dictionary: DictionaryInfo,
+  dictionaries: LoadedDictionaryTarget[],
   options: {
-    dictionaryPath: string;
-    dictionaryExport: string;
     maxExpansions: number;
     paths: CachePaths;
   }
 ): PreparedAnalysisCache {
   const currentSources = snapshotSources(loaded.program);
-  const compatibilityHash = computeCompatibilityHash(loaded, dictionary, options);
-  const cached = readEntry(options.paths.entryFile);
+  const compatibilityHash = computeCompatibilityHash(loaded, dictionaries, options);
+  let cached = readEntry(options.paths.entryFile);
+  if (
+    cached !== undefined &&
+    cached !== 'corrupt' &&
+    !factsTargetCurrentDictionaries(cached, dictionaries)
+  ) {
+    cached = 'corrupt';
+  }
   const currentNames = Object.keys(currentSources).sort(comparePaths);
 
   let reason: 'absent' | 'changed' | 'incompatible' | 'corrupt' = 'absent';
@@ -164,7 +168,7 @@ export function prepareAnalysisCache(
   ): PreparedAnalysisCache {
     return {
       event,
-      reuse: { dictionary, cachedFacts: reusable, filesToAnalyze: dirty },
+      reuse: { dictionaries, cachedFacts: reusable, filesToAnalyze: dirty },
       write(sourceFacts) {
         const facts = new Map(sourceFacts.map((entry) => [path.resolve(entry.fileName), entry]));
         const sources = Object.fromEntries(
@@ -196,6 +200,16 @@ export function prepareAnalysisCache(
   }
 }
 
+function factsTargetCurrentDictionaries(
+  entry: CacheEntry,
+  dictionaries: LoadedDictionaryTarget[]
+): boolean {
+  const keysById = new Map(dictionaries.map(({ id, info }) => [id, info.keys]));
+  return Object.values(entry.sources).every(({ facts }) =>
+    facts.facts.every((fact) => keysById.get(fact.dictionaryId)?.has(fact.key) === true)
+  );
+}
+
 function snapshotSources(program: ts.Program): Record<string, CurrentSource> {
   const applicationFiles = program.getSourceFiles().filter(isApplicationSource);
   const applicationNames = new Set(applicationFiles.map((source) => path.resolve(source.fileName)));
@@ -217,8 +231,8 @@ function snapshotSources(program: ts.Program): Record<string, CurrentSource> {
 /** Inputs that can alter semantic extraction without changing an application source force a miss. */
 function computeCompatibilityHash(
   loaded: LoadedProject,
-  dictionary: DictionaryInfo,
-  options: { dictionaryPath: string; dictionaryExport: string; maxExpansions: number }
+  dictionaries: LoadedDictionaryTarget[],
+  options: { maxExpansions: number }
 ): string {
   const externalSources = loaded.program
     .getSourceFiles()
@@ -242,9 +256,11 @@ function computeCompatibilityHash(
       typescriptVersion: ts.version,
       configPath: path.resolve(loaded.configPath),
       compilerOptions,
-      dictionaryPath: path.resolve(options.dictionaryPath),
-      dictionaryExport: options.dictionaryExport,
-      dictionaryKeys: [...dictionary.keys].sort(comparePaths),
+      dictionaries: dictionaries.map(({ id, locale, info }) => ({
+        id,
+        locale,
+        keys: [...info.keys].sort(comparePaths)
+      })),
       maxExpansions: options.maxExpansions,
       externalSources
     })
@@ -406,6 +422,7 @@ function isSourceFacts(value: unknown): value is SourceUsageFacts {
     value.facts.every(
       (fact) =>
         isRecord(fact) &&
+        typeof fact.dictionaryId === 'string' &&
         typeof fact.key === 'string' &&
         (fact.confidence === 'used' || fact.confidence === 'possibly-used') &&
         isEvidence(fact.evidence)

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import ts from '@typescript/typescript6';
-import { analyzeLoadedProject } from './analyzer.js';
+import { analyzeLoadedProjectMany, type LoadedDictionaryTarget } from './analyzer.js';
 import {
   type CacheEvent,
   ensureCacheDirectory,
@@ -9,6 +9,7 @@ import {
   resolveCachePaths
 } from './cache.js';
 import { DiagnosticCode } from './diagnostic-codes.js';
+import { resolveDictionaryTargets } from './dictionaries.js';
 import { type DictionaryKeySource, readDictionary } from './dictionary.js';
 import {
   applyDictionaryRemoval,
@@ -18,10 +19,10 @@ import {
 import { loadProjectWithDiagnostics } from './project.js';
 import type { Unused18nConfig, UsageEvidence } from './types.js';
 
-export interface LintOptions
-  extends Omit<Unused18nConfig, '$schema' | 'cacheStats' | 'dictionary' | 'project'> {
+export interface LintOptions extends Omit<Unused18nConfig, '$schema' | 'cacheStats' | 'project'> {
   project: string;
-  dictionary: string;
+  /** @deprecated Use `dictionaries`; retained for the published single-dictionary API. */
+  dictionary?: string;
   /** Receives cache lifecycle events without changing diagnostic output. */
   onCacheEvent?: (event: CacheEvent) => void;
 }
@@ -34,11 +35,28 @@ export { DiagnosticCode };
  * optional edits, and diagnostic production in one compiler process.
  */
 export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void> {
-  const dictionaryPath = path.resolve(options.dictionary);
   const dictionaryExport = options.dictionaryExport ?? 'default';
+  let targets: ReturnType<typeof resolveDictionaryTargets>;
+  try {
+    const patterns = options.dictionaries ?? options.dictionary;
+    if (!patterns) throw new Error('At least one dictionary path or glob is required');
+    targets = resolveDictionaryTargets(patterns, dictionaryExport);
+  } catch (error) {
+    yield createDiagnostic(
+      DiagnosticCode.ConfigurationFailure,
+      ts.DiagnosticCategory.Error,
+      error instanceof Error ? error.message : String(error)
+    );
+    return;
+  }
   const cacheEnabled = options.cache ?? true;
   const cachePaths = cacheEnabled
-    ? resolveCachePaths(options.project, dictionaryPath, dictionaryExport, options.cacheDir)
+    ? resolveCachePaths(
+        options.project,
+        targets.map((target) => target.path),
+        dictionaryExport,
+        options.cacheDir
+      )
     : undefined;
   if (!cacheEnabled) notify({ type: 'bypass', reason: 'disabled' });
   else if (options.remove) notify({ type: 'bypass', reason: 'remove' });
@@ -55,7 +73,7 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
   }
   const project = loadProjectWithDiagnostics(
     options.project,
-    [dictionaryPath],
+    targets.map((target) => target.path),
     cachePaths && fsCacheAvailable(cachePaths.directory)
       ? { tsBuildInfoFile: cachePaths.tsBuildInfoFile }
       : {}
@@ -89,40 +107,37 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     }
   }
 
-  let analysis: ReturnType<typeof analyzeLoadedProject>;
+  let analysis: ReturnType<typeof analyzeLoadedProjectMany>;
+  let loadedDictionaries: LoadedDictionaryTarget[];
   let preparedCache: PreparedAnalysisCache | undefined;
   try {
-    const analysisOptions = {
-      project: options.project,
-      dictionary: dictionaryPath,
-      dictionaryExport,
-      includeEvidence: true
-    };
-    const normalizedOptions =
-      options.maxExpansions === undefined
-        ? analysisOptions
-        : { ...analysisOptions, maxExpansions: options.maxExpansions };
-    const dictionary = readDictionary(
-      project.loaded.program,
-      project.loaded.checker,
-      dictionaryPath,
-      dictionaryExport
-    );
+    loadedDictionaries = targets.map((target) => ({
+      ...target,
+      info: readDictionary(
+        project.loaded!.program,
+        project.loaded!.checker,
+        target.path,
+        target.exportName
+      )
+    }));
     if (cachePaths && cacheEnabled && !options.remove) {
       // Removal always needs live AST provenance; only read-only runs may replay usage facts.
-      preparedCache = prepareAnalysisCache(project.loaded, dictionary, {
-        dictionaryPath,
-        dictionaryExport,
+      preparedCache = prepareAnalysisCache(project.loaded, loadedDictionaries, {
         maxExpansions: options.maxExpansions ?? 1_000,
         paths: cachePaths
       });
       notify(preparedCache.event);
     }
-    analysis = analyzeLoadedProject(
+    analysis = analyzeLoadedProjectMany(
       project.loaded,
-      normalizedOptions,
+      loadedDictionaries,
+      {
+        project: options.project,
+        includeEvidence: true,
+        ...(options.maxExpansions === undefined ? {} : { maxExpansions: options.maxExpansions })
+      },
       preparedCache?.reuse ?? {
-        dictionary
+        dictionaries: loadedDictionaries
       }
     );
   } catch (error) {
@@ -134,16 +149,17 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     return;
   }
 
-  for (const warning of analysis.result.unresolvedReferences) {
+  for (const warning of analysis.unresolvedReferences) {
     yield diagnosticFromEvidence(project.loaded.program, project.loaded.configPath, warning);
   }
 
-  const unusedKeys = new Set(
-    analysis.result.keys.filter(({ status }) => status === 'unused').map(({ key }) => key)
-  );
   if (!options.remove) {
-    for (const key of unusedKeys) {
-      yield unusedDiagnostic(key, analysis.dictionary.keySources.get(key));
+    for (const { target, result } of analysis.analyses) {
+      for (const key of result.keys
+        .filter(({ status }) => status === 'unused')
+        .map(({ key }) => key)) {
+        yield unusedDiagnostic(key, target.info.keySources.get(key));
+      }
     }
     if (preparedCache && preparedCache.event.type !== 'hit') {
       try {
@@ -159,19 +175,35 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     return;
   }
 
-  const removal = planDictionaryRemoval(analysis.dictionary, unusedKeys);
-  if (!removal.ok) {
-    for (const failure of removal.failures) {
-      yield removalFailureDiagnostic(failure, analysis.dictionary.keySources.get(failure.key));
+  const removals = analysis.analyses.map(({ target, result }) => ({
+    target,
+    removal: planDictionaryRemoval(
+      target.info,
+      new Set(result.keys.filter(({ status }) => status === 'unused').map(({ key }) => key))
+    )
+  }));
+  const failedRemovals = removals.filter(({ removal }) => !removal.ok);
+  if (failedRemovals.length > 0) {
+    for (const { target, removal } of failedRemovals) {
+      if (removal.ok) continue;
+      for (const failure of removal.failures) {
+        yield removalFailureDiagnostic(failure, target.info.keySources.get(failure.key));
+      }
     }
     return;
   }
 
+  const combinedPlan = {
+    edits: removals.flatMap(({ removal }) => (removal.ok ? [...removal.plan.edits] : [])),
+    removedKeys: new Set(
+      removals.flatMap(({ removal }) => (removal.ok ? [...removal.plan.removedKeys] : []))
+    )
+  };
   try {
-    applyDictionaryRemoval(removal.plan);
+    applyDictionaryRemoval(combinedPlan);
   } catch (error) {
     yield diagnosticAtNode(
-      analysis.dictionary.declaration,
+      loadedDictionaries[0]!.info.declaration,
       DiagnosticCode.RemovalFailure,
       ts.DiagnosticCategory.Error,
       error instanceof Error ? error.message : String(error)
@@ -179,13 +211,16 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     return;
   }
 
-  for (const key of removal.plan.removedKeys) {
-    yield diagnosticAtSource(
-      analysis.dictionary.keySources.get(key),
-      DiagnosticCode.RemovedKey,
-      ts.DiagnosticCategory.Message,
-      `Removed unused translation key "${key}".`
-    );
+  for (const { target, removal } of removals) {
+    if (!removal.ok) continue;
+    for (const key of removal.plan.removedKeys) {
+      yield diagnosticAtSource(
+        target.info.keySources.get(key),
+        DiagnosticCode.RemovedKey,
+        ts.DiagnosticCategory.Message,
+        `Removed unused translation key "${key}".`
+      );
+    }
   }
 
   function notify(event: CacheEvent): void {

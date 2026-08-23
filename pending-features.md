@@ -17,11 +17,10 @@ This document defines potential `unused18n` capabilities independently from the 
 
 1. Namespace model.
 2. Missing-key diagnostics.
-3. Plural, ordinal, and context semantics.
-4. Multiple dictionaries and key exclusions.
-5. Typed registration for opaque translators.
-6. Source filtering and framework adapters.
-7. Additional dictionary loaders.
+3. Key exclusions.
+4. Typed registration for opaque translators.
+5. Source filtering and framework adapters.
+6. Additional dictionary loaders.
 
 Namespace identity must precede missing-key reporting: a statically resolved key cannot be declared missing until the analyzer knows which dictionary owns its namespace. Multiple dictionaries should follow dictionary-independent source facts so source analysis is not repeated for every locale.
 
@@ -133,11 +132,11 @@ This changes persisted fact semantics and requires a cache algorithm-version inc
 - CLI exit behavior with and without `--fail-on-missing`.
 - Cache hits after dictionary-only changes.
 
-## 3. Plural, ordinal, and context semantics
+## 3. Plural, ordinal, and context follow-ups
 
 ### Goal
 
-Interpret i18next call options so a base source key can account for the concrete dictionary variants used at runtime.
+Extend the shipped filename-inferred JSON v4 cardinal, ordinal, and finite-context support with explicit locale descriptors and richer runtime configuration.
 
 ### Public contract
 
@@ -189,11 +188,11 @@ Expand variants while comparing references with dictionary keys. Avoid modifying
 - Locale-specific categories.
 - Object-returning translations and `keyPrefix` composition.
 
-## 4. Multiple dictionaries
+## 4. Multiple dictionary follow-ups
 
 ### Goal
 
-Analyze several explicit dictionaries using one TypeScript program and one source-reference pass.
+Extend the shipped path/glob multi-dictionary analysis with namespace descriptors and structured aggregate results.
 
 ### Public contract
 

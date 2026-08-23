@@ -15,7 +15,7 @@ test('loads .unused18nrc and resolves configured paths from its directory', () =
 
   assert.equal(loaded.fileName, path.join(fixture, '.unused18nrc'));
   assert.equal(loaded.config.project, path.join(fixture, 'project/tsconfig.json'));
-  assert.equal(loaded.config.dictionary, path.join(fixture, 'project/dictionary.ts'));
+  assert.deepEqual(loaded.config.dictionaries, [path.join(fixture, 'project/dictionary.ts')]);
   assert.equal(loaded.config.cache, false);
   assert.equal(loaded.config.cacheStats, true);
 });
@@ -47,7 +47,7 @@ test('generated schema documents every config field and rejects unknown properti
     'cache',
     'cacheDir',
     'cacheStats',
-    'dictionary',
+    'dictionaries',
     'dictionaryExport',
     'maxExpansions',
     'project',
@@ -104,6 +104,17 @@ test('CLI can disable destructive boolean options from config', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Translation key "configUnused" is unused/);
   assert.equal(fs.readFileSync(dictionary, 'utf8'), before);
+});
+
+test('config-relative dictionary globs expand every matching locale', () => {
+  const result = spawnSync(
+    process.execPath,
+    [cli, `--config=${path.join(fixture, 'multi.json')}`],
+    { cwd: root, encoding: 'utf8' }
+  );
+
+  assert.equal(result.status, 1);
+  assert.equal((result.stderr.match(/Translation key "unused" is unused/g) ?? []).length, 3);
 });
 
 test('CLI reports config and merged required-option failures as argument errors', () => {
