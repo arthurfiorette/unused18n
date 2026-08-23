@@ -11,13 +11,15 @@ on:
         type: string
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
   publish:
     if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
 
     environment:
       name: NPM Registry
@@ -33,7 +35,8 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/setup@v2
         with:
-          cache: true
+          runtime: node@24
+          cache: false
           install: true
 
       - name: Verify stable release tag
@@ -50,5 +53,12 @@ jobs:
       - name: Update NPM
         run: npm install --global npm@latest
 
+      - name: Verify trusted publishing prerequisites
+        run: |
+          npm --version
+          test "$(npm config get registry)" = "https://registry.npmjs.org/"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
       - name: Publish to NPM
-        run: npm publish --access public --provenance
+        run: npm publish --access public
