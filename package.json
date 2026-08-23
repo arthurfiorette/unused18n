@@ -1,6 +1,6 @@
 {
   "name": "unused18n",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Type-aware unused i18next dictionary linter for TypeScript and JSON dictionaries.",
   "keywords": [
     "i18n",
