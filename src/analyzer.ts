@@ -10,7 +10,8 @@ import {
   joinKey,
   merge,
   prepend,
-  type StringResolution
+  type StringResolution,
+  unresolved
 } from './strings.js';
 import type { AnalysisResult, AnalyzeOptions, UsageEvidence } from './types.js';
 
@@ -21,7 +22,7 @@ interface TranslationWrapper {
 
 interface TranslationHookWrapper {
   owner: ts.FunctionLikeDeclaration;
-  prefixExpressions: Array<ts.Expression | undefined>;
+  prefixExpressions: Array<ts.Expression | null | undefined>;
   staticPrefixes: StringResolution[];
 }
 
@@ -253,6 +254,14 @@ export function analyzeLoadedProject(
           return;
         }
 
+        if (ts.isArrayBindingPattern(node.name) && hookPrefix) {
+          const first = node.name.elements[0];
+          if (first && ts.isBindingElement(first) && ts.isIdentifier(first.name)) {
+            addTranslator(checker.getSymbolAtLocation(first.name), hookPrefix);
+          }
+          return;
+        }
+
         if (ts.isIdentifier(node.name)) {
           const initializer = unwrapExpression(node.initializer);
           const aliasedPrefix = translatorPrefix(initializer);
@@ -383,7 +392,18 @@ export function analyzeLoadedProject(
     if (prefix) {
       const keyExpression = call.arguments[0];
       if (!keyExpression || isAnalyzedWrapperParameter(keyExpression, call)) return;
-      const resolution = prepend(prefix, strings.resolve(keyExpression));
+      // A call-level override deliberately escapes a bound translator prefix, notably for getFixedT.
+      const prefixOverride = call.arguments[1]
+        ? optionExpression(call.arguments[1], 'keyPrefix')
+        : undefined;
+      const resolution = prepend(
+        prefixOverride === null
+          ? merge(prefix, unresolved())
+          : prefixOverride
+            ? mergePrefixOverride(prefix, prefixOverride)
+            : prefix,
+        strings.resolve(keyExpression)
+      );
       if (callHasTrueOption(call, 'returnObjects')) {
         if (isUnconsumedObjectCall(call)) {
           markSubtrees(
@@ -620,7 +640,14 @@ export function analyzeLoadedProject(
     if (known) return known;
 
     const unwrapped = unwrapExpression(expression);
+    if (ts.isCallExpression(unwrapped) && isGetFixedTCall(unwrapped)) {
+      // i18next defines the third getFixedT argument as keyPrefix; language and namespace are separate.
+      const prefix = unwrapped.arguments[2];
+      return prefix ? strings.resolve(prefix) : empty();
+    }
     if (ts.isPropertyAccessExpression(unwrapped) && unwrapped.name.text === 't') {
+      const hookPrefix = translationHookPrefix(unwrapped.expression);
+      if (hookPrefix) return hookPrefix;
       const symbol = checker.getSymbolAtLocation(unwrapped.name);
       if (
         isLibrarySymbol(symbol, 't', 'i18next') ||
@@ -628,6 +655,22 @@ export function analyzeLoadedProject(
       ) {
         return empty();
       }
+    }
+    if (
+      ts.isElementAccessExpression(unwrapped) &&
+      unwrapped.argumentExpression &&
+      strings.resolve(unwrapped.argumentExpression).values.has('0')
+    ) {
+      const hookPrefix = translationHookPrefix(unwrapped.expression);
+      if (hookPrefix) return hookPrefix;
+    }
+    const directSymbol = checker.getSymbolAtLocation(unwrapped);
+    if (
+      isImportedName(directSymbol, 't', 'i18next') ||
+      isLibrarySymbol(directSymbol, 't', 'i18next') ||
+      isI18nextTFunction(unwrapped)
+    ) {
+      return empty();
     }
     return undefined;
   }
@@ -638,13 +681,30 @@ export function analyzeLoadedProject(
     const callee = unwrapExpression(unwrapped.expression);
     const target = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
     const symbol = checker.getSymbolAtLocation(target);
+    // Name-only matching would let unrelated application hooks suppress valid unused diagnostics.
     if (isImportedName(symbol, 'useTranslation', 'react-i18next')) return true;
-    if (ts.isIdentifier(callee) && callee.text === 'useTranslation') return true;
-    return ts.isPropertyAccessExpression(callee) && callee.name.text === 'useTranslation';
+    if (isLibrarySymbol(symbol, 'useTranslation', 'react-i18next')) return true;
+    return (
+      ts.isPropertyAccessExpression(callee) &&
+      callee.name.text === 'useTranslation' &&
+      isNamespaceImportFrom(callee.expression, 'react-i18next')
+    );
   }
 
-  function translationHookPrefix(expression: ts.Expression): StringResolution | undefined {
+  function translationHookPrefix(
+    expression: ts.Expression,
+    seen = new Set<ts.Node>()
+  ): StringResolution | undefined {
     const unwrapped = unwrapExpression(expression);
+    if (seen.has(unwrapped)) return undefined;
+    const nextSeen = new Set(seen).add(unwrapped);
+    if (ts.isIdentifier(unwrapped)) {
+      // Follow local result aliases so later destructuring retains the prefix proven at hook creation.
+      const declaration = normalizedSymbol(unwrapped)?.declarations?.find(ts.isVariableDeclaration);
+      return declaration?.initializer
+        ? translationHookPrefix(declaration.initializer, nextSeen)
+        : undefined;
+    }
     if (!ts.isCallExpression(unwrapped)) return undefined;
     const cached = translationHookCache.get(unwrapped);
     if (cached !== undefined) return cached ?? undefined;
@@ -662,9 +722,12 @@ export function analyzeLoadedProject(
     let result: StringResolution | undefined;
     for (const prefix of wrapper.staticPrefixes) result = result ? merge(result, prefix) : prefix;
     for (const prefixExpression of wrapper.prefixExpressions) {
-      const prefix = prefixExpression
-        ? resolveHookPrefixArgument(prefixExpression, wrapper.owner, unwrapped)
-        : empty();
+      const prefix =
+        prefixExpression === null
+          ? unresolved()
+          : prefixExpression
+            ? resolveHookPrefixArgument(prefixExpression, wrapper.owner, unwrapped)
+            : empty();
       result = result ? merge(result, prefix) : prefix;
     }
 
@@ -674,12 +737,12 @@ export function analyzeLoadedProject(
 
   function keyPrefixFromUseTranslation(call: ts.CallExpression): StringResolution {
     const expression = keyPrefixExpressionFromUseTranslation(call);
-    return expression ? strings.resolve(expression) : empty();
+    return expression === null ? unresolved() : expression ? strings.resolve(expression) : empty();
   }
 
   function keyPrefixExpressionFromUseTranslation(
     call: ts.CallExpression
-  ): ts.Expression | undefined {
+  ): ts.Expression | null | undefined {
     const options = call.arguments[1];
     return options ? optionExpression(options, 'keyPrefix') : undefined;
   }
@@ -705,7 +768,7 @@ export function analyzeLoadedProject(
     expression: ts.Expression,
     option: string,
     seen = new Set<ts.Node>()
-  ): ts.Expression | undefined {
+  ): ts.Expression | null | undefined {
     const value = unwrapExpression(expression);
     if (seen.has(value)) return undefined;
     const nextSeen = new Set(seen).add(value);
@@ -713,13 +776,13 @@ export function analyzeLoadedProject(
       const declaration = normalizedSymbol(value)?.declarations?.find(ts.isVariableDeclaration);
       return declaration?.initializer
         ? optionExpression(declaration.initializer, option, nextSeen)
-        : undefined;
+        : null;
     }
-    if (!ts.isObjectLiteralExpression(value)) return undefined;
+    if (!ts.isObjectLiteralExpression(value)) return null;
     for (const property of [...value.properties].reverse()) {
       if (ts.isSpreadAssignment(property)) {
         const spread = optionExpression(property.expression, option, nextSeen);
-        if (spread) return spread;
+        if (spread !== undefined) return spread;
         continue;
       }
       if (ts.isShorthandPropertyAssignment(property) && property.name.text === option) {
@@ -735,8 +798,9 @@ export function analyzeLoadedProject(
         return property.name;
       }
       if (!ts.isPropertyAssignment(property)) continue;
-      const name = property.name.getText(value.getSourceFile()).replaceAll(/['"]/g, '');
+      const name = staticPropertyName(property.name);
       if (name === option) return property.initializer;
+      if (name === undefined && ts.isComputedPropertyName(property.name)) return null;
     }
     return undefined;
   }
@@ -784,7 +848,7 @@ export function analyzeLoadedProject(
         if (spread !== undefined) return spread;
       }
       if (!ts.isPropertyAssignment(property)) continue;
-      const name = property.name.getText(value.getSourceFile()).replaceAll(/['"]/g, '');
+      const name = staticPropertyName(property.name);
       if (name === option) return property.initializer.kind === ts.SyntaxKind.TrueKeyword;
     }
     return undefined;
@@ -968,6 +1032,70 @@ export function analyzeLoadedProject(
     );
   }
 
+  function isGetFixedTCall(call: ts.CallExpression): boolean {
+    const callee = unwrapExpression(call.expression);
+    const target = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
+    const symbol = checker.getSymbolAtLocation(target);
+    if (isImportedName(symbol, 'getFixedT', 'i18next')) return true;
+    if (isLibrarySymbol(symbol, 'getFixedT', 'i18next')) return true;
+    return (
+      ts.isPropertyAccessExpression(callee) &&
+      callee.name.text === 'getFixedT' &&
+      (isDefaultImportFrom(callee.expression, 'i18next') ||
+        isNamespaceImportFrom(callee.expression, 'i18next'))
+    );
+  }
+
+  function isI18nextTFunction(expression: ts.Expression): boolean {
+    // Type provenance supports declaration-only TFunction values without accepting structural lookalikes.
+    const type = checker.getTypeAtLocation(expression);
+    if (type.getCallSignatures().length === 0) return false;
+    const symbols = [type.aliasSymbol, type.getSymbol()];
+    if (
+      symbols.some(
+        (symbol) =>
+          symbol?.name === 'TFunction' &&
+          symbol.declarations?.some((declaration) =>
+            declarationBelongsToPackage(declaration, 'i18next')
+          )
+      )
+    ) {
+      return true;
+    }
+    return type.getCallSignatures().some((signature) => {
+      const declaration = signature.getDeclaration();
+      if (!declaration || !declarationBelongsToPackage(declaration, 'i18next')) return false;
+      let current: ts.Node | undefined = declaration;
+      while (current) {
+        if (
+          ((ts.isInterfaceDeclaration(current) || ts.isTypeAliasDeclaration(current)) &&
+            current.name.text === 'TFunction') ||
+          (ts.isPropertySignature(current) && current.name.getText() === 't')
+        ) {
+          return true;
+        }
+        current = current.parent;
+      }
+      return false;
+    });
+  }
+
+  function mergePrefixOverride(
+    boundPrefix: StringResolution,
+    expression: ts.Expression
+  ): StringResolution {
+    const value = unwrapExpression(expression);
+    if (
+      value.kind === ts.SyntaxKind.NullKeyword ||
+      (ts.isIdentifier(value) && value.text === 'undefined')
+    ) {
+      return boundPrefix;
+    }
+    const override = strings.resolve(value);
+    // An optional runtime override may fall back to the bound prefix, so neither branch is discarded.
+    return override.complete ? override : merge(boundPrefix, override);
+  }
+
   function isLibrarySymbol(
     symbol: ts.Symbol | undefined,
     exportedName: string,
@@ -977,9 +1105,27 @@ export function analyzeLoadedProject(
     return Boolean(
       normalized?.name === exportedName &&
         normalized.declarations?.some((declaration) =>
-          declaration.getSourceFile().fileName.includes(packageName)
+          declarationBelongsToPackage(declaration, packageName)
         )
     );
+  }
+
+  function declarationBelongsToPackage(declaration: ts.Node, packageName: string): boolean {
+    // Installed declarations and ambient test/consumer declarations encode package ownership differently.
+    const marker = `${path.sep}node_modules${path.sep}${packageName}${path.sep}`;
+    if (path.resolve(declaration.getSourceFile().fileName).includes(marker)) return true;
+    let current: ts.Node | undefined = declaration;
+    while (current) {
+      if (
+        ts.isModuleDeclaration(current) &&
+        ts.isStringLiteral(current.name) &&
+        current.name.text === packageName
+      ) {
+        return true;
+      }
+      current = current.parent;
+    }
+    return false;
   }
 
   function isDefaultImportFrom(expression: ts.Expression, packageName: string): boolean {
@@ -996,6 +1142,32 @@ export function analyzeLoadedProject(
       })
     );
   }
+
+  function isNamespaceImportFrom(expression: ts.Expression, packageName: string): boolean {
+    const symbol = checker.getSymbolAtLocation(unwrapExpression(expression));
+    return Boolean(
+      symbol?.declarations?.some((declaration) => {
+        if (!ts.isNamespaceImport(declaration)) return false;
+        const importDeclaration = declaration.parent.parent;
+        return (
+          ts.isImportDeclaration(importDeclaration) &&
+          ts.isStringLiteral(importDeclaration.moduleSpecifier) &&
+          importDeclaration.moduleSpecifier.text === packageName
+        );
+      })
+    );
+  }
+}
+
+function staticPropertyName(name: ts.PropertyName): string | undefined {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) {
+    return name.text;
+  }
+  if (ts.isComputedPropertyName(name)) {
+    const expression = unwrapExpression(name.expression);
+    if (ts.isStringLiteral(expression) || ts.isNumericLiteral(expression)) return expression.text;
+  }
+  return undefined;
 }
 
 function returnedTranslatorProperty(

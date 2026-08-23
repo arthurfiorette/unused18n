@@ -333,7 +333,13 @@ export function merge(a: StringResolution, b: StringResolution): StringResolutio
 export function prepend(prefix: StringResolution, key: StringResolution): StringResolution {
   const values = new Set<string>();
   const patterns = new Set<string>();
-  const prefixes = prefix.values.size > 0 ? prefix.values : new Set(['']);
+  // Only a proven empty prefix may preserve an exact unprefixed key; unknown prefixes stay unknown.
+  const prefixes =
+    prefix.values.size > 0
+      ? prefix.values
+      : prefix.complete && prefix.patterns.size === 0
+        ? new Set([''])
+        : new Set<string>();
   for (const left of prefixes) {
     for (const right of key.values) values.add(joinKey(left, right));
     for (const right of key.patterns) patterns.add(joinKey(left, right));

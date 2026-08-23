@@ -47,11 +47,11 @@ src/i18n/en.json:4:5 - warning TS95001: Translation key "common.cancel" is unuse
 
 ### Dictionary formats
 
-| Dictionary | Export option |
-| --- | --- |
-| JSON object | None; JSON always uses its implicit default export |
-| TypeScript default export | None; `default` is used automatically |
-| TypeScript named export | Pass `--export=<name>` |
+| Dictionary                | Export option                                      |
+| ------------------------- | -------------------------------------------------- |
+| JSON object               | None; JSON always uses its implicit default export |
+| TypeScript default export | None; `default` is used automatically              |
+| TypeScript named export   | Pass `--export=<name>`                             |
 
 TypeScript exports must resolve statically to an object or array. Application files must be included in the selected TypeScript project. JSON dictionaries work without enabling `resolveJsonModule` in your `tsconfig.json`.
 
@@ -78,7 +78,15 @@ function statusLabel(status: 'pending' | 'complete') {
 Translator aliases, `keyPrefix`, `<Trans>`, and analyzable custom hooks or typed helpers retain their translation provenance:
 
 ```tsx
-import { Trans as Message, useTranslation as useI18n } from 'react-i18next';
+import i18n, { getFixedT, t as translate } from 'i18next';
+import {
+  Trans as Message,
+  useTranslation as useI18n
+} from 'react-i18next';
+
+translate('common.save');
+i18n.t('common.cancel');
+getFixedT(null, null, 'checkout')('title');
 
 const { t: commonT } = useI18n(undefined, { keyPrefix: 'common' });
 commonT('save');
@@ -93,7 +101,7 @@ checkoutT('title');
 <Message i18nKey='empty.title' />;
 ```
 
-Custom wrappers must have an implementation available in the selected TypeScript project. Declaration-only helpers cannot be analyzed.
+Application-specific wrappers must have an implementation available in the selected TypeScript project unless the translator value is typed as i18next's `TFunction`.
 
 ### Objects and dictionary access
 
@@ -127,16 +135,16 @@ Removal preserves unrelated formatting and comments. It is all-or-nothing: if an
 
 ## CLI options
 
-| Option | Description |
-| --- | --- |
-| `-p, --project <path>` | Required. Path to `tsconfig.json` or its directory |
-| `-d, --dictionary <path>` | Required. TypeScript or JSON dictionary file |
-| `-e, --export <name>` | TypeScript export name; defaults to `default` |
-| `--remove` | Remove every safely editable unused key |
-| `--max-expansions <n>` | Maximum number of finite key combinations; defaults to `1000` |
-| `--no-cache` | Disable persistent caching |
-| `--cache-dir <path>` | Override the cache directory |
-| `--cache-stats` | Print cache hits, misses, and reused file counts |
+| Option                    | Description                                                   |
+| ------------------------- | ------------------------------------------------------------- |
+| `-p, --project <path>`    | Required. Path to `tsconfig.json` or its directory            |
+| `-d, --dictionary <path>` | Required. TypeScript or JSON dictionary file                  |
+| `-e, --export <name>`     | TypeScript export name; defaults to `default`                 |
+| `--remove`                | Remove every safely editable unused key                       |
+| `--max-expansions <n>`    | Maximum number of finite key combinations; defaults to `1000` |
+| `--no-cache`              | Disable persistent caching                                    |
+| `--cache-dir <path>`      | Override the cache directory                                  |
+| `--cache-stats`           | Print cache hits, misses, and reused file counts              |
 
 Caching is enabled by default under `<tsconfig-directory>/node_modules/.cache/unused18n`. The directory can be safely deleted. Cache failures fall back to a normal analysis without changing diagnostics or exit status.
 
@@ -144,11 +152,11 @@ Run `npx unused18n help` for command help or `npx unused18n autocomplete` to con
 
 ## Exit codes
 
-| Code | Meaning |
-| --- | --- |
-| `0` | No unused keys remain, or every requested removal succeeded |
-| `1` | Unused keys remain, or analysis/removal failed |
-| `2` | CLI arguments or flags are invalid |
+| Code | Meaning                                                     |
+| ---- | ----------------------------------------------------------- |
+| `0`  | No unused keys remain, or every requested removal succeeded |
+| `1`  | Unused keys remain, or analysis/removal failed              |
+| `2`  | CLI arguments or flags are invalid                          |
 
 ## Programmatic API
 
@@ -169,15 +177,15 @@ for (const diagnostic of lint({
 
 ### `LintOptions`
 
-| Option | Type | Default |
-| --- | --- | --- |
-| `project` | `string` | Required |
-| `dictionary` | `string` | Required |
-| `dictionaryExport` | `string` | `'default'` |
-| `maxExpansions` | `number` | `1000` |
-| `remove` | `boolean` | `false` |
-| `cache` | `boolean` | `true` |
-| `cacheDir` | `string` | `<tsconfig-directory>/node_modules/.cache/unused18n` |
-| `onCacheEvent` | `(event: CacheEvent) => void` | No callback |
+| Option             | Type                          | Default                                              |
+| ------------------ | ----------------------------- | ---------------------------------------------------- |
+| `project`          | `string`                      | Required                                             |
+| `dictionary`       | `string`                      | Required                                             |
+| `dictionaryExport` | `string`                      | `'default'`                                          |
+| `maxExpansions`    | `number`                      | `1000`                                               |
+| `remove`           | `boolean`                     | `false`                                              |
+| `cache`            | `boolean`                     | `true`                                               |
+| `cacheDir`         | `string`                      | `<tsconfig-directory>/node_modules/.cache/unused18n` |
+| `onCacheEvent`     | `(event: CacheEvent) => void` | No callback                                          |
 
 The package exports `lint`, `DiagnosticCode`, and the `LintOptions` and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary.
