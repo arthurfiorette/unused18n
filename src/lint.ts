@@ -14,7 +14,7 @@ import type { UsageEvidence } from './types.js';
 export interface LintOptions {
   project: string;
   dictionary: string;
-  dictionaryExport: string;
+  dictionaryExport?: string;
   maxExpansions?: number;
   remove?: boolean;
 }
@@ -27,6 +27,7 @@ export { DiagnosticCode };
  */
 export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void> {
   const dictionaryPath = path.resolve(options.dictionary);
+  const dictionaryExport = options.dictionaryExport ?? 'default';
   const project = loadProjectWithDiagnostics(options.project, [dictionaryPath]);
   yield* project.diagnostics;
   if (!project.loaded) return;
@@ -48,7 +49,7 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     const analysisOptions = {
       project: options.project,
       dictionary: dictionaryPath,
-      dictionaryExport: options.dictionaryExport,
+      dictionaryExport,
       includeEvidence: true
     };
     analysis = analyzeLoadedProject(

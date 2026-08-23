@@ -56,9 +56,17 @@ export function loadProjectWithDiagnostics(
 
   const roots = new Set(parsed.fileNames.map((file) => path.resolve(file)));
   for (const file of extraFiles) roots.add(path.resolve(file));
+  const resolveJsonModule = extraFiles.some((file) => path.extname(file).toLowerCase() === '.json');
+  const jsonOptions: ts.CompilerOptions = {
+    ...parsed.options,
+    allowNonTsExtensions: true
+  };
+  if (parsed.options.moduleResolution !== ts.ModuleResolutionKind.Classic) {
+    jsonOptions.resolveJsonModule = true;
+  }
   const createOptions: ts.CreateProgramOptions = {
     rootNames: [...roots].sort(comparePaths),
-    options: parsed.options
+    options: resolveJsonModule ? jsonOptions : parsed.options
   };
   if (parsed.projectReferences) createOptions.projectReferences = parsed.projectReferences;
   const program = ts.createProgram(createOptions);

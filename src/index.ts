@@ -10,11 +10,11 @@ const formatHost: ts.FormatDiagnosticsHost = {
 
 export default class Unused18n extends Command {
   static override description =
-    'Lint a TypeScript i18next dictionary and report keys without statically recoverable usage.';
+    'Lint a TypeScript or JSON i18next dictionary and report keys without statically recoverable usage.';
 
   static override examples = [
     '<%= config.bin %> lint --project ./tsconfig.json --dictionary ./src/i18n/pt.ts --export dictionary',
-    '<%= config.bin %> lint --project . --dictionary ./src/i18n/pt.ts --export dictionary --remove'
+    '<%= config.bin %> lint --project . --dictionary ./src/i18n/en.json --remove'
   ];
 
   static override flags = {
@@ -22,14 +22,13 @@ export default class Unused18n extends Command {
       char: 'd',
       helpValue: '<path>',
       required: true,
-      summary: 'TypeScript source file containing the dictionary export'
+      summary: 'TypeScript or JSON source file containing the dictionary'
     }),
     export: Flags.string({
       char: 'e',
       helpValue: '<name>',
-      required: true,
       default: 'default',
-      summary: 'Exported dictionary variable name'
+      summary: 'TypeScript dictionary export name; JSON uses default'
     }),
     'max-expansions': Flags.integer({
       default: 1_000,

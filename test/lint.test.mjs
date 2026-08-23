@@ -172,6 +172,200 @@ dictionary.used
   );
 });
 
+test('lints a JSON dictionary through default import usage without resolveJsonModule', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: { module: 'ESNext', moduleResolution: 'Bundler', strict: true },
+      include: ['usage.ts']
+    }),
+    'messages.json': JSON.stringify(
+      {
+        common: { used: 'Used', unused: 'Unused' },
+        categories: { first: 'First', second: 'Second' }
+      },
+      null,
+      2
+    ),
+    'usage.ts': `import messages from './messages.json' with { type: 'json' }
+const copy = messages
+copy.common.used
+Object.keys(messages.categories)
+`
+  });
+  const dictionary = path.join(project, 'messages.json');
+  const result = [...lint({ project, dictionary })];
+
+  assert.deepEqual(
+    result
+      .filter(({ code }) => code === DiagnosticCode.UnusedKey)
+      .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]),
+    ['common.unused']
+  );
+
+  const command = spawnSync(
+    process.execPath,
+    [cli, `--project=${project}`, `--dictionary=${dictionary}`],
+    { encoding: 'utf8' }
+  );
+  assert.equal(command.status, 1);
+  assert.match(command.stderr, /Translation key "common\.unused" is unused/);
+});
+
+test('rejects named exports for JSON dictionaries', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['usage.ts'] }),
+    'messages.json': JSON.stringify({ unused: 'Unused' }),
+    'usage.ts': 'export {}\n'
+  });
+  const result = [
+    ...lint({
+      project,
+      dictionary: path.join(project, 'messages.json'),
+      dictionaryExport: 'messages'
+    })
+  ];
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0]?.code, DiagnosticCode.ConfigurationFailure);
+  assert.match(
+    String(result[0]?.messageText),
+    /JSON dictionaries only expose the "default" export/
+  );
+});
+
+test('removes unused JSON object properties while preserving valid JSON', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: { module: 'ESNext', moduleResolution: 'Bundler' },
+      include: ['usage.ts']
+    }),
+    'messages.json': `{
+  "common": {
+    "used": "Used",
+    "unused": "Unused"
+  },
+  "remove": "Remove"
+}
+`,
+    'usage.ts': `import messages from './messages.json' with { type: 'json' }
+messages.common.used
+`
+  });
+  const dictionary = path.join(project, 'messages.json');
+  const result = [...lint({ project, dictionary, remove: true })];
+  const output = fs.readFileSync(dictionary, 'utf8');
+
+  assert.equal(result.filter(({ code }) => code === DiagnosticCode.RemovedKey).length, 2);
+  assert.deepEqual(JSON.parse(output), { common: { used: 'Used' } });
+  assert.match(output, /"used": "Used"/);
+});
+
+test('malformed JSON and array removals leave the dictionary unchanged', (t) => {
+  const malformedProject = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['usage.ts'] }),
+    'messages.json': `{ "broken": }
+`,
+    'usage.ts': 'export {}\n'
+  });
+  const malformedPath = path.join(malformedProject, 'messages.json');
+  const malformedBefore = fs.readFileSync(malformedPath, 'utf8');
+  const malformed = [
+    ...lint({ project: malformedProject, dictionary: malformedPath, remove: true })
+  ];
+
+  assert.ok(malformed.some(({ category }) => category === ts.DiagnosticCategory.Error));
+  assert.ok(malformed.every(({ code }) => code !== DiagnosticCode.RemovedKey));
+  assert.equal(fs.readFileSync(malformedPath, 'utf8'), malformedBefore);
+
+  const arrayProject = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: { module: 'ESNext', moduleResolution: 'Bundler' },
+      include: ['usage.ts']
+    }),
+    'messages.json': JSON.stringify({ used: 'Used', items: [{ unused: 'Unused' }] }, null, 2),
+    'usage.ts': `import messages from './messages.json' with { type: 'json' }
+messages.used
+`
+  });
+  const arrayPath = path.join(arrayProject, 'messages.json');
+  const arrayBefore = fs.readFileSync(arrayPath, 'utf8');
+  const arrayResult = [...lint({ project: arrayProject, dictionary: arrayPath, remove: true })];
+
+  assert.ok(arrayResult.some(({ code }) => code === DiagnosticCode.RemovalFailure));
+  assert.equal(fs.readFileSync(arrayPath, 'utf8'), arrayBefore);
+});
+
+test('rejects JSONC syntax before removal', (t) => {
+  for (const source of [
+    `{ "used": "Used", "unused": "Unused", }
+`,
+    `{
+  // JSON comments are not portable.
+  "used": "Used",
+  "unused": "Unused"
+}
+`
+  ]) {
+    const project = temporaryProject(t, {
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: { module: 'ESNext', moduleResolution: 'Bundler' },
+        include: ['usage.ts']
+      }),
+      'messages.json': source,
+      'usage.ts': `import messages from './messages.json' with { type: 'json' }
+messages.used
+`
+    });
+    const dictionary = path.join(project, 'messages.json');
+    const before = fs.readFileSync(dictionary, 'utf8');
+    const result = [...lint({ project, dictionary, remove: true })];
+
+    assert.ok(result.some(({ code }) => code === DiagnosticCode.ConfigurationFailure));
+    assert.ok(result.every(({ code }) => code !== DiagnosticCode.RemovedKey));
+    assert.equal(fs.readFileSync(dictionary, 'utf8'), before);
+  }
+});
+
+test('lints JSON under Classic module resolution without overriding the resolver', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: { ignoreDeprecations: '6.0', moduleResolution: 'Classic' },
+      include: ['usage.ts']
+    }),
+    'messages.json': JSON.stringify({ unused: 'Unused' }),
+    'usage.ts': 'export {}\n'
+  });
+  const result = [...lint({ project, dictionary: path.join(project, 'messages.json') })];
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0]?.code, DiagnosticCode.UnusedKey);
+});
+
+test('accepts empty JSON objects and rejects scalar JSON roots', (t) => {
+  const emptyProject = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['usage.ts'] }),
+    'messages.json': '{}',
+    'usage.ts': 'export {}\n'
+  });
+  assert.deepEqual(
+    [...lint({ project: emptyProject, dictionary: path.join(emptyProject, 'messages.json') })],
+    []
+  );
+
+  for (const value of ['"text"', '42', 'true', 'null']) {
+    const scalarProject = temporaryProject(t, {
+      'tsconfig.json': JSON.stringify({ include: ['usage.ts'] }),
+      'messages.json': value,
+      'usage.ts': 'export {}\n'
+    });
+    const result = [
+      ...lint({ project: scalarProject, dictionary: path.join(scalarProject, 'messages.json') })
+    ];
+    assert.equal(result.at(-1)?.code, DiagnosticCode.ConfigurationFailure);
+    assert.match(String(result.at(-1)?.messageText), /must resolve to an object or array/);
+  }
+});
+
 test('--remove applies every safe edit and leaves no unused diagnostics', (t) => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'unused18n-remove-'));
   t.after(() => fs.rmSync(project, { force: true, recursive: true }));

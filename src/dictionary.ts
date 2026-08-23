@@ -31,7 +31,7 @@ export interface DictionaryKeySource {
 /** The flattened dictionary and source provenance needed for read-only removal planning. */
 export interface DictionaryInfo {
   readonly sourceFile: ts.SourceFile;
-  readonly declaration: ts.VariableDeclaration | ts.ExportAssignment;
+  readonly declaration: ts.Node;
   readonly symbol: ts.Symbol;
   readonly type: ts.Type;
   /** Active flattened keys after spreads and later properties have overwritten earlier values. */
@@ -54,20 +54,53 @@ export function readDictionary(
   if (!sourceFile)
     throw new Error(`Dictionary is not part of the TypeScript program: ${absolutePath}`);
 
-  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
-  const exported = moduleSymbol
-    ? checker.getExportsOfModule(moduleSymbol).find((symbol) => symbol.name === exportName)
-    : undefined;
-  if (!exported) throw new Error(`Export "${exportName}" not found in ${absolutePath}`);
+  let declaration: ts.Node;
+  let initializer: ts.Expression;
+  let symbol: ts.Symbol;
+  if (path.extname(absolutePath).toLowerCase() === '.json') {
+    try {
+      JSON.parse(sourceFile.text);
+    } catch (error) {
+      throw new Error(
+        `Invalid JSON dictionary ${absolutePath}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    if (exportName !== 'default') {
+      throw new Error(
+        `JSON dictionaries only expose the "default" export; received "${exportName}"`
+      );
+    }
+    const statement = sourceFile.statements.find(ts.isExpressionStatement);
+    // TypeScript binds JSON's synthetic `export=` here but omits the field from its public type.
+    const sourceSymbol = (sourceFile as ts.SourceFile & { readonly symbol?: ts.Symbol }).symbol;
+    const jsonSymbol = sourceSymbol?.exports?.get(ts.InternalSymbolName.ExportEquals);
+    if (!statement || !jsonSymbol) {
+      throw new Error(`JSON dictionary could not be resolved: ${absolutePath}`);
+    }
+    declaration = statement;
+    initializer = statement.expression;
+    symbol = jsonSymbol;
+  } else {
+    const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+    const exported = moduleSymbol
+      ? checker.getExportsOfModule(moduleSymbol).find((candidate) => candidate.name === exportName)
+      : undefined;
+    if (!exported) throw new Error(`Export "${exportName}" not found in ${absolutePath}`);
 
-  const symbol = unwrapAlias(checker, exported);
-  if (!symbol) throw new Error(`Export "${exportName}" could not be resolved`);
-  const variableDeclaration = symbol.declarations?.find(ts.isVariableDeclaration);
-  const exportAssignment = symbol.declarations?.find(ts.isExportAssignment);
-  const declaration = variableDeclaration ?? exportAssignment;
-  const initializer = variableDeclaration?.initializer ?? exportAssignment?.expression;
-  if (!declaration || !initializer) {
-    throw new Error(`Export "${exportName}" must resolve to an initialized dictionary expression`);
+    const resolvedSymbol = unwrapAlias(checker, exported);
+    if (!resolvedSymbol) throw new Error(`Export "${exportName}" could not be resolved`);
+    const variableDeclaration = resolvedSymbol.declarations?.find(ts.isVariableDeclaration);
+    const exportAssignment = resolvedSymbol.declarations?.find(ts.isExportAssignment);
+    const resolvedDeclaration = variableDeclaration ?? exportAssignment;
+    const resolvedInitializer = variableDeclaration?.initializer ?? exportAssignment?.expression;
+    if (!resolvedDeclaration || !resolvedInitializer) {
+      throw new Error(
+        `Export "${exportName}" must resolve to an initialized dictionary expression`
+      );
+    }
+    declaration = resolvedDeclaration;
+    initializer = resolvedInitializer;
+    symbol = resolvedSymbol;
   }
 
   const keySources = new Map<string, DictionaryKeySource>();
@@ -240,9 +273,10 @@ function flattenExpression(
     const blockedChain = addBarrier(propertyChain, 'array');
     expression.elements.forEach((element, index) => {
       if (ts.isExpression(element)) {
+        const elementPrefix = [...prefix, String(index)];
         flattenExpression(
           element,
-          [...prefix, String(index)],
+          elementPrefix,
           blockedChain,
           keySources,
           checker,
@@ -250,6 +284,7 @@ function flattenExpression(
           new Set(seen),
           sharedSource
         );
+        addBarrierToSubtree(keySources, elementPrefix.join('.'), 'array');
       }
     });
     return;

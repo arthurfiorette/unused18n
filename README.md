@@ -1,6 +1,6 @@
 # unused18n
 
-Type-aware unused i18next dictionary linter for TypeScript projects.
+Type-aware unused i18next dictionary linter for TypeScript and JSON dictionaries.
 
 `unused18n` creates one TypeScript program, follows translation aliases and finite key types, and reports unused keys at their dictionary declarations. It is ESM-only and requires Node.js 24 or newer.
 
@@ -12,7 +12,26 @@ pnpm add --save-dev unused18n
 
 ## Usage
 
-Given a default-exported dictionary:
+JSON dictionaries work without changing `resolveJsonModule` in your project:
+
+```json
+{
+  "common": {
+    "save": "Save",
+    "cancel": "Cancel"
+  }
+}
+```
+
+```sh
+pnpm unused18n lint \
+  --project=./tsconfig.json \
+  --dictionary=./src/i18n/en.json
+```
+
+JSON exposes an implicit default export, so `--export` is unnecessary. A non-default export name is rejected instead of ignored.
+
+TypeScript dictionaries can use a default export:
 
 ```ts
 // src/i18n/en.ts
@@ -53,8 +72,8 @@ Flags:
 
 ```text
 -p, --project <path>        tsconfig.json or its directory
--d, --dictionary <path>     TypeScript dictionary source file
--e, --export <name>         named export, or "default" for the default export
+-d, --dictionary <path>     TypeScript or JSON dictionary source file
+-e, --export <name>         TypeScript export name (default: "default")
     --max-expansions <n>    finite string-union expansion limit (default: 1000)
     --remove                remove every safely editable unused key
 ```
@@ -146,6 +165,16 @@ const { cancel } = dictionary.common;
 Object.keys(dictionary.categories);
 ```
 
+The same usage analysis applies to default JSON imports:
+
+```ts
+import messages from './i18n/en.json' with { type: 'json' };
+
+messages.common.save;
+const { cancel } = messages.common;
+Object.keys(messages.categories);
+```
+
 Unbounded runtime keys produce source-located warnings. They do not hide unrelated unused keys.
 
 ## Removing unused keys
@@ -153,14 +182,15 @@ Unbounded runtime keys produce source-located warnings. They do not hide unrelat
 ```sh
 pnpm unused18n lint \
   --project=. \
-  --dictionary=./src/i18n/en.ts \
-  --export=default \
+  --dictionary=./src/i18n/en.json \
   --remove
 ```
 
 `--remove` plans all edits before changing the dictionary, verifies the original source text, and deletes properties without reprinting the AST. Unrelated formatting and comments remain untouched.
 
-Removal is refused when an unused key comes from an array, computed property, imported or shared object, unresolved spread, or ambiguous overwrite. If any requested edit is unsafe, the file remains unchanged.
+JSON and TypeScript object properties use the same formatting-preserving removal planner. Arrays are valid dictionaries and their numeric keys are linted, but array-derived keys cannot be removed because deleting an element would shift later indexes.
+
+Removal is also refused when an unused key comes from a computed property, imported or shared object, unresolved spread, or ambiguous overwrite. If any requested edit is unsafe, the file remains unchanged. Malformed JSON and scalar JSON roots stop before analysis or mutation.
 
 ## Exit codes
 
@@ -180,8 +210,7 @@ import { DiagnosticCode, lint } from 'unused18n';
 
 for (const diagnostic of lint({
   project: './tsconfig.json',
-  dictionary: './src/i18n/en.ts',
-  dictionaryExport: 'default'
+  dictionary: './src/i18n/en.json'
 })) {
   if (diagnostic.code === DiagnosticCode.UnusedKey) {
     console.log(diagnostic.file?.fileName, diagnostic.messageText);
@@ -189,4 +218,4 @@ for (const diagnostic of lint({
 }
 ```
 
-`lint()` is a lazy generator. Consuming it loads the project, analyzes usage, and optionally applies `remove: true`. It yields standard TypeScript diagnostics, including project configuration and syntax errors that prevent safe analysis.
+`dictionaryExport` is optional and defaults to `default`; set it for named TypeScript exports. `lint()` is a lazy generator. Consuming it loads the project, analyzes usage, and optionally applies `remove: true`. It yields standard TypeScript diagnostics, including project configuration and syntax errors that prevent safe analysis.

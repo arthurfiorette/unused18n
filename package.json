@@ -1,7 +1,7 @@
 {
   "name": "unused18n",
   "version": "0.1.0",
-  "description": "Type-aware unused i18next dictionary linter for TypeScript projects.",
+  "description": "Type-aware unused i18next dictionary linter for TypeScript and JSON dictionaries.",
   "keywords": [
     "i18n",
     "i18next",
@@ -35,6 +35,7 @@
   "scripts": {
     "build": "pnpm clean && tsc -p tsconfig.build.json",
     "check": "pnpm lint-ci && pnpm test-types && pnpm test",
+    "clean": "node --input-type=module -e \"import fs from 'node:fs'; fs.rmSync('dist', { recursive: true, force: true })\"",
     "format": "biome format --write .",
     "lint": "biome check .",
     "lint-ci": "biome ci .",
