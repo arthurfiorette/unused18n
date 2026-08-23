@@ -33,7 +33,7 @@
     "unused18n": "bin/run.js"
   },
   "scripts": {
-    "build": "pnpm clean && tsc -p tsconfig.build.json",
+    "build": "pnpm schema && pnpm clean && tsc -p tsconfig.build.json",
     "check": "pnpm lint-ci && pnpm test-types && pnpm test",
     "clean": "node --input-type=module -e \"import fs from 'node:fs'; fs.rmSync('dist', { recursive: true, force: true })\"",
     "format": "biome format --write .",
@@ -41,6 +41,7 @@
     "lint-ci": "biome ci .",
     "lint-fix": "biome check --write --unsafe .",
     "prepack": "pnpm build",
+    "schema": "ts-json-schema-generator -p src/types.ts -t Unused18nConfig -f tsconfig.json -o schema.json && biome format --write schema.json",
     "test": "pnpm build && node --test test/*.test.mjs",
     "test-types": "tsc --noEmit"
   },
@@ -79,6 +80,7 @@
     "@arthurfiorette/biomejs-config": "^2.0.1",
     "@biomejs/biome": "^2.5.10",
     "@types/node": "^26.2.0",
+    "ts-json-schema-generator": "^2.9.0",
     "typescript": "^7.0.2"
   },
   "packageManager": "pnpm@11.23.0",

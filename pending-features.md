@@ -21,9 +21,11 @@ This document defines potential `unused18n` capabilities independently from the 
 4. Multiple dictionaries and key exclusions.
 5. Typed registration for opaque translators.
 6. Source filtering and framework adapters.
-7. Additional dictionary loaders and configuration discovery.
+7. Additional dictionary loaders.
 
 Namespace identity must precede missing-key reporting: a statically resolved key cannot be declared missing until the analyzer knows which dictionary owns its namespace. Multiple dictionaries should follow dictionary-independent source facts so source analysis is not repeated for every locale.
+
+Missing-key reporting may initially cover only references without `count`, `ordinal`, or `context`. Variant-bearing calls must remain advisory until variant expansion is implemented; otherwise a valid base call could be reported missing when only its runtime variants exist.
 
 ## 1. Namespace model
 
@@ -77,6 +79,8 @@ The selected dictionary descriptor decides whether a reference applies. Namespac
 - Named and aliased `useTranslation` imports.
 - Namespace arrays and finite namespace unions.
 - Explicit namespace-qualified keys.
+- `getFixedT(language, namespace, keyPrefix)` and direct `i18next.t` calls.
+- `<Trans>` references and analyzable wrappers carrying bound namespaces.
 - Custom and disabled namespace separators.
 - Unknown namespaces and unknown `ns` option spreads.
 - Consistent diagnostics across cached, uncached, and partially invalidated runs.
@@ -94,6 +98,7 @@ Report finite source references that target the selected dictionary but do not e
 - Keep missing-key collection enabled by default if it is advisory; the flag controls exit status, not whether analysis occurs.
 - Missing diagnostics identify the key, namespace when configured, and source expression.
 - Programmatic consumers receive standard TypeScript diagnostics through `lint()`.
+- Calls carrying `count`, `ordinal`, or `context` are not reported missing until variant semantics can compare their runtime candidates.
 
 ### Internal changes
 
@@ -199,6 +204,7 @@ interface LintManyOptions {
   project: string;
   dictionaries: DictionaryDescriptor[];
   failOnMissing?: boolean;
+  remove?: boolean;
   cache?: boolean;
   cacheDir?: string;
   onCacheEvent?: (event: CacheEvent) => void;
@@ -217,7 +223,8 @@ The CLI may accept repeated `--dictionary` descriptors or a configuration file o
 - Namespace-aware dictionaries receive only references that can target them.
 - Locale variants are evaluated per dictionary locale.
 - Duplicate descriptors are rejected before analysis.
-- Removal is planned across all selected dictionaries before any file changes. If any edit is unsafe or stale, no dictionary is changed.
+- Removal is planned and staged across all selected dictionaries before any destination is replaced. If any edit is unsafe, stale, or cannot be staged, no dictionary is changed.
+- Replacements retain restorable sibling backups until every destination is committed. A commit failure triggers rollback and a fatal mutation diagnostic; backups remain available if rollback itself cannot complete.
 
 ### Cache design
 
@@ -233,6 +240,8 @@ The CLI may accept repeated `--dictionary` descriptors or a configuration file o
 - Duplicate descriptors and conflicting namespace/locale identities.
 - Aggregate diagnostics with stable ordering.
 - Cross-file all-or-nothing removal.
+- A source changing after planning but before staging.
+- Injected staging, replacement, and rollback failures without silent partial mutation.
 
 ## 5. Key exclusions
 
@@ -242,7 +251,7 @@ Exclude intentionally retained dictionary keys from unused diagnostics and remov
 
 ### Public contract
 
-Prefer explicit exact keys and glob patterns:
+Prefer explicit exact keys and segment-aware glob patterns:
 
 ```ts
 interface DictionaryDescriptor {
@@ -250,7 +259,15 @@ interface DictionaryDescriptor {
 }
 ```
 
-Patterns use normalized dictionary key paths and the same documented wildcard semantics as dynamic key matching. Exclusions are dictionary-specific and apply before unused diagnostics or removal planning.
+Patterns use normalized dictionary key paths. Exclusions are dictionary-specific and apply before unused diagnostics or removal planning.
+
+The exclusion grammar must be stable before release:
+
+- A pattern without wildcards matches one exact normalized key.
+- `*` matches characters within one key segment and never crosses `.`.
+- `**` matches zero or more complete key segments.
+- `\` escapes `*`, `\`, and `.` when those characters belong to a literal property name.
+- A trailing `.**` is the explicit subtree form.
 
 ### Constraints
 
@@ -263,6 +280,7 @@ Patterns use normalized dictionary key paths and the same documented wildcard se
 
 - Exact, subtree, and wildcard exclusions.
 - Flat properties containing separator characters.
+- Single-segment `*`, recursive `**`, subtree, and escaped literal wildcard behavior.
 - Excluded keys under `--remove`.
 - Different exclusions for multiple dictionaries.
 
@@ -279,10 +297,14 @@ Register module exports or global symbols structurally, not source-text regular 
 ```ts
 interface TranslatorRegistration {
   module?: string;
-  export: string;
+  export?: string;
+  global?: string;
   kind: 'translator' | 'hook-object' | 'hook-tuple' | 'fixed-translator-factory';
   keyArgument?: number;
   prefix?: string;
+  translatorProperty?: string;
+  translatorIndex?: number;
+  prefixArgument?: number;
 }
 
 interface LintOptions {
@@ -290,14 +312,14 @@ interface LintOptions {
 }
 ```
 
-Registrations resolve through TypeScript module symbols. A missing or ambiguous export is a configuration error.
+Exactly one target form is required: `module` plus `export`, or `global`. Module registrations resolve through TypeScript module symbols; global registrations resolve through the program's global symbol table. Missing, ambiguous, or conflicting targets are configuration errors.
 
 ### Required semantics
 
 - Translator registrations identify the key argument and optional fixed prefix.
-- Hook-object registrations identify the translator property.
-- Hook-tuple registrations identify the translator index.
-- Factory registrations identify the argument that binds `keyPrefix`.
+- Hook-object registrations use `translatorProperty`, defaulting to `t`.
+- Hook-tuple registrations use `translatorIndex`, defaulting to `0`.
+- Factory registrations use `prefixArgument` to identify the argument that binds `keyPrefix`.
 - Registered symbols can be aliased and re-exported without losing provenance.
 - Local functions with the same text name do not match.
 - Registration changes invalidate cached analysis facts.
@@ -409,23 +431,6 @@ Built-in CommonJS compatibility can resolve `module.exports` and `exports.<name>
 - Loader identity, version, and source content participate in cache compatibility.
 - A loader is read-only unless it also supplies formatting-preserving edit ranges and stale-source validation.
 - Arbitrary module execution is not allowed during analysis.
-
-## 10. Configuration discovery
-
-### Goal
-
-Make repeated multi-dictionary and registration configuration practical after those APIs stabilize.
-
-### Contract
-
-- Discover one documented configuration filename from the working directory or an explicit `--config` path.
-- CLI flags override scalar configuration.
-- Repeated CLI dictionary descriptors replace or extend configured descriptors according to one documented rule.
-- Configuration is validated before project loading.
-- JavaScript configuration must be ESM and should export a plain object. JSON configuration remains data-only.
-- Configuration loading errors use the existing configuration diagnostic path and CLI failure status.
-
-Do not add config discovery while the public model is still limited to one project and one dictionary; two required flags are simpler and more explicit.
 
 ## Demand-driven compatibility
 

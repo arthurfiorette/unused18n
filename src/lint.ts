@@ -16,18 +16,12 @@ import {
   planDictionaryRemoval
 } from './dictionary-removal.js';
 import { loadProjectWithDiagnostics } from './project.js';
-import type { UsageEvidence } from './types.js';
+import type { Unused18nConfig, UsageEvidence } from './types.js';
 
-export interface LintOptions {
+export interface LintOptions
+  extends Omit<Unused18nConfig, '$schema' | 'cacheStats' | 'dictionary' | 'project'> {
   project: string;
   dictionary: string;
-  dictionaryExport?: string;
-  maxExpansions?: number;
-  remove?: boolean;
-  /** Enables persistent compiler and analysis caches. @defaultValue true */
-  cache?: boolean;
-  /** Overrides the default `<tsconfig-dir>/node_modules/.cache/unused18n` directory. */
-  cacheDir?: string;
   /** Receives cache lifecycle events without changing diagnostic output. */
   onCacheEvent?: (event: CacheEvent) => void;
 }

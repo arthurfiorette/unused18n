@@ -133,18 +133,37 @@ npx unused18n lint \
 
 Removal preserves unrelated formatting and comments. It is all-or-nothing: if any unused key cannot be edited safely, the dictionary remains unchanged. Array elements, computed properties, shared or imported objects, unresolved spreads, and ambiguous overwrites must be removed manually.
 
+## Configuration
+
+Create `.unused18nrc` in the directory where the CLI runs:
+
+```json
+{
+  "$schema": "./node_modules/unused18n/schema.json",
+  "project": "./tsconfig.json",
+  "dictionary": "./src/i18n/en.json",
+  "maxExpansions": 1000,
+  "cache": true
+}
+```
+
+The bundled schema documents every option and provides editor validation and completion. Relative `project`, `dictionary`, and `cacheDir` paths resolve from the config file directory. CLI flags override config values.
+
+Use `--config=<path>` to load a different JSON file. Without it, `unused18n` looks for `.unused18nrc` in the current working directory. A missing default config is ignored.
+
 ## CLI options
 
 | Option                    | Description                                                   |
 | ------------------------- | ------------------------------------------------------------- |
-| `-p, --project <path>`    | Required. Path to `tsconfig.json` or its directory            |
-| `-d, --dictionary <path>` | Required. TypeScript or JSON dictionary file                  |
+| `--config <path>`         | Load JSON options from this file instead of `.unused18nrc`    |
+| `-p, --project <path>`    | Required by flag or config. `tsconfig.json` path or directory |
+| `-d, --dictionary <path>` | Required by flag or config. TypeScript or JSON dictionary     |
 | `-e, --export <name>`     | TypeScript export name; defaults to `default`                 |
-| `--remove`                | Remove every safely editable unused key                       |
+| `--[no-]remove`           | Enable or override config-file removal                        |
 | `--max-expansions <n>`    | Maximum number of finite key combinations; defaults to `1000` |
 | `--no-cache`              | Disable persistent caching                                    |
 | `--cache-dir <path>`      | Override the cache directory                                  |
-| `--cache-stats`           | Print cache hits, misses, and reused file counts              |
+| `--[no-]cache-stats`      | Enable or override config-file cache statistics               |
 
 Caching is enabled by default under `<tsconfig-directory>/node_modules/.cache/unused18n`. The directory can be safely deleted. Cache failures fall back to a normal analysis without changing diagnostics or exit status.
 
@@ -188,4 +207,4 @@ for (const diagnostic of lint({
 | `cacheDir`         | `string`                      | `<tsconfig-directory>/node_modules/.cache/unused18n` |
 | `onCacheEvent`     | `(event: CacheEvent) => void` | No callback                                          |
 
-The package exports `lint`, `DiagnosticCode`, and the `LintOptions` and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary.
+The package exports `lint`, `DiagnosticCode`, and the `LintOptions`, `Unused18nConfig`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary.

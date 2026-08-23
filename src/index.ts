@@ -1,12 +1,78 @@
 import { Command, Flags } from '@oclif/core';
 import ts from '@typescript/typescript6';
-import { type CacheEvent, DiagnosticCode, lint } from './lint.js';
+import { ConfigFileError, loadConfig } from './config.js';
+import { type CacheEvent, DiagnosticCode, type LintOptions, lint } from './lint.js';
+import type { Unused18nConfig } from './types.js';
 
 const formatHost: ts.FormatDiagnosticsHost = {
   getCanonicalFileName: (fileName) => fileName,
   getCurrentDirectory: () => process.cwd(),
   getNewLine: () => ts.sys.newLine
 };
+
+const cliFlags = {
+  cache: Flags.boolean({
+    allowNo: true,
+    summary: 'Reuse persistent compiler and per-file analysis caches (default: true)'
+  }),
+  'cache-dir': Flags.string({
+    helpValue: '<path>',
+    summary: 'Override the persistent cache directory'
+  }),
+  'cache-stats': Flags.boolean({
+    allowNo: true,
+    summary: 'Report cache hits, misses, reuse, and bypasses'
+  }),
+  config: Flags.string({
+    helpValue: '<path>',
+    summary: 'Load JSON options from this file instead of .unused18nrc'
+  }),
+  dictionary: Flags.string({
+    char: 'd',
+    helpValue: '<path>',
+    summary: 'TypeScript or JSON source file containing the dictionary'
+  }),
+  export: Flags.string({
+    char: 'e',
+    helpValue: '<name>',
+    summary: 'TypeScript dictionary export name (default: default); JSON uses default'
+  }),
+  'max-expansions': Flags.integer({
+    min: 1,
+    summary: 'Maximum finite string-union expansion (default: 1000)'
+  }),
+  project: Flags.string({
+    char: 'p',
+    helpValue: '<path>',
+    summary: 'tsconfig.json path or its containing directory'
+  }),
+  remove: Flags.boolean({
+    allowNo: true,
+    summary: 'Remove every safely editable unused dictionary key'
+  }),
+  version: Flags.version({ char: 'v' })
+};
+
+type ConfigOptionName = Exclude<keyof Unused18nConfig, '$schema'>;
+type ConfigurableCliFlag = Exclude<keyof typeof cliFlags, 'config' | 'version'>;
+
+// Both directions are checked so adding either a config field or configurable flag breaks typecheck.
+const configFlagNames = {
+  project: 'project',
+  dictionary: 'dictionary',
+  dictionaryExport: 'export',
+  maxExpansions: 'max-expansions',
+  remove: 'remove',
+  cache: 'cache',
+  cacheDir: 'cache-dir',
+  cacheStats: 'cache-stats'
+} as const satisfies Record<ConfigOptionName, ConfigurableCliFlag>;
+
+type MappedCliFlag = (typeof configFlagNames)[ConfigOptionName];
+const allConfigurableFlagsMapped: Exclude<ConfigurableCliFlag, MappedCliFlag> extends never
+  ? true
+  : never = true;
+void allConfigurableFlagsMapped;
 
 export default class Unused18n extends Command {
   static override description =
@@ -17,66 +83,51 @@ export default class Unused18n extends Command {
     '<%= config.bin %> lint --project . --dictionary ./src/i18n/en.json --remove'
   ];
 
-  static override flags = {
-    cache: Flags.boolean({
-      allowNo: true,
-      default: true,
-      summary: 'Reuse persistent compiler and per-file analysis caches'
-    }),
-    'cache-dir': Flags.string({
-      helpValue: '<path>',
-      summary: 'Override the persistent cache directory'
-    }),
-    'cache-stats': Flags.boolean({
-      default: false,
-      summary: 'Report cache hits, misses, reuse, and bypasses'
-    }),
-    dictionary: Flags.string({
-      char: 'd',
-      helpValue: '<path>',
-      required: true,
-      summary: 'TypeScript or JSON source file containing the dictionary'
-    }),
-    export: Flags.string({
-      char: 'e',
-      helpValue: '<name>',
-      default: 'default',
-      summary: 'TypeScript dictionary export name; JSON uses default'
-    }),
-    'max-expansions': Flags.integer({
-      default: 1_000,
-      min: 1,
-      summary: 'Maximum finite string-union expansion'
-    }),
-    project: Flags.string({
-      char: 'p',
-      helpValue: '<path>',
-      required: true,
-      summary: 'tsconfig.json path or its containing directory'
-    }),
-    remove: Flags.boolean({
-      default: false,
-      summary: 'Remove every safely editable unused dictionary key'
-    }),
-    version: Flags.version({ char: 'v' })
-  };
+  static override flags = cliFlags;
 
   async run(): Promise<void> {
     const { flags } = await this.parse(Unused18n);
+    let fileConfig: Unused18nConfig;
+    try {
+      fileConfig = loadConfig(flags.config).config;
+    } catch (error) {
+      this.error(error instanceof ConfigFileError ? error.message : String(error), { exit: 2 });
+    }
+
+    const project = flags.project ?? fileConfig.project;
+    const dictionary = flags.dictionary ?? fileConfig.dictionary;
+    if (!project)
+      this.error('Missing required option: provide --project or set "project" in config.', {
+        exit: 2
+      });
+    if (!dictionary) {
+      this.error('Missing required option: provide --dictionary or set "dictionary" in config.', {
+        exit: 2
+      });
+    }
+
+    const dictionaryExport = flags.export ?? fileConfig.dictionaryExport ?? 'default';
+    const maxExpansions = flags['max-expansions'] ?? fileConfig.maxExpansions ?? 1_000;
+    const remove = flags.remove ?? fileConfig.remove ?? false;
+    const cache = flags.cache ?? fileConfig.cache ?? true;
+    const cacheDir = flags['cache-dir'] ?? fileConfig.cacheDir;
+    const cacheStats = flags['cache-stats'] ?? fileConfig.cacheStats ?? false;
     let failed = false;
 
-    for (const diagnostic of lint({
-      project: flags.project,
-      dictionary: flags.dictionary,
-      dictionaryExport: flags.export,
-      maxExpansions: flags['max-expansions'],
-      remove: flags.remove,
-      cache: flags.cache,
-      ...(flags['cache-dir'] ? { cacheDir: flags['cache-dir'] } : {}),
-      ...(flags['cache-stats']
+    const lintOptions = {
+      project,
+      dictionary,
+      dictionaryExport,
+      maxExpansions,
+      remove,
+      cache,
+      ...(cacheDir ? { cacheDir } : {}),
+      ...(cacheStats
         ? { onCacheEvent: (event: CacheEvent) => this.logToStderr(formatCacheEvent(event)) }
         : {})
-    })) {
+    } satisfies LintOptions;
+
+    for (const diagnostic of lint(lintOptions)) {
       this.logToStderr(ts.formatDiagnosticsWithColorAndContext([diagnostic], formatHost).trimEnd());
       if (
         diagnostic.category === ts.DiagnosticCategory.Error ||
@@ -93,6 +144,7 @@ export default class Unused18n extends Command {
 export const COMMANDS = { lint: Unused18n };
 
 export type { CacheEvent, LintOptions } from './lint.js';
+export type { Unused18nConfig } from './types.js';
 export { DiagnosticCode, lint };
 
 function formatCacheEvent(event: CacheEvent): string {

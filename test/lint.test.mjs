@@ -447,7 +447,7 @@ test('Oclif exits 1 for unused keys and 2 for invalid flags', () => {
   assert.match(unused.stderr, /TS95001/);
   assert.match(unused.stderr, /TS95002/);
   assert.equal(invalid.status, 2);
-  assert.match(invalid.stderr, /Missing required flag/);
+  assert.match(invalid.stderr, /Missing required option.*dictionary/s);
 });
 
 test('Oclif exposes help, autocomplete, and unknown-command plugins', () => {

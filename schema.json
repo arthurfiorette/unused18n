@@ -1,0 +1,71 @@
+{
+  "$ref": "#/definitions/Unused18nConfig",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "Unused18nConfig": {
+      "additionalProperties": false,
+      "description": "JSON options accepted by `.unused18nrc`. CLI flags override matching fields when both are set.",
+      "properties": {
+        "$schema": {
+          "description": "Enables editor completion and validation through the schema shipped with `unused18n`.",
+          "examples": ["./node_modules/unused18n/schema.json"],
+          "minLength": 1,
+          "type": "string"
+        },
+        "cache": {
+          "default": true,
+          "description": "Reuses persistent compiler and per-file analysis state between runs.",
+          "examples": [true, false],
+          "type": "boolean"
+        },
+        "cacheDir": {
+          "default": "<tsconfig-directory>/node_modules/.cache/unused18n",
+          "description": "Overrides the persistent cache directory. Relative values resolve from `.unused18nrc`.",
+          "examples": ["./node_modules/.cache/unused18n", "./.cache/unused18n"],
+          "minLength": 1,
+          "type": "string"
+        },
+        "cacheStats": {
+          "default": false,
+          "description": "Prints cache hits, misses, bypasses, and reused file counts to stderr.",
+          "examples": [true, false],
+          "type": "boolean"
+        },
+        "dictionary": {
+          "description": "TypeScript or strict JSON dictionary file. Relative values resolve from `.unused18nrc`.",
+          "examples": ["./src/i18n/en.json", "./src/i18n/en.ts"],
+          "minLength": 1,
+          "type": "string"
+        },
+        "dictionaryExport": {
+          "default": "default",
+          "description": "Export containing a TypeScript dictionary. JSON dictionaries always use `default`.",
+          "examples": ["default", "dictionary"],
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxExpansions": {
+          "default": 1000,
+          "description": "Positive integer limiting finite string combinations before a key becomes dynamic and advisory.",
+          "examples": [1000, 5000],
+          "minimum": 1,
+          "multipleOf": 1,
+          "type": "number"
+        },
+        "project": {
+          "description": "Path to `tsconfig.json` or its containing directory. Relative values resolve from `.unused18nrc`.",
+          "examples": ["./tsconfig.json", "."],
+          "minLength": 1,
+          "type": "string"
+        },
+        "remove": {
+          "default": false,
+          "description": "Removes every unused key only when all planned dictionary edits are safe.",
+          "examples": [true, false],
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  }
+}
