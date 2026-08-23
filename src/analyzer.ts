@@ -37,6 +37,28 @@ interface ObjectResolution extends StringResolution {
 export interface LoadedProjectAnalysis {
   result: AnalysisResult;
   dictionary: ReturnType<typeof readDictionary>;
+  sourceFacts: SourceUsageFacts[];
+}
+
+/** Dictionary-expanded observation that can be serialized without compiler object identities. */
+export interface UsageFact {
+  key: string;
+  confidence: 'used' | 'possibly-used';
+  evidence: UsageEvidence;
+}
+
+/** Ordered facts preserve evidence selection when replayed in Program source order. */
+export interface SourceUsageFacts {
+  fileName: string;
+  facts: UsageFact[];
+  unresolvedReferences: UsageEvidence[];
+}
+
+/** Reuse is prepared only after cache invalidation proves excluded components unchanged. */
+export interface AnalysisReuse {
+  dictionary?: ReturnType<typeof readDictionary>;
+  cachedFacts?: ReadonlyMap<string, SourceUsageFacts>;
+  filesToAnalyze?: ReadonlySet<string>;
 }
 
 /** Creates the compatibility Program for API callers that do not already own one. */
@@ -52,11 +74,13 @@ export function analyzeProject(options: AnalyzeOptions): AnalysisResult {
  */
 export function analyzeLoadedProject(
   { program, checker, configPath }: LoadedProject,
-  options: AnalyzeOptions
+  options: AnalyzeOptions,
+  reuse: AnalysisReuse = {}
 ): LoadedProjectAnalysis {
   const includeEvidence = options.includeEvidence ?? true;
   const dictionaryPath = path.resolve(options.dictionary);
-  const dictionary = readDictionary(program, checker, dictionaryPath, options.dictionaryExport);
+  const dictionary =
+    reuse.dictionary ?? readDictionary(program, checker, dictionaryPath, options.dictionaryExport);
   const dictionaryKeys = [...dictionary.keys];
   const dictionaryPrefixes = new Set<string>();
   const keysByTopLevel = new Map<string, string[]>();
@@ -77,13 +101,20 @@ export function analyzeLoadedProject(
     const file = path.resolve(source.fileName);
     return !source.isDeclarationFile && !file.includes(`${path.sep}node_modules${path.sep}`);
   });
+  const analysisSourceFiles = reuse.filesToAnalyze
+    ? sourceFiles.filter((source) => reuse.filesToAnalyze?.has(path.resolve(source.fileName)))
+    : sourceFiles;
 
   const translators = new Map<ts.Symbol, StringResolution>();
   const translationHookWrappers = new Map<ts.Symbol, TranslationHookWrapper>();
   const wrappers = new Map<ts.Symbol, TranslationWrapper>();
   const wrapperCalls = new Map<ts.Symbol, number>();
-  const dictionaryIndex = DictionaryIndex.create(dictionaryKeys, includeEvidence);
-  const unresolvedReferences: UsageEvidence[] = [];
+  // Discovery still uses live Symbols, but only dirty connected components need new observations.
+  const freshFacts = new Map<string, SourceUsageFacts>();
+  for (const sourceFile of analysisSourceFiles) {
+    const fileName = path.resolve(sourceFile.fileName);
+    freshFacts.set(fileName, { fileName, facts: [], unresolvedReferences: [] });
+  }
   const objectCache = new WeakMap<ts.Expression, ObjectResolution | null>();
   const dictionaryTypeCache = new WeakMap<ts.Type, boolean>();
   let translationHookCache = new WeakMap<ts.CallExpression, StringResolution | null>();
@@ -98,12 +129,41 @@ export function analyzeLoadedProject(
   discoverTranslationWrappers();
   countWrapperCalls();
 
-  for (const sourceFile of sourceFiles) visitSource(sourceFile);
+  for (const sourceFile of analysisSourceFiles) visitSource(sourceFile);
+
+  // Fresh and cached runs share this replay boundary so classification joins remain identical.
+  const dictionaryIndex = DictionaryIndex.create(dictionaryKeys, includeEvidence);
+  const unresolvedReferences: UsageEvidence[] = [];
+  const unresolvedIdentities = new Set<string>();
+  const sourceFacts = sourceFiles.map((sourceFile) => {
+    const fileName = path.resolve(sourceFile.fileName);
+    const facts = freshFacts.get(fileName) ??
+      reuse.cachedFacts?.get(fileName) ?? {
+        fileName,
+        facts: [],
+        unresolvedReferences: []
+      };
+    for (const fact of facts.facts) {
+      dictionaryIndex.markExact(
+        fact.key,
+        fact.confidence,
+        includeEvidence ? fact.evidence : undefined
+      );
+    }
+    for (const evidence of facts.unresolvedReferences) {
+      const identity = evidenceIdentity(evidence);
+      if (unresolvedIdentities.has(identity)) continue;
+      unresolvedIdentities.add(identity);
+      unresolvedReferences.push(evidence);
+    }
+    return facts;
+  });
 
   const keys = dictionaryIndex.toKeyAnalysis();
 
   return {
     dictionary,
+    sourceFacts,
     result: {
       dictionary: dictionaryPath,
       dictionaryExport: options.dictionaryExport,
@@ -120,7 +180,7 @@ export function analyzeLoadedProject(
   };
 
   function discoverTranslationHookWrappers(): void {
-    for (const sourceFile of sourceFiles) {
+    for (const sourceFile of analysisSourceFiles) {
       walk(sourceFile, (node) => {
         if (!ts.isCallExpression(node) || !isUseTranslationCall(node)) return;
         const owner = enclosingFunction(node);
@@ -178,7 +238,7 @@ export function analyzeLoadedProject(
   }
 
   function discoverHookTranslators(): void {
-    for (const sourceFile of sourceFiles) {
+    for (const sourceFile of analysisSourceFiles) {
       walk(sourceFile, (node) => {
         if (!ts.isVariableDeclaration(node) || !node.initializer) return;
 
@@ -223,7 +283,7 @@ export function analyzeLoadedProject(
     while (changed && iteration < 20) {
       changed = false;
       iteration += 1;
-      for (const sourceFile of sourceFiles) {
+      for (const sourceFile of analysisSourceFiles) {
         walk(sourceFile, (node) => {
           if (!ts.isCallExpression(node)) return;
           const target = functionLikeForCall(node);
@@ -247,7 +307,7 @@ export function analyzeLoadedProject(
   }
 
   function discoverTranslationWrappers(): void {
-    for (const sourceFile of sourceFiles) {
+    for (const sourceFile of analysisSourceFiles) {
       walk(sourceFile, (node) => {
         if (!ts.isCallExpression(node) || !translatorPrefix(node.expression)) return;
         const key = node.arguments[0] ? unwrapExpression(node.arguments[0]) : undefined;
@@ -273,7 +333,7 @@ export function analyzeLoadedProject(
   }
 
   function countWrapperCalls(): void {
-    for (const sourceFile of sourceFiles) {
+    for (const sourceFile of analysisSourceFiles) {
       walk(sourceFile, (node) => {
         if (!ts.isCallExpression(node)) return;
         const symbol = normalizedSymbol(node.expression);
@@ -743,13 +803,13 @@ export function analyzeLoadedProject(
       // An unbounded runtime value has no defensible candidate set, so it remains a warning rather
       // than globally weakening unrelated `unused` classifications.
       const evidence = evidenceFor(node, 'possibly-used', `${reason}: unresolved runtime key`);
+      const facts = factsForNode(node);
       if (
-        !unresolvedReferences.some(
+        !facts.unresolvedReferences.some(
           (entry) => evidenceIdentity(entry) === evidenceIdentity(evidence)
         )
-      ) {
-        unresolvedReferences.push(evidence);
-      }
+      )
+        facts.unresolvedReferences.push(evidence);
     }
   }
 
@@ -788,11 +848,22 @@ export function analyzeLoadedProject(
     node: ts.Node,
     reason: string
   ): void {
-    const evidence = includeEvidence ? evidenceFor(node, confidence, reason) : undefined;
+    const evidence = evidenceFor(node, confidence, reason);
+    const facts = factsForNode(node);
     for (const key of candidateKeys) {
       if (!dictionary.keys.has(key)) continue;
-      dictionaryIndex.markExact(key, confidence, evidence);
+      facts.facts.push({ key, confidence, evidence });
     }
+  }
+
+  function factsForNode(node: ts.Node): SourceUsageFacts {
+    const fileName = path.resolve(node.getSourceFile().fileName);
+    let facts = freshFacts.get(fileName);
+    if (!facts) {
+      facts = { fileName, facts: [], unresolvedReferences: [] };
+      freshFacts.set(fileName, facts);
+    }
+    return facts;
   }
 
   function evidenceFor(

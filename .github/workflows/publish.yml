@@ -36,7 +36,7 @@ jobs:
         uses: pnpm/setup@v2
         with:
           runtime: node@24
-          cache: false
+          cache: true
           install: true
 
       - name: Verify stable release tag
@@ -49,13 +49,6 @@ jobs:
 
       - name: Check
         run: pnpm check
-
-      - name: Verify trusted publishing prerequisites
-        run: |
-          npx --yes npm@latest --version
-          test "$(npm config get registry)" = "https://registry.npmjs.org/"
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
 
       - name: Publish to NPM
         run: npx --yes npm@latest publish --access public

@@ -1,8 +1,15 @@
 import path from 'node:path';
 import ts from '@typescript/typescript6';
 import { analyzeLoadedProject } from './analyzer.js';
+import {
+  type CacheEvent,
+  ensureCacheDirectory,
+  type PreparedAnalysisCache,
+  prepareAnalysisCache,
+  resolveCachePaths
+} from './cache.js';
 import { DiagnosticCode } from './diagnostic-codes.js';
-import type { DictionaryKeySource } from './dictionary.js';
+import { type DictionaryKeySource, readDictionary } from './dictionary.js';
 import {
   applyDictionaryRemoval,
   type DictionaryRemovalFailure,
@@ -17,8 +24,15 @@ export interface LintOptions {
   dictionaryExport?: string;
   maxExpansions?: number;
   remove?: boolean;
+  /** Enables persistent compiler and analysis caches. @defaultValue true */
+  cache?: boolean;
+  /** Overrides the default `<tsconfig-dir>/node_modules/.cache/unused18n` directory. */
+  cacheDir?: string;
+  /** Receives cache lifecycle events without changing diagnostic output. */
+  onCacheEvent?: (event: CacheEvent) => void;
 }
 
+export type { CacheEvent };
 export { DiagnosticCode };
 
 /**
@@ -28,7 +42,30 @@ export { DiagnosticCode };
 export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void> {
   const dictionaryPath = path.resolve(options.dictionary);
   const dictionaryExport = options.dictionaryExport ?? 'default';
-  const project = loadProjectWithDiagnostics(options.project, [dictionaryPath]);
+  const cacheEnabled = options.cache ?? true;
+  const cachePaths = cacheEnabled
+    ? resolveCachePaths(options.project, dictionaryPath, dictionaryExport, options.cacheDir)
+    : undefined;
+  if (!cacheEnabled) notify({ type: 'bypass', reason: 'disabled' });
+  else if (options.remove) notify({ type: 'bypass', reason: 'remove' });
+  if (cachePaths) {
+    try {
+      ensureCacheDirectory(cachePaths);
+    } catch (error) {
+      notify({
+        type: 'error',
+        operation: 'compiler',
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  const project = loadProjectWithDiagnostics(
+    options.project,
+    [dictionaryPath],
+    cachePaths && fsCacheAvailable(cachePaths.directory)
+      ? { tsBuildInfoFile: cachePaths.tsBuildInfoFile }
+      : {}
+  );
   yield* project.diagnostics;
   if (!project.loaded) return;
 
@@ -43,8 +80,23 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
   ) {
     return;
   }
+  if (project.loaded.cacheError) {
+    notify({ type: 'error', operation: 'compiler', message: project.loaded.cacheError });
+  }
+  if (project.loaded.saveBuildInfo) {
+    try {
+      project.loaded.saveBuildInfo();
+    } catch (error) {
+      notify({
+        type: 'error',
+        operation: 'compiler',
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
 
   let analysis: ReturnType<typeof analyzeLoadedProject>;
+  let preparedCache: PreparedAnalysisCache | undefined;
   try {
     const analysisOptions = {
       project: options.project,
@@ -52,11 +104,32 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
       dictionaryExport,
       includeEvidence: true
     };
-    analysis = analyzeLoadedProject(
-      project.loaded,
+    const normalizedOptions =
       options.maxExpansions === undefined
         ? analysisOptions
-        : { ...analysisOptions, maxExpansions: options.maxExpansions }
+        : { ...analysisOptions, maxExpansions: options.maxExpansions };
+    const dictionary = readDictionary(
+      project.loaded.program,
+      project.loaded.checker,
+      dictionaryPath,
+      dictionaryExport
+    );
+    if (cachePaths && cacheEnabled && !options.remove) {
+      // Removal always needs live AST provenance; only read-only runs may replay usage facts.
+      preparedCache = prepareAnalysisCache(project.loaded, dictionary, {
+        dictionaryPath,
+        dictionaryExport,
+        maxExpansions: options.maxExpansions ?? 1_000,
+        paths: cachePaths
+      });
+      notify(preparedCache.event);
+    }
+    analysis = analyzeLoadedProject(
+      project.loaded,
+      normalizedOptions,
+      preparedCache?.reuse ?? {
+        dictionary
+      }
     );
   } catch (error) {
     yield createDiagnostic(
@@ -77,6 +150,17 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
   if (!options.remove) {
     for (const key of unusedKeys) {
       yield unusedDiagnostic(key, analysis.dictionary.keySources.get(key));
+    }
+    if (preparedCache && preparedCache.event.type !== 'hit') {
+      try {
+        notify(preparedCache.write(analysis.sourceFacts));
+      } catch (error) {
+        notify({
+          type: 'error',
+          operation: 'write',
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
     }
     return;
   }
@@ -108,6 +192,23 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
       ts.DiagnosticCategory.Message,
       `Removed unused translation key "${key}".`
     );
+  }
+
+  function notify(event: CacheEvent): void {
+    try {
+      options.onCacheEvent?.(event);
+    } catch {
+      // Observability callbacks never change lint correctness or exit behavior.
+    }
+  }
+}
+
+/** Cache filesystem failures must degrade to the same cold compiler path as `--no-cache`. */
+function fsCacheAvailable(directory: string): boolean {
+  try {
+    return ts.sys.directoryExists(directory);
+  } catch {
+    return false;
   }
 }
 

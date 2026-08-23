@@ -1,6 +1,6 @@
 import { Command, Flags } from '@oclif/core';
 import ts from '@typescript/typescript6';
-import { DiagnosticCode, lint } from './lint.js';
+import { type CacheEvent, DiagnosticCode, lint } from './lint.js';
 
 const formatHost: ts.FormatDiagnosticsHost = {
   getCanonicalFileName: (fileName) => fileName,
@@ -18,6 +18,19 @@ export default class Unused18n extends Command {
   ];
 
   static override flags = {
+    cache: Flags.boolean({
+      allowNo: true,
+      default: true,
+      summary: 'Reuse persistent compiler and per-file analysis caches'
+    }),
+    'cache-dir': Flags.string({
+      helpValue: '<path>',
+      summary: 'Override the persistent cache directory'
+    }),
+    'cache-stats': Flags.boolean({
+      default: false,
+      summary: 'Report cache hits, misses, reuse, and bypasses'
+    }),
     dictionary: Flags.string({
       char: 'd',
       helpValue: '<path>',
@@ -57,7 +70,12 @@ export default class Unused18n extends Command {
       dictionary: flags.dictionary,
       dictionaryExport: flags.export,
       maxExpansions: flags['max-expansions'],
-      remove: flags.remove
+      remove: flags.remove,
+      cache: flags.cache,
+      ...(flags['cache-dir'] ? { cacheDir: flags['cache-dir'] } : {}),
+      ...(flags['cache-stats']
+        ? { onCacheEvent: (event: CacheEvent) => this.logToStderr(formatCacheEvent(event)) }
+        : {})
     })) {
       this.logToStderr(ts.formatDiagnosticsWithColorAndContext([diagnostic], formatHost).trimEnd());
       if (
@@ -74,5 +92,13 @@ export default class Unused18n extends Command {
 
 export const COMMANDS = { lint: Unused18n };
 
-export type { LintOptions } from './lint.js';
+export type { CacheEvent, LintOptions } from './lint.js';
 export { DiagnosticCode, lint };
+
+function formatCacheEvent(event: CacheEvent): string {
+  if (event.type === 'write') return `[cache] write files=${event.files}`;
+  if (event.type === 'bypass') return `[cache] bypass (${event.reason})`;
+  if (event.type === 'error') return `[cache] ${event.operation} error: ${event.message}`;
+  const reason = event.reason ? ` (${event.reason})` : '';
+  return `[cache] ${event.type}${reason} analyzed=${event.analyzedFiles} reused=${event.reusedFiles}`;
+}

@@ -1,18 +1,18 @@
 # unused18n
 
-Type-aware unused i18next dictionary linter for TypeScript and JSON dictionaries.
+Find unused keys in TypeScript and JSON [i18next](https://www.i18next.com/) dictionaries.
 
-`unused18n` creates one TypeScript program, follows translation aliases and finite key types, and reports unused keys at their dictionary declarations. It is ESM-only and requires Node.js 24 or newer.
+`unused18n` understands statically recoverable translation keys, reports unused keys at their dictionary declarations, and can safely remove them. It is ESM-only and requires Node.js 24.16 or newer.
 
 ## Install
 
 ```sh
-pnpm add --save-dev unused18n
+npm install --save-dev unused18n
 ```
 
-## Usage
+## Quick start
 
-JSON dictionaries work without changing `resolveJsonModule` in your project:
+Given a JSON dictionary:
 
 ```json
 {
@@ -23,68 +23,43 @@ JSON dictionaries work without changing `resolveJsonModule` in your project:
 }
 ```
 
+and application code that only uses `common.save`:
+
+```ts
+import messages from './i18n/en.json' with { type: 'json' };
+
+messages.common.save;
+```
+
+run:
+
 ```sh
-pnpm unused18n lint \
+npx unused18n lint \
   --project=./tsconfig.json \
   --dictionary=./src/i18n/en.json
 ```
 
-JSON exposes an implicit default export, so `--export` is unnecessary. A non-default export name is rejected instead of ignored.
-
-TypeScript dictionaries can use a default export:
-
-```ts
-// src/i18n/en.ts
-
-export default {
-  common: {
-    save: 'Save',
-    cancel: 'Cancel'
-  }
-};
-```
-
-Run:
-
-```sh
-pnpm unused18n lint \
-  --project=./tsconfig.json \
-  --dictionary=./src/i18n/en.ts \
-  --export=default
-```
-
-Named exports work too:
-
-```ts
-export const dictionary = {
-  common: { save: 'Save' }
-};
-```
-
-```sh
-pnpm unused18n lint \
-  --project=./tsconfig.json \
-  --dictionary=./src/i18n/en.ts \
-  --export=dictionary
-```
-
-Flags:
+`unused18n` reports the unused key at its declaration:
 
 ```text
--p, --project <path>        tsconfig.json or its directory
--d, --dictionary <path>     TypeScript or JSON dictionary source file
--e, --export <name>         TypeScript export name (default: "default")
-    --max-expansions <n>    finite string-union expansion limit (default: 1000)
-    --remove                remove every safely editable unused key
+src/i18n/en.json:4:5 - warning TS95001: Translation key "common.cancel" is unused.
 ```
 
-Run `unused18n help` for command help or `unused18n autocomplete` to install shell completion for Bash, Zsh, or PowerShell. Completion-aware invocations use `unused18n lint`; bare `unused18n --flags` calls remain supported for compatibility.
+### Dictionary formats
+
+| Dictionary | Export option |
+| --- | --- |
+| JSON object | None; JSON always uses its implicit default export |
+| TypeScript default export | None; `default` is used automatically |
+| TypeScript named export | Pass `--export=<name>` |
+
+TypeScript exports must resolve statically to an object or array. Application files must be included in the selected TypeScript project. JSON dictionaries work without enabling `resolveJsonModule` in your `tsconfig.json`.
 
 ## Supported patterns
 
 ### Literals and finite keys
 
-Literal, conditional, asserted, concatenated, and finite template-literal keys are resolved:
+Literal, conditional, concatenated, asserted, and finite template-literal keys are resolved:
 
 ```ts
 const { t } = useTranslation();
@@ -98,14 +73,12 @@ function statusLabel(status: 'pending' | 'complete') {
 }
 ```
 
-Finite values can also flow through helpers, maps, indexed access, and reassigned local variables.
+### Aliases, prefixes, and wrappers
 
-### Aliases, prefixes, and custom hooks
+Translator aliases, `keyPrefix`, `<Trans>`, and analyzable custom hooks or typed helpers retain their translation provenance:
 
-Hook aliases, destructured translators, `keyPrefix`, and wrappers around `useTranslation()` retain their translation provenance:
-
-```ts
-import { useTranslation as useI18n } from 'react-i18next';
+```tsx
+import { Trans as Message, useTranslation as useI18n } from 'react-i18next';
 
 const { t: commonT } = useI18n(undefined, { keyPrefix: 'common' });
 commonT('save');
@@ -116,37 +89,15 @@ function useCheckoutTranslation() {
 
 const { t: checkoutT } = useCheckoutTranslation();
 checkoutT('title');
+
+<Message i18nKey='empty.title' />;
 ```
 
-Custom hooks may return the translation result directly or expose the translator inside another object.
+Custom wrappers must have an implementation available in the selected TypeScript project. Declaration-only helpers cannot be analyzed.
 
-### Components and forwarded translators
+### Objects and dictionary access
 
-`Trans` aliases and translation functions passed through typed helpers are followed:
-
-```tsx
-import { Trans as Message, useTranslation } from 'react-i18next';
-import type { TFunction } from 'i18next';
-
-const { t } = useTranslation();
-
-function translateButton(
-  translate: TFunction,
-  key: 'buttons.save' | 'buttons.cancel'
-) {
-  return translate(key);
-}
-
-translateButton(t, 'buttons.save');
-
-export function EmptyState() {
-  return <Message i18nKey='empty.title' />;
-}
-```
-
-### Object translations and dictionary access
-
-Object-returning translations track the properties that are actually consumed:
+Object-returning translations and direct dictionary access track the properties that are consumed:
 
 ```ts
 const dashboard = t('dashboard', {
@@ -155,55 +106,53 @@ const dashboard = t('dashboard', {
 
 dashboard.title;
 const { description } = dashboard;
-```
 
-Direct dictionary access, destructuring, spreads, enumeration, and finite indexed access are also recognized:
-
-```ts
 dictionary.common.save;
 const { cancel } = dictionary.common;
 Object.keys(dictionary.categories);
 ```
 
-The same usage analysis applies to default JSON imports:
+Dictionary paths use `.` separators. i18next namespaces and custom `keySeparator` behavior are not interpreted. Unbounded runtime keys produce source-located warnings; they do not mark unrelated dictionary keys as used, and warnings alone do not fail the command.
 
-```ts
-import messages from './i18n/en.json' with { type: 'json' };
-
-messages.common.save;
-const { cancel } = messages.common;
-Object.keys(messages.categories);
-```
-
-Unbounded runtime keys produce source-located warnings. They do not hide unrelated unused keys.
-
-## Removing unused keys
+## Remove unused keys
 
 ```sh
-pnpm unused18n lint \
-  --project=. \
+npx unused18n lint \
+  --project=./tsconfig.json \
   --dictionary=./src/i18n/en.json \
   --remove
 ```
 
-`--remove` plans all edits before changing the dictionary, verifies the original source text, and deletes properties without reprinting the AST. Unrelated formatting and comments remain untouched.
+Removal preserves unrelated formatting and comments. It is all-or-nothing: if any unused key cannot be edited safely, the dictionary remains unchanged. Array elements, computed properties, shared or imported objects, unresolved spreads, and ambiguous overwrites must be removed manually.
 
-JSON and TypeScript object properties use the same formatting-preserving removal planner. Arrays are valid dictionaries and their numeric keys are linted, but array-derived keys cannot be removed because deleting an element would shift later indexes.
+## CLI options
 
-Removal is also refused when an unused key comes from a computed property, imported or shared object, unresolved spread, or ambiguous overwrite. If any requested edit is unsafe, the file remains unchanged. Malformed JSON and scalar JSON roots stop before analysis or mutation.
+| Option | Description |
+| --- | --- |
+| `-p, --project <path>` | Required. Path to `tsconfig.json` or its directory |
+| `-d, --dictionary <path>` | Required. TypeScript or JSON dictionary file |
+| `-e, --export <name>` | TypeScript export name; defaults to `default` |
+| `--remove` | Remove every safely editable unused key |
+| `--max-expansions <n>` | Maximum number of finite key combinations; defaults to `1000` |
+| `--no-cache` | Disable persistent caching |
+| `--cache-dir <path>` | Override the cache directory |
+| `--cache-stats` | Print cache hits, misses, and reused file counts |
+
+Caching is enabled by default under `<tsconfig-directory>/node_modules/.cache/unused18n`. The directory can be safely deleted. Cache failures fall back to a normal analysis without changing diagnostics or exit status.
+
+Run `npx unused18n help` for command help or `npx unused18n autocomplete` to configure shell completion.
 
 ## Exit codes
 
-- `0`: no unused keys remain, or every requested removal succeeded
-- `1`: unused keys remain or analysis/removal produced an error
-- `2`: CLI arguments or flags are invalid
-- `127`: the requested Oclif command does not exist
+| Code | Meaning |
+| --- | --- |
+| `0` | No unused keys remain, or every requested removal succeeded |
+| `1` | Unused keys remain, or analysis/removal failed |
+| `2` | CLI arguments or flags are invalid |
 
-Unresolved runtime-key warnings alone do not fail the command.
+## Programmatic API
 
-## Programmatic usage
-
-Use `lint()` when diagnostics need to be consumed by another tool instead of printed by the CLI:
+`lint()` returns a lazy generator of standard TypeScript diagnostics:
 
 ```ts
 import { DiagnosticCode, lint } from 'unused18n';
@@ -218,4 +167,17 @@ for (const diagnostic of lint({
 }
 ```
 
-`dictionaryExport` is optional and defaults to `default`; set it for named TypeScript exports. `lint()` is a lazy generator. Consuming it loads the project, analyzes usage, and optionally applies `remove: true`. It yields standard TypeScript diagnostics, including project configuration and syntax errors that prevent safe analysis.
+### `LintOptions`
+
+| Option | Type | Default |
+| --- | --- | --- |
+| `project` | `string` | Required |
+| `dictionary` | `string` | Required |
+| `dictionaryExport` | `string` | `'default'` |
+| `maxExpansions` | `number` | `1000` |
+| `remove` | `boolean` | `false` |
+| `cache` | `boolean` | `true` |
+| `cacheDir` | `string` | `<tsconfig-directory>/node_modules/.cache/unused18n` |
+| `onCacheEvent` | `(event: CacheEvent) => void` | No callback |
+
+The package exports `lint`, `DiagnosticCode`, and the `LintOptions` and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary.
