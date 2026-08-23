@@ -60,9 +60,7 @@ export default class Unused18n extends Command {
       maxExpansions: flags['max-expansions'],
       remove: flags.remove
     })) {
-      this.logToStderr(
-        ts.formatDiagnosticsWithColorAndContext([diagnostic], formatHost).trimEnd()
-      );
+      this.logToStderr(ts.formatDiagnosticsWithColorAndContext([diagnostic], formatHost).trimEnd());
       if (
         diagnostic.category === ts.DiagnosticCategory.Error ||
         diagnostic.code === DiagnosticCode.UnusedKey

@@ -5,3 +5,4 @@ coverage
 /.oclif
 oclif.manifest.json
 parity.md
+docs/
