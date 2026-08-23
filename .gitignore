@@ -4,3 +4,4 @@ coverage
 *.log
 /.oclif
 oclif.manifest.json
+parity.md
