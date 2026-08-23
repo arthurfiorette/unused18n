@@ -19,12 +19,20 @@ import {
 import { loadProjectWithDiagnostics } from './project.js';
 import type { Unused18nConfig, UsageEvidence } from './types.js';
 
-export interface LintOptions extends Omit<Unused18nConfig, '$schema' | 'cacheStats' | 'project'> {
-  project: string;
+export type LintEvent =
+  | { type: 'phase'; phase: 'project' | 'analysis' | 'results' }
+  | { type: 'file-progress'; fileName: string; completedFiles: number; totalFiles: number }
+  | { type: 'cache'; event: CacheEvent };
+
+export interface LintOptions
+  extends Omit<Unused18nConfig, '$schema' | 'cacheStats' | 'logLevel' | 'project'> {
+  project?: string;
   /** @deprecated Use `dictionaries`; retained for the published single-dictionary API. */
   dictionary?: string;
   /** Receives cache lifecycle events without changing diagnostic output. */
   onCacheEvent?: (event: CacheEvent) => void;
+  /** Receives synchronous lifecycle events without changing lint behavior. */
+  onEvent?: (event: LintEvent) => void;
 }
 
 export type { CacheEvent };
@@ -35,7 +43,8 @@ export { DiagnosticCode };
  * optional edits, and diagnostic production in one compiler process.
  */
 export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void> {
-  const dictionaryExport = options.dictionaryExport ?? 'default';
+  const projectPath = options.project ?? './tsconfig.json';
+  const dictionaryExport = options.dictionaryExport;
   let targets: ReturnType<typeof resolveDictionaryTargets>;
   try {
     const patterns = options.dictionaries ?? options.dictionary;
@@ -49,10 +58,11 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     );
     return;
   }
+  emit({ type: 'phase', phase: 'project' });
   const cacheEnabled = options.cache ?? true;
   const cachePaths = cacheEnabled
     ? resolveCachePaths(
-        options.project,
+        projectPath,
         targets.map((target) => target.path),
         dictionaryExport,
         options.cacheDir
@@ -72,7 +82,7 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     }
   }
   const project = loadProjectWithDiagnostics(
-    options.project,
+    projectPath,
     targets.map((target) => target.path),
     cachePaths && fsCacheAvailable(cachePaths.directory)
       ? { tsBuildInfoFile: cachePaths.tsBuildInfoFile }
@@ -106,20 +116,26 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
       });
     }
   }
+  emit({ type: 'phase', phase: 'analysis' });
 
   let analysis: ReturnType<typeof analyzeLoadedProjectMany>;
   let loadedDictionaries: LoadedDictionaryTarget[];
   let preparedCache: PreparedAnalysisCache | undefined;
   try {
-    loadedDictionaries = targets.map((target) => ({
-      ...target,
-      info: readDictionary(
+    loadedDictionaries = targets.map((target) => {
+      const info = readDictionary(
         project.loaded!.program,
         project.loaded!.checker,
         target.path,
-        target.exportName
-      )
-    }));
+        target.requestedExport
+      );
+      return {
+        ...target,
+        id: `${target.path}\0${info.exportName}`,
+        exportName: info.exportName,
+        info
+      };
+    });
     if (cachePaths && cacheEnabled && !options.remove) {
       // Removal always needs live AST provenance; only read-only runs may replay usage facts.
       preparedCache = prepareAnalysisCache(project.loaded, loadedDictionaries, {
@@ -132,9 +148,11 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
       project.loaded,
       loadedDictionaries,
       {
-        project: options.project,
+        project: projectPath,
         includeEvidence: true,
-        ...(options.maxExpansions === undefined ? {} : { maxExpansions: options.maxExpansions })
+        ...(options.maxExpansions === undefined ? {} : { maxExpansions: options.maxExpansions }),
+        onFileAnalyzed: (fileName, completedFiles, totalFiles) =>
+          emit({ type: 'file-progress', fileName, completedFiles, totalFiles })
       },
       preparedCache?.reuse ?? {
         dictionaries: loadedDictionaries
@@ -148,6 +166,7 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     );
     return;
   }
+  emit({ type: 'phase', phase: 'results' });
 
   for (const warning of analysis.unresolvedReferences) {
     yield diagnosticFromEvidence(project.loaded.program, project.loaded.configPath, warning);
@@ -155,11 +174,10 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
 
   if (!options.remove) {
     for (const { target, result } of analysis.analyses) {
-      for (const key of result.keys
-        .filter(({ status }) => status === 'unused')
-        .map(({ key }) => key)) {
-        yield unusedDiagnostic(key, target.info.keySources.get(key));
-      }
+      yield* unusedDiagnostics(
+        result.keys.filter(({ status }) => status === 'unused').map(({ key }) => key),
+        target.info.keySources
+      );
     }
     if (preparedCache && preparedCache.event.type !== 'hit') {
       try {
@@ -224,8 +242,17 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
   }
 
   function notify(event: CacheEvent): void {
+    emit({ type: 'cache', event });
     try {
       options.onCacheEvent?.(event);
+    } catch {
+      // Observability callbacks never change lint correctness or exit behavior.
+    }
+  }
+
+  function emit(event: LintEvent): void {
+    try {
+      options.onEvent?.(event);
     } catch {
       // Observability callbacks never change lint correctness or exit behavior.
     }
@@ -245,9 +272,63 @@ function unusedDiagnostic(key: string, source: DictionaryKeySource | undefined):
   return diagnosticAtSource(
     source,
     DiagnosticCode.UnusedKey,
-    ts.DiagnosticCategory.Warning,
+    ts.DiagnosticCategory.Error,
     `Translation key "${key}" is unused.`
   );
+}
+
+/** Exact source-node identity survives barrier decoration without merging same-prefix literals. */
+function* unusedDiagnostics(
+  orderedUnusedKeys: readonly string[],
+  keySources: ReadonlyMap<string, DictionaryKeySource>
+): Generator<ts.Diagnostic, void, void> {
+  const unusedKeys = new Set(orderedUnusedKeys);
+  const coverage = new Map<ts.ObjectLiteralElementLike, { total: number; unused: number }>();
+  for (const [key, source] of keySources) {
+    for (const property of source.propertyChain) {
+      const current = coverage.get(property.node) ?? { total: 0, unused: 0 };
+      current.total += 1;
+      if (unusedKeys.has(key)) current.unused += 1;
+      coverage.set(property.node, current);
+    }
+  }
+
+  const boundaries = new Map<string, DictionaryKeySource['propertyChain'][number]>();
+  const groupedNodes = new Set<ts.ObjectLiteralElementLike>();
+  for (const key of orderedUnusedKeys) {
+    const source = keySources.get(key);
+    const boundary = source?.propertyChain.find((property, index) => {
+      const counts = coverage.get(property.node);
+      return index < source.propertyChain.length - 1 && counts?.total === counts?.unused;
+    });
+    if (boundary) {
+      boundaries.set(key, boundary);
+      groupedNodes.add(boundary.node);
+    }
+  }
+
+  const emitted = new Set<ts.ObjectLiteralElementLike>();
+  for (const key of orderedUnusedKeys) {
+    const source = keySources.get(key);
+    if (!source) {
+      yield unusedDiagnostic(key, undefined);
+      continue;
+    }
+    const boundary = boundaries.get(key);
+    if (!boundary) {
+      if (source.propertyChain.some(({ node }) => groupedNodes.has(node))) continue;
+      yield unusedDiagnostic(key, source);
+      continue;
+    }
+    if (emitted.has(boundary.node)) continue;
+    emitted.add(boundary.node);
+    yield diagnosticAtNode(
+      boundary.node,
+      DiagnosticCode.UnusedKey,
+      ts.DiagnosticCategory.Error,
+      `Translation subtree "${boundary.keyPrefix}" is unused.`
+    );
+  }
 }
 
 function removalFailureDiagnostic(

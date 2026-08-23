@@ -1,14 +1,9 @@
 import { Command, Flags } from '@oclif/core';
 import ts from '@typescript/typescript6';
 import { ConfigFileError, loadConfig } from './config.js';
-import { type CacheEvent, DiagnosticCode, type LintOptions, lint } from './lint.js';
+import { DiagnosticCode, type LintOptions, lint } from './lint.js';
+import { createReporter } from './reporter.js';
 import type { Unused18nConfig } from './types.js';
-
-const formatHost: ts.FormatDiagnosticsHost = {
-  getCanonicalFileName: (fileName) => fileName,
-  getCurrentDirectory: () => process.cwd(),
-  getNewLine: () => ts.sys.newLine
-};
 
 const cliFlags = {
   cache: Flags.boolean({
@@ -36,16 +31,20 @@ const cliFlags = {
   export: Flags.string({
     char: 'e',
     helpValue: '<name>',
-    summary: 'TypeScript dictionary export name (default: default); JSON uses default'
+    summary: 'TypeScript export name; otherwise prefer default or infer the sole export'
   }),
   'max-expansions': Flags.integer({
     min: 1,
     summary: 'Maximum finite string-union expansion (default: 1000)'
   }),
+  'log-level': Flags.string({
+    options: ['silent', 'info', 'debug'],
+    summary: 'Operational logging level (default: info)'
+  }),
   project: Flags.string({
     char: 'p',
     helpValue: '<path>',
-    summary: 'tsconfig.json path or its containing directory'
+    summary: 'tsconfig.json path or directory (default: ./tsconfig.json)'
   }),
   remove: Flags.boolean({
     allowNo: true,
@@ -66,7 +65,8 @@ const configFlagNames = {
   remove: 'remove',
   cache: 'cache',
   cacheDir: 'cache-dir',
-  cacheStats: 'cache-stats'
+  cacheStats: 'cache-stats',
+  logLevel: 'log-level'
 } as const satisfies Record<ConfigOptionName, ConfigurableCliFlag>;
 
 type MappedCliFlag = (typeof configFlagNames)[ConfigOptionName];
@@ -95,41 +95,47 @@ export default class Unused18n extends Command {
       this.error(error instanceof ConfigFileError ? error.message : String(error), { exit: 2 });
     }
 
-    const project = flags.project ?? fileConfig.project;
+    const project = flags.project ?? fileConfig.project ?? './tsconfig.json';
     const dictionaries = flags.dictionary ?? fileConfig.dictionaries;
-    if (!project)
-      this.error('Missing required option: provide --project or set "project" in config.', {
-        exit: 2
-      });
     if (!dictionaries) {
       this.error('Missing required option: provide --dictionary or set "dictionaries" in config.', {
         exit: 2
       });
     }
 
-    const dictionaryExport = flags.export ?? fileConfig.dictionaryExport ?? 'default';
+    const dictionaryExport = flags.export ?? fileConfig.dictionaryExport;
     const maxExpansions = flags['max-expansions'] ?? fileConfig.maxExpansions ?? 1_000;
     const remove = flags.remove ?? fileConfig.remove ?? false;
     const cache = flags.cache ?? fileConfig.cache ?? true;
     const cacheDir = flags['cache-dir'] ?? fileConfig.cacheDir;
     const cacheStats = flags['cache-stats'] ?? fileConfig.cacheStats ?? false;
+    const requestedLogLevel = flags['log-level'] ?? fileConfig.logLevel;
+    const logLevel =
+      requestedLogLevel === 'silent' || requestedLogLevel === 'debug'
+        ? requestedLogLevel
+        : cacheStats
+          ? 'debug'
+          : 'info';
     let failed = false;
+    const reporter = createReporter({
+      level: logLevel,
+      isTTY: process.stderr.isTTY === true,
+      write: (message) => this.logToStderr(message)
+    });
 
     const lintOptions = {
       project,
       dictionaries,
-      dictionaryExport,
+      ...(dictionaryExport === undefined ? {} : { dictionaryExport }),
       maxExpansions,
       remove,
       cache,
       ...(cacheDir ? { cacheDir } : {}),
-      ...(cacheStats
-        ? { onCacheEvent: (event: CacheEvent) => this.logToStderr(formatCacheEvent(event)) }
-        : {})
+      onEvent: reporter.event
     } satisfies LintOptions;
 
     for (const diagnostic of lint(lintOptions)) {
-      this.logToStderr(ts.formatDiagnosticsWithColorAndContext([diagnostic], formatHost).trimEnd());
+      reporter.diagnostic(diagnostic);
       if (
         diagnostic.category === ts.DiagnosticCategory.Error ||
         diagnostic.code === DiagnosticCode.UnusedKey
@@ -144,14 +150,6 @@ export default class Unused18n extends Command {
 
 export const COMMANDS = { lint: Unused18n };
 
-export type { CacheEvent, LintOptions } from './lint.js';
-export type { Unused18nConfig } from './types.js';
+export type { CacheEvent, LintEvent, LintOptions } from './lint.js';
+export type { LogLevel, Unused18nConfig } from './types.js';
 export { DiagnosticCode, lint };
-
-function formatCacheEvent(event: CacheEvent): string {
-  if (event.type === 'write') return `[cache] write files=${event.files}`;
-  if (event.type === 'bypass') return `[cache] bypass (${event.reason})`;
-  if (event.type === 'error') return `[cache] ${event.operation} error: ${event.message}`;
-  const reason = event.reason ? ` (${event.reason})` : '';
-  return `[cache] ${event.type}${reason} analyzed=${event.analyzedFiles} reused=${event.reusedFiles}`;
-}

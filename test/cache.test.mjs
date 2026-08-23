@@ -240,7 +240,7 @@ test('--remove bypasses analysis facts and the next read misses changed content'
   assert.equal(after.events[0]?.reason, 'incompatible');
 });
 
-test('CLI reports opt-in cache statistics without changing lint exit behavior', (t) => {
+test('CLI cache observability respects silent output without changing lint exit behavior', (t) => {
   const project = temporaryProject(t);
   const cacheDir = path.join(project, 'cache');
   const args = [
@@ -249,15 +249,15 @@ test('CLI reports opt-in cache statistics without changing lint exit behavior', 
     `--project=${project}`,
     `--dictionary=${path.join(project, 'dictionary.ts')}`,
     `--cache-dir=${cacheDir}`,
-    '--cache-stats'
+    '--cache-stats',
+    '--log-level=silent'
   ];
 
   const cold = spawnSync(process.execPath, args, { encoding: 'utf8' });
   const warm = spawnSync(process.execPath, args, { encoding: 'utf8' });
 
   assert.equal(cold.status, 1);
-  assert.match(cold.stderr, /\[cache\] miss .*analyzed=3 reused=0/);
-  assert.match(cold.stderr, /\[cache\] write files=3/);
+  assert.doesNotMatch(cold.stderr, /Cache (miss|write)/);
   assert.equal(warm.status, 1);
-  assert.match(warm.stderr, /\[cache\] hit analyzed=0 reused=3/);
+  assert.doesNotMatch(warm.stderr, /Cache hit/);
 });

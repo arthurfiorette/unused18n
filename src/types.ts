@@ -11,21 +11,20 @@ export interface Unused18nConfig {
   /**
    * Path to `tsconfig.json` or its containing directory. Relative values resolve from `.unused18nrc`.
    * @minLength 1
+   * @default "./tsconfig.json"
    * @examples ["./tsconfig.json", "."]
    */
   project?: string;
   /**
    * Dictionary path or glob, or an array of patterns. Relative values resolve from `.unused18nrc`.
    * Matched filenames provide locale names, for example `pt-BR.json` becomes `pt-BR`.
-   * @minLength 1
    * @minItems 1
    * @examples ["./src/i18n/*.json", ["./src/i18n/*.json", "./packages/{site,admin}/locales/*.json"]]
    */
-  dictionaries?: string | string[];
+  dictionaries?: DictionaryPattern | DictionaryPattern[];
   /**
-   * Export containing a TypeScript dictionary. JSON dictionaries always use `default`.
+   * Export containing a TypeScript dictionary. Omission prefers `default`, then the sole export.
    * @minLength 1
-   * @default "default"
    * @examples ["default", "dictionary"]
    */
   dictionaryExport?: string;
@@ -62,13 +61,24 @@ export interface Unused18nConfig {
    * @examples [true, false]
    */
   cacheStats?: boolean;
+  /**
+   * Controls operational progress output. Diagnostics are always printed.
+   * @default "info"
+   * @examples ["silent", "info", "debug"]
+   */
+  logLevel?: 'silent' | 'info' | 'debug';
 }
+
+/** @minLength 1 */
+export type DictionaryPattern = string;
+
+export type LogLevel = 'silent' | 'info' | 'debug';
 
 /** Internal analysis options shared by the public linter and regression tests. */
 export interface AnalyzeOptions {
-  project: string;
+  project?: string;
   dictionary: string;
-  dictionaryExport: string;
+  dictionaryExport?: string;
   /**
    * Raise only when larger finite unions are worth the additional retained work;
    * exceeding the limit falls back to a pattern or advisory unresolved warning.

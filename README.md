@@ -35,14 +35,13 @@ run:
 
 ```sh
 npx unused18n lint \
-  --project=./tsconfig.json \
   --dictionary=./src/i18n/en.json
 ```
 
 `unused18n` reports the unused key at its declaration:
 
 ```text
-src/i18n/en.json:4:5 - warning TS95001: Translation key "common.cancel" is unused.
+src/i18n/en.json:4:5 - error TS95001: Translation key "common.cancel" is unused.
 ```
 
 ### Dictionary formats
@@ -51,9 +50,11 @@ src/i18n/en.json:4:5 - warning TS95001: Translation key "common.cancel" is unuse
 | ------------------------- | -------------------------------------------------- |
 | JSON object               | None; JSON always uses its implicit default export |
 | TypeScript default export | None; `default` is used automatically              |
-| TypeScript named export   | Pass `--export=<name>`                             |
+| TypeScript named export   | The sole export is inferred; otherwise pass `--export=<name>` |
 
 TypeScript exports must resolve statically to an object or array. Application files must be included in the selected TypeScript project. JSON dictionaries work without enabling `resolveJsonModule` in your `tsconfig.json`.
+
+When an entire object subtree is unused, one `TS95001` diagnostic covers the complete property instead of reporting every leaf.
 
 ### Multiple locales
 
@@ -155,7 +156,8 @@ Create `.unused18nrc` in the directory where the CLI runs:
   "project": "./tsconfig.json",
   "dictionaries": "./src/i18n/*.json",
   "maxExpansions": 1000,
-  "cache": true
+  "cache": true,
+  "logLevel": "info"
 }
 ```
 
@@ -168,14 +170,15 @@ Use `--config=<path>` to load a different JSON file. Without it, `unused18n` loo
 | Option                    | Description                                                   |
 | ------------------------- | ------------------------------------------------------------- |
 | `--config <path>`         | Load JSON options from this file instead of `.unused18nrc`    |
-| `-p, --project <path>`    | Required by flag or config. `tsconfig.json` path or directory |
+| `-p, --project <path>`    | `tsconfig.json` path or directory; defaults to `./tsconfig.json` |
 | `-d, --dictionary <path>` | Required by flag or config. Repeatable dictionary path/glob  |
-| `-e, --export <name>`     | TypeScript export name; defaults to `default`                 |
+| `-e, --export <name>`     | TypeScript export name; omission prefers `default`, then one export |
 | `--[no-]remove`           | Enable or override config-file removal                        |
 | `--max-expansions <n>`    | Maximum number of finite key combinations; defaults to `1000` |
 | `--no-cache`              | Disable persistent caching                                    |
 | `--cache-dir <path>`      | Override the cache directory                                  |
 | `--[no-]cache-stats`      | Enable or override config-file cache statistics               |
+| `--log-level <level>`     | Operational output: `silent`, `info`, or `debug`              |
 
 Caching is enabled by default under `<tsconfig-directory>/node_modules/.cache/unused18n`. The directory can be safely deleted. Cache failures fall back to a normal analysis without changing diagnostics or exit status.
 
@@ -210,14 +213,15 @@ for (const diagnostic of lint({
 
 | Option             | Type                          | Default                                              |
 | ------------------ | ----------------------------- | ---------------------------------------------------- |
-| `project`          | `string`                      | Required                                             |
+| `project`          | `string`                      | `'./tsconfig.json'`                                  |
 | `dictionaries`     | `string \| string[]`           | Required                                             |
 | `dictionary`       | `string`                      | Deprecated single-dictionary alias                   |
-| `dictionaryExport` | `string`                      | `'default'`                                          |
+| `dictionaryExport` | `string`                      | Prefer `default`, then infer the sole export         |
 | `maxExpansions`    | `number`                      | `1000`                                               |
 | `remove`           | `boolean`                     | `false`                                              |
 | `cache`            | `boolean`                     | `true`                                               |
 | `cacheDir`         | `string`                      | `<tsconfig-directory>/node_modules/.cache/unused18n` |
 | `onCacheEvent`     | `(event: CacheEvent) => void` | No callback                                          |
+| `onEvent`          | `(event: LintEvent) => void`  | No callback                                          |
 
-The package exports `lint`, `DiagnosticCode`, and the `LintOptions`, `Unused18nConfig`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary.
+The package exports `lint`, `DiagnosticCode`, and the `LintOptions`, `Unused18nConfig`, `LintEvent`, `LogLevel`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary.

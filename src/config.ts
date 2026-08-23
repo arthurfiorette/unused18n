@@ -18,7 +18,8 @@ const configValidators = {
   remove: (value) => typeof value === 'boolean',
   cache: (value) => typeof value === 'boolean',
   cacheDir: isNonEmptyString,
-  cacheStats: (value) => typeof value === 'boolean'
+  cacheStats: (value) => typeof value === 'boolean',
+  logLevel: (value) => value === 'silent' || value === 'info' || value === 'debug'
 } satisfies Record<keyof Unused18nConfig, ConfigValidator>;
 
 export interface LoadedConfig {

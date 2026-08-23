@@ -27,6 +27,7 @@ test('analyzes locale dictionaries with different valid plural shapes', () => {
     ]),
     [
       ['ar.json', 'Translation key "unused" is unused.'],
+      ['en.json', 'Translation key "shape" is unused.'],
       ['en.json', 'Translation key "unused" is unused.'],
       ['ja.json', 'Translation key "sharedDirect" is unused.'],
       ['ja.json', 'Translation key "unused" is unused.']
@@ -109,11 +110,19 @@ test('removes unused keys from every matched dictionary in one plan', (t) => {
     })
   ];
 
-  assert.equal(diagnostics.filter(({ code }) => code === DiagnosticCode.RemovedKey).length, 4);
+  assert.equal(diagnostics.filter(({ code }) => code === DiagnosticCode.RemovedKey).length, 5);
   for (const locale of ['ar', 'en', 'ja']) {
     assert.equal(
       Object.hasOwn(JSON.parse(fs.readFileSync(path.join(copy, `${locale}.json`))), 'unused'),
       false
     );
   }
+  assert.equal(
+    Object.hasOwn(JSON.parse(fs.readFileSync(path.join(copy, 'en.json'))), 'shape'),
+    false
+  );
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(copy, 'ja.json'))).shape.nested,
+    'Japanese nested shape'
+  );
 });

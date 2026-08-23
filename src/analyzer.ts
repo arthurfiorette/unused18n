@@ -68,6 +68,8 @@ export interface AnalysisReuse {
 }
 
 export interface LoadedDictionaryTarget extends DictionaryTarget {
+  id: string;
+  exportName: string;
   info: ReturnType<typeof readDictionary>;
 }
 
@@ -80,7 +82,7 @@ export interface LoadedProjectManyAnalysis {
 /** Creates the compatibility Program for API callers that do not already own one. */
 export function analyzeProject(options: AnalyzeOptions): AnalysisResult {
   const dictionaryPath = path.resolve(options.dictionary);
-  const loaded = loadProject(options.project, [dictionaryPath]);
+  const loaded = loadProject(options.project ?? './tsconfig.json', [dictionaryPath]);
   return analyzeLoadedProject(loaded, options).result;
 }
 
@@ -97,9 +99,12 @@ export function analyzeLoadedProject(
   const info =
     reuse.dictionary ?? readDictionary(program, checker, dictionaryPath, options.dictionaryExport);
   const target: LoadedDictionaryTarget = {
-    id: `${dictionaryPath}\0${options.dictionaryExport}`,
+    id: `${dictionaryPath}\0${info.exportName}`,
     path: dictionaryPath,
-    exportName: options.dictionaryExport,
+    ...(options.dictionaryExport === undefined
+      ? {}
+      : { requestedExport: options.dictionaryExport }),
+    exportName: info.exportName,
     locale: path.basename(dictionaryPath, path.extname(dictionaryPath)),
     info
   };
@@ -118,7 +123,9 @@ export function analyzeLoadedProject(
 export function analyzeLoadedProjectMany(
   { program, checker, configPath }: LoadedProject,
   targets: LoadedDictionaryTarget[],
-  options: Pick<AnalyzeOptions, 'includeEvidence' | 'maxExpansions' | 'project'>,
+  options: Pick<AnalyzeOptions, 'includeEvidence' | 'maxExpansions' | 'project'> & {
+    onFileAnalyzed?: (fileName: string, completedFiles: number, totalFiles: number) => void;
+  },
   reuse: AnalysisReuse = {}
 ): LoadedProjectManyAnalysis {
   const includeEvidence = options.includeEvidence ?? true;
@@ -179,7 +186,18 @@ export function analyzeLoadedProjectMany(
   discoverTranslationWrappers();
   countWrapperCalls();
 
-  for (const sourceFile of analysisSourceFiles) visitSource(sourceFile);
+  analysisSourceFiles.forEach((sourceFile, index) => {
+    visitSource(sourceFile);
+    try {
+      options.onFileAnalyzed?.(
+        path.resolve(sourceFile.fileName),
+        index + 1,
+        analysisSourceFiles.length
+      );
+    } catch {
+      // Instrumentation cannot change source classification or cache contents.
+    }
+  });
 
   // Fresh and cached runs share this replay boundary so classification joins remain identical.
   const dictionaryIndexes = new Map(
@@ -691,18 +709,30 @@ export function analyzeLoadedProjectMany(
     if (ts.isPropertyAccessExpression(expression)) {
       const base = resolveObject(expression.expression, nextSeen);
       if (!base) return undefined;
-      if ([...base.values].some((value) => dictionary.keys.has(value))) return base;
+      if (resolvesDictionaryLeaf(base)) return base;
       return appendObject(base, exact(expression.name.text));
     }
 
     if (ts.isElementAccessExpression(expression)) {
       const base = resolveObject(expression.expression, nextSeen);
       if (!base || !expression.argumentExpression) return base;
-      if ([...base.values].some((value) => dictionary.keys.has(value))) return base;
+      if (resolvesDictionaryLeaf(base)) return base;
       return appendObject(base, strings.resolve(expression.argumentExpression));
     }
 
     return undefined;
+  }
+
+  function resolvesDictionaryLeaf(base: ObjectResolution): boolean {
+    const candidates = base.dictionaryIds
+      ? dictionaries.filter(({ id }) => base.dictionaryIds?.has(id))
+      : dictionaries;
+    return [...base.values].some((value) =>
+      candidates.some(
+        ({ info }) =>
+          info.keys.has(value) && ![...info.keys].some((key) => key.startsWith(`${value}.`))
+      )
+    );
   }
 
   function appendObject(base: ObjectResolution, segment: StringResolution): ObjectResolution {

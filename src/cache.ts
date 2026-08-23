@@ -63,7 +63,7 @@ const packageVersion = readPackageVersion();
 export function resolveCachePaths(
   project: string,
   dictionaries: readonly string[],
-  dictionaryExport: string,
+  dictionaryExport: string | undefined,
   cacheDir?: string
 ): CachePaths {
   const resolvedProject = path.resolve(project);
@@ -79,7 +79,7 @@ export function resolveCachePaths(
     canonicalJson({
       project: configPath,
       dictionaries: dictionaries.map((dictionary) => path.resolve(dictionary)).sort(comparePaths),
-      dictionaryExport
+      dictionaryExport: dictionaryExport ?? '<infer>'
     })
   );
   return {

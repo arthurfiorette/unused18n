@@ -30,6 +30,7 @@ export interface DictionaryKeySource {
 
 /** The flattened dictionary and source provenance needed for read-only removal planning. */
 export interface DictionaryInfo {
+  readonly exportName: string;
   readonly sourceFile: ts.SourceFile;
   readonly declaration: ts.Node;
   readonly symbol: ts.Symbol;
@@ -45,7 +46,7 @@ export function readDictionary(
   program: ts.Program,
   checker: ts.TypeChecker,
   dictionaryPath: string,
-  exportName: string
+  exportName?: string
 ): DictionaryInfo {
   const absolutePath = path.resolve(dictionaryPath);
   const sourceFile = program
@@ -65,7 +66,7 @@ export function readDictionary(
         `Invalid JSON dictionary ${absolutePath}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
-    if (exportName !== 'default') {
+    if (exportName !== undefined && exportName !== 'default') {
       throw new Error(
         `JSON dictionaries only expose the "default" export; received "${exportName}"`
       );
@@ -80,12 +81,26 @@ export function readDictionary(
     declaration = statement;
     initializer = statement.expression;
     symbol = jsonSymbol;
+    exportName = 'default';
   } else {
     const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
-    const exported = moduleSymbol
-      ? checker.getExportsOfModule(moduleSymbol).find((candidate) => candidate.name === exportName)
-      : undefined;
-    if (!exported) throw new Error(`Export "${exportName}" not found in ${absolutePath}`);
+    const exports = moduleSymbol ? checker.getExportsOfModule(moduleSymbol) : [];
+    let exported =
+      exportName !== undefined
+        ? exports.find((candidate) => candidate.name === exportName)
+        : exports.find((candidate) => candidate.name === 'default');
+    if (exportName !== undefined && !exported)
+      throw new Error(`Export "${exportName}" not found in ${absolutePath}`);
+    if (exportName === undefined && !exported && exports.length === 1) exported = exports[0];
+    if (!exported) {
+      const names = exports.map(({ name }) => `"${name}"`).join(', ');
+      throw new Error(
+        exports.length === 0
+          ? `Cannot infer dictionary export from ${absolutePath}: the module has no exports.`
+          : `Cannot infer dictionary export from ${absolutePath}: multiple exports exist: ${names}. Pass --export=<name>.`
+      );
+    }
+    exportName = exported.name;
 
     const resolvedSymbol = unwrapAlias(checker, exported);
     if (!resolvedSymbol) throw new Error(`Export "${exportName}" could not be resolved`);
@@ -110,6 +125,7 @@ export function readDictionary(
   }
 
   return {
+    exportName,
     sourceFile,
     declaration,
     symbol,

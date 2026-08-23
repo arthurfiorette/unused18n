@@ -46,7 +46,7 @@ test('build emits JavaScript and declaration source maps', () => {
   assert.equal(fs.existsSync(path.join(projectFixture, '../../../dist/index.d.ts.map')), true);
 });
 
-test('emits only statically unused dictionary leaves as warning diagnostics', () => {
+test('emits only statically unused dictionary leaves as error diagnostics', () => {
   const unused = diagnostics()
     .filter(({ code }) => code === DiagnosticCode.UnusedKey)
     .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]);
@@ -62,9 +62,11 @@ test('emits only statically unused dictionary leaves as warning diagnostics', ()
     'wrapped.stale'
   ]);
   assert.ok(
-    diagnostics().every(
-      ({ category, source }) => category === ts.DiagnosticCategory.Warning && source === 'unused18n'
-    )
+    diagnostics()
+      .filter(({ code }) => code === DiagnosticCode.UnusedKey)
+      .every(
+        ({ category, source }) => category === ts.DiagnosticCategory.Error && source === 'unused18n'
+      )
   );
 });
 
@@ -477,7 +479,9 @@ test('Oclif --remove fixes safe unused keys and exits 0', (t) => {
     '--dictionary',
     path.join(project, 'dictionary.ts'),
     '--export',
-    'dictionary'
+    'dictionary',
+    '--log-level',
+    'silent'
   ];
 
   const removed = spawnSync(process.execPath, [...args, '--remove'], { encoding: 'utf8' });
@@ -487,4 +491,88 @@ test('Oclif --remove fixes safe unused keys and exits 0', (t) => {
   assert.match(removed.stderr, /TS95003/);
   assert.equal(clean.status, 0);
   assert.equal(clean.stderr, '');
+});
+
+test('defaults the project and infers unambiguous dictionary exports', () => {
+  const project = path.join(fixtures, 'inference');
+  const defaultResult = [
+    ...lint({ project, dictionary: path.join(project, 'default.ts'), cache: false })
+  ];
+  const soleResult = [
+    ...lint({ project, dictionary: path.join(project, 'sole.ts'), cache: false })
+  ];
+  const explicitResult = [
+    ...lint({
+      project,
+      dictionary: path.join(project, 'ambiguous.ts'),
+      dictionaryExport: 'first',
+      cache: false
+    })
+  ];
+  const ambiguousResult = [
+    ...lint({ project, dictionary: path.join(project, 'ambiguous.ts'), cache: false })
+  ];
+  const emptyResult = [
+    ...lint({ project, dictionary: path.join(project, 'empty.ts'), cache: false })
+  ];
+  const emptySelectorResult = [
+    ...lint({
+      project,
+      dictionary: path.join(project, 'sole.ts'),
+      dictionaryExport: '',
+      cache: false
+    })
+  ];
+  const cliResult = spawnSync(
+    process.execPath,
+    [cli, '--dictionary', './sole.ts', '--log-level', 'silent', '--no-cache'],
+    { cwd: project, encoding: 'utf8' }
+  );
+
+  assert.match(String(defaultResult[0]?.messageText), /defaultUnused/);
+  assert.match(String(soleResult[0]?.messageText), /soleUnused/);
+  assert.match(String(explicitResult[0]?.messageText), /firstUnused/);
+  assert.match(String(ambiguousResult[0]?.messageText), /multiple exports exist/);
+  assert.match(String(emptyResult[0]?.messageText), /module has no exports/);
+  assert.match(String(emptySelectorResult[0]?.messageText), /Export "" not found/);
+  assert.equal(cliResult.status, 1);
+  assert.match(cliResult.stderr, /soleUnused/);
+});
+
+test('reports a missing default project as a configuration diagnostic', () => {
+  const project = path.join(fixtures, 'no-project');
+  const result = spawnSync(
+    process.execPath,
+    [cli, '--dictionary', './dictionary.ts', '--log-level', 'silent'],
+    { cwd: project, encoding: 'utf8' }
+  );
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /TS95005/);
+  assert.match(result.stderr, /tsconfig\.json/);
+});
+
+test('groups maximal fully-unused object subtrees with complete source ranges', () => {
+  const project = path.join(fixtures, 'grouping');
+  const result = [
+    ...lint({ project, dictionary: path.join(project, 'dictionary.ts'), cache: false })
+  ].filter(({ code }) => code === DiagnosticCode.UnusedKey);
+  const messages = result.map(({ messageText }) => String(messageText));
+
+  assert.deepEqual(messages, [
+    'Translation subtree "complete" is unused.',
+    'Translation key "list.0" is unused.',
+    'Translation key "list.1" is unused.',
+    'Translation key "mixed.unused" is unused.',
+    'Translation subtree "single" is unused.',
+    'Translation subtree "spreadComplete" is unused.',
+    'Translation key "spreadMixed" is unused.',
+    'Translation key "spreadMixed.unused" is unused.'
+  ]);
+  const complete = result[0];
+  assert.match(
+    complete.file.text.slice(complete.start, complete.start + complete.length),
+    /^complete: \{[\s\S]*second: 'Second'[\s\S]*\}$/
+  );
+  assert.ok(result.every(({ category }) => category === ts.DiagnosticCategory.Error));
 });

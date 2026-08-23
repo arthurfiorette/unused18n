@@ -2,16 +2,15 @@ import { globSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 export interface DictionaryTarget {
-  id: string;
   path: string;
-  exportName: string;
+  requestedExport?: string;
   locale: string;
 }
 
 /** Expands once before project creation so compiler roots, cache identity, and diagnostics agree. */
 export function resolveDictionaryTargets(
   patterns: string | readonly string[],
-  exportName: string,
+  exportName?: string,
   cwd = process.cwd()
 ): DictionaryTarget[] {
   const values = typeof patterns === 'string' ? [patterns] : patterns;
@@ -27,9 +26,8 @@ export function resolveDictionaryTargets(
     throw new Error(`No dictionaries matched: ${values.join(', ')}`);
   }
   return paths.map((fileName) => ({
-    id: `${fileName}\0${exportName}`,
     path: fileName,
-    exportName,
+    ...(exportName === undefined ? {} : { requestedExport: exportName }),
     locale: path.basename(fileName, path.extname(fileName))
   }));
 }

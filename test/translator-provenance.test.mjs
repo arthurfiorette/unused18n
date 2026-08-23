@@ -16,7 +16,7 @@ test('recognizes proven first-party translators without accepting name-only look
 
   assert.deepEqual(unused, [
     'dynamic',
-    'known.spread',
+    'known',
     'stale',
     'unknownOptions',
     'unrelatedFixed',

@@ -4,6 +4,9 @@
   "friend_male_other": "Friend",
   "directJa": "Direct Japanese",
   "sharedDirect": "Shared Japanese",
+  "shape": {
+    "nested": "Japanese nested shape"
+  },
   "status_one": "Status",
   "unused": "Unused"
 }

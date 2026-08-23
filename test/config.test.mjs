@@ -49,13 +49,16 @@ test('generated schema documents every config field and rejects unknown properti
     'cacheStats',
     'dictionaries',
     'dictionaryExport',
+    'logLevel',
     'maxExpansions',
     'project',
     'remove'
   ]);
-  assert.equal(definition?.properties?.dictionaryExport?.default, 'default');
+  assert.equal(definition?.properties?.dictionaryExport?.default, undefined);
+  assert.equal(definition?.properties?.logLevel?.default, 'info');
   assert.equal(definition?.properties?.maxExpansions?.default, 1000);
   assert.equal(definition?.properties?.project?.minLength, 1);
+  assert.equal(schema.definitions?.DictionaryPattern?.minLength, 1);
   assert.deepEqual(definition?.properties?.$schema?.examples, [
     './node_modules/unused18n/schema.json'
   ]);
@@ -65,7 +68,6 @@ test('CLI discovers config, honors config-relative paths, and lets flags overrid
   const discovered = spawnSync(process.execPath, [cli], { cwd: fixture, encoding: 'utf8' });
   assert.equal(discovered.status, 1);
   assert.match(discovered.stderr, /Translation key "configUnused" is unused/);
-  assert.match(discovered.stderr, /\[cache\] bypass \(disabled\)/);
 
   const explicit = spawnSync(
     process.execPath,
@@ -130,7 +132,7 @@ test('CLI reports config and merged required-option failures as argument errors'
     encoding: 'utf8'
   });
   assert.equal(missingOptions.status, 2);
-  assert.match(missingOptions.stderr, /Missing required option.*project/);
+  assert.match(missingOptions.stderr, /Missing required option.*dictionary/);
 });
 
 test('npm package includes the generated schema at the documented path', () => {
