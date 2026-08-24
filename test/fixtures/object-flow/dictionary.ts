@@ -28,6 +28,7 @@ export default {
   typeAssertionCastFlow: { used: 'Used despite an invalid type assertion' },
   defaultFlow: { used: 'Used through a default parameter', unused: 'Unused default sibling' },
   externalFlow: { used: 'Passed to declaration-only external code' },
+  forwardRefFlow: { used: 'Used through an imported forwardRef component', unused: 'Unused' },
   hiddenJsxFlow: { used: 'Overwritten JSX value' },
   visibleJsxFlow: { used: 'Winning JSX value' },
   hiddenReturnFlow: { used: 'Overwritten return value' },

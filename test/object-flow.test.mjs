@@ -21,6 +21,7 @@ test('tracks translation objects through parameters, JSX props, and returned obj
     'billingHistory.stale',
     'defaultFlow.unused',
     'destructuredFlow.unused',
+    'forwardRefFlow.unused',
     'hiddenJsxFlow',
     'hiddenReturnFlow',
     'jsxFlow.unused',

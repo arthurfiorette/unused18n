@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { ForwardChild } from './forward-child.js';
 
 const { t: translate } = useTranslation();
 
@@ -97,6 +98,10 @@ consumeDefault();
 declare function consumeExternal(labels: unknown): void;
 const externalLabels = translate('externalFlow', { returnObjects: true });
 consumeExternal(externalLabels);
+
+const forwardRefLabels = translate('forwardRefFlow', { returnObjects: true });
+const forwardRefChild = <ForwardChild labels={forwardRefLabels} />;
+void forwardRefChild;
 
 const hiddenJsxLabels = translate('hiddenJsxFlow', { returnObjects: true });
 const visibleJsxLabels = translate('visibleJsxFlow', { returnObjects: true });

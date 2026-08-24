@@ -1891,14 +1891,26 @@ export function analyzeLoadedProjectMany(
         functionLikeCache.set(expression, declaration);
         return declaration;
       }
-      if (
-        ts.isVariableDeclaration(declaration) &&
-        declaration.initializer &&
-        (ts.isArrowFunction(declaration.initializer) ||
-          ts.isFunctionExpression(declaration.initializer))
-      ) {
-        functionLikeCache.set(expression, declaration.initializer);
-        return declaration.initializer;
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        const initializer = unwrapExpression(declaration.initializer);
+        if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)) {
+          functionLikeCache.set(expression, initializer);
+          return initializer;
+        }
+        if (ts.isCallExpression(initializer) && isReactForwardRefCall(initializer)) {
+          const render = initializer.arguments[0]
+            ? unwrapExpression(initializer.arguments[0])
+            : undefined;
+          if (render && (ts.isArrowFunction(render) || ts.isFunctionExpression(render))) {
+            // Restrict this to proven transparent React wrappers. Arbitrary higher-order functions
+            // may store, transform, or ignore callbacks, so matching callback and response types is
+            // not enough to prove value provenance. Resolving signatures for every call also added
+            // material checker time on giant projects; JSX inputs therefore bind only through
+            // wrapper contracts whose runtime identity semantics are known.
+            functionLikeCache.set(expression, render);
+            return render;
+          }
+        }
       }
     }
     functionLikeCache.set(expression, null);
@@ -2003,6 +2015,26 @@ export function analyzeLoadedProjectMany(
     return (
       ts.isPropertyAccessExpression(callee) &&
       callee.name.text === 'useMemo' &&
+      (isDefaultImportFrom(callee.expression, 'react') ||
+        isNamespaceImportFrom(callee.expression, 'react'))
+    );
+  }
+
+  function isReactForwardRefCall(call: ts.CallExpression): boolean {
+    const callee = unwrapExpression(call.expression);
+    const target = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
+    // Keep the import alias here: @types/react declares `forwardRef` under namespace React, so
+    // unwrapping first loses the ImportSpecifier that proves its package origin.
+    const symbol = checker.getSymbolAtLocation(target);
+    if (
+      isImportedName(symbol, 'forwardRef', 'react') ||
+      isLibrarySymbol(symbol, 'forwardRef', 'react')
+    ) {
+      return true;
+    }
+    return (
+      ts.isPropertyAccessExpression(callee) &&
+      callee.name.text === 'forwardRef' &&
       (isDefaultImportFrom(callee.expression, 'react') ||
         isNamespaceImportFrom(callee.expression, 'react'))
     );

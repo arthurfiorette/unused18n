@@ -9,4 +9,7 @@ declare module 'i18next' {
 
 declare module 'react' {
   export function useMemo<T>(factory: () => T, dependencies: readonly unknown[]): T;
+  export function forwardRef<T, P>(
+    render: (props: P, ref: unknown) => unknown
+  ): (props: P & { ref?: unknown }) => unknown;
 }
