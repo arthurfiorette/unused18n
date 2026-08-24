@@ -4,6 +4,7 @@ import path from 'node:path';
 import ts from '@typescript/typescript6';
 import type {
   DictionaryInfo,
+  DictionaryKeySource,
   DictionaryRemovalBarrier,
   DictionarySourceProperty
 } from './dictionary.js';
@@ -41,6 +42,8 @@ export type DictionaryRemovalPlanResult =
   | { readonly ok: true; readonly plan: DictionaryRemovalPlan }
   | { readonly ok: false; readonly failures: readonly DictionaryRemovalFailure[] };
 
+type PropertyCoverage = Map<ts.ObjectLiteralElementLike, { total: number; unused: number }>;
+
 /**
  * Plans safe source removals without mutating the AST or filesystem.
  *
@@ -52,20 +55,21 @@ export function planDictionaryRemoval(
   unusedKeys: ReadonlySet<string>
 ): DictionaryRemovalPlanResult {
   const activeUnusedKeys = new Set([...unusedKeys].filter((key) => dictionary.keySources.has(key)));
+  const coverage = propertyCoverage(dictionary.keySources, activeUnusedKeys);
   const selectedProperties = new Map<ts.ObjectLiteralElementLike, DictionarySourceProperty>();
   const failures: DictionaryRemovalFailure[] = [];
 
   for (const key of activeUnusedKeys) {
     const source = dictionary.keySources.get(key);
     if (!source) continue;
-    const candidate = source.propertyChain.find(
-      (property) =>
-        property.barriers.length === 0 &&
+    const candidate = source.propertyChain.find((property) => {
+      const count = coverage.get(property.node);
+      return (
+        property.barriers.every((barrier) => barrier === 'array') &&
         isSupportedProperty(property.node) &&
-        activeDescendants(dictionary, property.keyPrefix).every((activeKey) =>
-          activeUnusedKeys.has(activeKey)
-        )
-    );
+        count?.total === count?.unused
+      );
+    });
     if (candidate) {
       selectedProperties.set(candidate.node, candidate);
       continue;
@@ -96,27 +100,25 @@ export function planDictionaryRemoval(
  * never cause partial edits within a source file.
  */
 export function applyDictionaryRemoval(plan: DictionaryRemovalPlan): void {
-  const editsByFile = new Map<string, DictionaryRemovalEdit[]>();
-  for (const edit of plan.edits) {
-    const fileName = path.resolve(edit.fileName);
-    const fileEdits = editsByFile.get(fileName);
-    if (fileEdits) fileEdits.push(edit);
-    else editsByFile.set(fileName, [edit]);
-  }
+  const editsByFile = validateAndGroupEdits(plan.edits);
   const outputs = new Map<string, string>();
 
   for (const [fileName, edits] of editsByFile) {
     const sourceText = fs.readFileSync(fileName, 'utf8');
+    const chunks: string[] = [];
+    let cursor = 0;
     for (const edit of edits) {
+      if (edit.end > sourceText.length) {
+        throw new Error(`Dictionary removal edit is out of bounds: ${fileName}`);
+      }
       if (sourceText.slice(edit.start, edit.end) !== edit.expectedText) {
         throw new Error(`Dictionary source changed after removal was planned: ${fileName}`);
       }
+      chunks.push(sourceText.slice(cursor, edit.start));
+      cursor = edit.end;
     }
-    let output = sourceText;
-    for (const edit of [...edits].sort((left, right) => right.start - left.start)) {
-      output = `${output.slice(0, edit.start)}${output.slice(edit.end)}`;
-    }
-    outputs.set(fileName, output);
+    chunks.push(sourceText.slice(cursor));
+    outputs.set(fileName, chunks.join(''));
   }
 
   const temporaryFiles = new Map<string, string>();
@@ -182,8 +184,61 @@ export function applyDictionaryRemoval(plan: DictionaryRemovalPlan): void {
   }
 }
 
-function activeDescendants(dictionary: DictionaryInfo, prefix: string): string[] {
-  return [...dictionary.keys].filter((key) => key === prefix || key.startsWith(`${prefix}.`));
+/** Canonicalizes deletion ranges before any destination or temporary file is touched. */
+export function validateAndGroupEdits(
+  edits: readonly DictionaryRemovalEdit[]
+): Map<string, DictionaryRemovalEdit[]> {
+  const editsByFile = new Map<string, DictionaryRemovalEdit[]>();
+  for (const edit of edits) {
+    if (
+      !Number.isSafeInteger(edit.start) ||
+      !Number.isSafeInteger(edit.end) ||
+      edit.start < 0 ||
+      edit.end < edit.start
+    ) {
+      throw new Error(`Dictionary removal edit has an invalid range: ${edit.fileName}`);
+    }
+    const fileName = path.resolve(edit.fileName);
+    const fileEdits = editsByFile.get(fileName);
+    if (fileEdits) fileEdits.push(edit);
+    else editsByFile.set(fileName, [edit]);
+  }
+
+  for (const [fileName, fileEdits] of editsByFile) {
+    fileEdits.sort((left, right) => left.start - right.start || left.end - right.end);
+    const normalized: DictionaryRemovalEdit[] = [];
+    for (const edit of fileEdits) {
+      const previous = normalized.at(-1);
+      if (previous?.start === edit.start && previous.end === edit.end) {
+        if (previous.expectedText !== edit.expectedText) {
+          throw new Error(`Dictionary removal edits disagree for the same range: ${fileName}`);
+        }
+        continue;
+      }
+      if (previous && edit.start < previous.end) {
+        throw new Error(`Dictionary removal edits overlap: ${fileName}`);
+      }
+      normalized.push(edit);
+    }
+    editsByFile.set(fileName, normalized);
+  }
+  return editsByFile;
+}
+
+function propertyCoverage(
+  keySources: ReadonlyMap<string, DictionaryKeySource>,
+  unusedKeys: ReadonlySet<string>
+): PropertyCoverage {
+  const coverage: PropertyCoverage = new Map();
+  for (const [key, source] of keySources) {
+    for (const property of source.propertyChain) {
+      const count = coverage.get(property.node) ?? { total: 0, unused: 0 };
+      count.total += 1;
+      if (unusedKeys.has(key)) count.unused += 1;
+      coverage.set(property.node, count);
+    }
+  }
+  return coverage;
 }
 
 function uniqueBarriers(

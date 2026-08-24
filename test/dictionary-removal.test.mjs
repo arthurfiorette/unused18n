@@ -5,7 +5,11 @@ import path from 'node:path';
 import test from 'node:test';
 import ts from '@typescript/typescript6';
 import { readDictionary } from '../dist/dictionary.js';
-import { applyDictionaryRemoval, planDictionaryRemoval } from '../dist/dictionary-removal.js';
+import {
+  applyDictionaryRemoval,
+  planDictionaryRemoval,
+  validateAndGroupEdits
+} from '../dist/dictionary-removal.js';
 
 function temporaryDictionary(t, source, files = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'unused18n-removal-'));
@@ -126,6 +130,29 @@ test('collapses a safe parent when every active descendant is unused', (t) => {
   assert.deepEqual([...dictionary.keys], ['survivor']);
   assert.doesNotMatch(source, /group:/);
   assert.match(source, /Keep this sibling and its comment/);
+});
+
+test('removes an array-valued property when every element is unused', (t) => {
+  const dictionaryPath = temporaryDictionary(
+    t,
+    `export const dictionary = {
+  group: {
+    keep: 'keep',
+    examples: ['first', 'second', 'third'],
+  },
+}
+`
+  );
+
+  const { dictionary, source } = removeKeys(dictionaryPath, [
+    'group.examples.0',
+    'group.examples.1',
+    'group.examples.2'
+  ]);
+
+  assert.deepEqual([...dictionary.keys], ['group.keep']);
+  assert.doesNotMatch(source, /examples/);
+  assert.match(source, /keep: 'keep'/);
 });
 
 test('removes every root property without leaving an invalid trailing comma', (t) => {
@@ -267,4 +294,52 @@ test('rejects a stale multi-file plan before changing either dictionary', (t) =>
     })
   );
   assert.equal(fs.readFileSync(first, 'utf8'), firstBefore);
+});
+
+test('normalizes duplicate unordered edits and reconstructs output once', (t) => {
+  const dictionaryPath = temporaryDictionary(t, 'abcdef');
+  const removeB = { fileName: dictionaryPath, start: 1, end: 2, expectedText: 'b' };
+  const removeDE = { fileName: dictionaryPath, start: 3, end: 5, expectedText: 'de' };
+
+  const grouped = validateAndGroupEdits([removeDE, removeB, removeB]);
+  assert.deepEqual(
+    grouped.get(dictionaryPath)?.map(({ start, end }) => [start, end]),
+    [
+      [1, 2],
+      [3, 5]
+    ]
+  );
+
+  applyDictionaryRemoval({ edits: [removeDE, removeB, removeB], removedKeys: new Set() });
+  assert.equal(fs.readFileSync(dictionaryPath, 'utf8'), 'acf');
+});
+
+test('rejects conflicting, overlapping, and out-of-bounds edits before mutation', (t) => {
+  const dictionaryPath = temporaryDictionary(t, 'abcdef');
+  const original = fs.readFileSync(dictionaryPath, 'utf8');
+  const edit = (start, end, expectedText) => ({
+    fileName: dictionaryPath,
+    start,
+    end,
+    expectedText
+  });
+
+  assert.throws(() => validateAndGroupEdits([edit(1, 3, 'bc'), edit(1, 3, 'wrong')]), /disagree/);
+  assert.throws(
+    () =>
+      applyDictionaryRemoval({
+        edits: [edit(1, 4, 'bcd'), edit(3, 5, 'de')],
+        removedKeys: new Set()
+      }),
+    /overlap/
+  );
+  assert.throws(
+    () => applyDictionaryRemoval({ edits: [edit(5, 7, 'f')], removedKeys: new Set() }),
+    /out of bounds/
+  );
+  assert.throws(
+    () => applyDictionaryRemoval({ edits: [edit(-1, 1, 'a')], removedKeys: new Set() }),
+    /invalid range/
+  );
+  assert.equal(fs.readFileSync(dictionaryPath, 'utf8'), original);
 });

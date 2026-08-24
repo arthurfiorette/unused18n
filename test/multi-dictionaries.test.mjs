@@ -56,7 +56,7 @@ test('CLI accepts repeated dictionary flags', () => {
   );
 
   assert.equal(result.status, 1);
-  assert.equal((result.stderr.match(/Translation key "unused" is unused/g) ?? []).length, 2);
+  assert.match(result.stderr, /Summary: 4 unused/);
 });
 
 test('reuses one cached source analysis across every locale dictionary', (t) => {
@@ -94,23 +94,53 @@ test('reuses one cached source analysis across every locale dictionary', (t) => 
     warm.events.map(({ type }) => type),
     ['hit']
   );
+
+  const entryPath = fs
+    .readdirSync(cacheDir, { recursive: true })
+    .map((entry) => path.join(cacheDir, entry))
+    .find((entry) => entry.endsWith('.json'));
+  assert.ok(entryPath);
+  const entry = JSON.parse(fs.readFileSync(entryPath, 'utf8'));
+  const targetedIds = new Set(
+    Object.values(entry.sources).flatMap(({ facts }) =>
+      facts.observations.flatMap(({ dictionaryIds }) => dictionaryIds ?? [])
+    )
+  );
+  assert.deepEqual([...targetedIds].map((id) => path.basename(id.split('\0')[0])).sort(), [
+    'ar.json',
+    'en.json',
+    'ja.json'
+  ]);
 });
 
 test('removes unused keys from every matched dictionary in one plan', (t) => {
   const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'unused18n-locales-'));
   t.after(() => fs.rmSync(copy, { force: true, recursive: true }));
   fs.cpSync(project, copy, { recursive: true });
+  const cacheDir = path.join(copy, 'cache');
+  const dictionaryPattern = path.join(copy, '??.json');
+  [...lint({ project: copy, dictionaries: dictionaryPattern, cacheDir })];
+  const events = [];
+  const lintEvents = [];
 
   const diagnostics = [
     ...lint({
       project: copy,
-      dictionaries: path.join(copy, '??.json'),
+      dictionaries: dictionaryPattern,
       remove: true,
-      cache: false
+      cacheDir,
+      onEvent: (event) => lintEvents.push(event),
+      onCacheEvent: (event) => events.push(event)
     })
   ];
 
+  assert.deepEqual(
+    events.map(({ type }) => type),
+    ['hit']
+  );
+  assert.equal(events[0]?.analyzedFiles, 0);
   assert.equal(diagnostics.filter(({ code }) => code === DiagnosticCode.RemovedKey).length, 5);
+  assert.equal(lintEvents.find(({ type }) => type === 'summary')?.removedKeys, 5);
   for (const locale of ['ar', 'en', 'ja']) {
     assert.equal(
       Object.hasOwn(JSON.parse(fs.readFileSync(path.join(copy, `${locale}.json`))), 'unused'),

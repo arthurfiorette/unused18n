@@ -6,8 +6,8 @@ import type { AnalysisReuse, LoadedDictionaryTarget, SourceUsageFacts } from './
 import type { LoadedProject } from './project.js';
 
 // Bump either version whenever persisted shape or analyzer semantics would make old facts unsafe.
-const CACHE_SCHEMA_VERSION = 2;
-const ANALYSIS_ALGORITHM_VERSION = 2;
+const CACHE_SCHEMA_VERSION = 4;
+const ANALYSIS_ALGORITHM_VERSION = 9;
 const MAX_CACHE_BYTES = 64 * 1024 * 1024;
 
 /** Cache observability stays separate from TypeScript diagnostics and never affects lint status. */
@@ -75,13 +75,11 @@ export function resolveCachePaths(
   const directory = cacheDir
     ? path.resolve(cacheDir)
     : path.join(projectDirectory, 'node_modules', '.cache', 'unused18n');
-  const identity = hash(
-    canonicalJson({
-      project: configPath,
-      dictionaries: dictionaries.map((dictionary) => path.resolve(dictionary)).sort(comparePaths),
-      dictionaryExport: dictionaryExport ?? '<infer>'
-    })
-  );
+  const identity = hashCanonical({
+    project: configPath,
+    dictionaries: dictionaries.map((dictionary) => path.resolve(dictionary)).sort(comparePaths),
+    dictionaryExport: dictionaryExport ?? '<infer>'
+  });
   return {
     directory,
     entryFile: path.join(directory, `analysis-${identity}.json`),
@@ -178,8 +176,9 @@ export function prepareAnalysisCache(
               ...source,
               facts: facts.get(fileName) ?? {
                 fileName,
-                facts: [],
-                unresolvedReferences: []
+                observations: [],
+                unresolvedReferences: [],
+                translationObjectCasts: []
               }
             }
           ])
@@ -204,9 +203,11 @@ function factsTargetCurrentDictionaries(
   entry: CacheEntry,
   dictionaries: LoadedDictionaryTarget[]
 ): boolean {
-  const keysById = new Map(dictionaries.map(({ id, info }) => [id, info.keys]));
+  const dictionaryIds = new Set(dictionaries.map(({ id }) => id));
   return Object.values(entry.sources).every(({ facts }) =>
-    facts.facts.every((fact) => keysById.get(fact.dictionaryId)?.has(fact.key) === true)
+    facts.observations.every(
+      (observation) => observation.dictionaryIds?.every((id) => dictionaryIds.has(id)) ?? true
+    )
   );
 }
 
@@ -248,23 +249,21 @@ function computeCompatibilityHash(
         key !== 'tsBuildInfoFile'
     )
   );
-  return hash(
-    canonicalJson({
-      schemaVersion: CACHE_SCHEMA_VERSION,
-      analysisVersion: ANALYSIS_ALGORITHM_VERSION,
-      packageVersion,
-      typescriptVersion: ts.version,
-      configPath: path.resolve(loaded.configPath),
-      compilerOptions,
-      dictionaries: dictionaries.map(({ id, locale, info }) => ({
-        id,
-        locale,
-        keys: [...info.keys].sort(comparePaths)
-      })),
-      maxExpansions: options.maxExpansions,
-      externalSources
-    })
-  );
+  return hashCanonical({
+    schemaVersion: CACHE_SCHEMA_VERSION,
+    analysisVersion: ANALYSIS_ALGORITHM_VERSION,
+    packageVersion,
+    typescriptVersion: ts.version,
+    configPath: path.resolve(loaded.configPath),
+    compilerOptions,
+    dictionaries: dictionaries.map(({ id, locale, info }) => ({
+      id,
+      locale,
+      keys: [...info.keys].sort(comparePaths)
+    })),
+    maxExpansions: options.maxExpansions,
+    externalSources
+  });
 }
 
 function dependenciesFor(
@@ -418,17 +417,24 @@ function isSourceFacts(value: unknown): value is SourceUsageFacts {
   return (
     isRecord(value) &&
     typeof value.fileName === 'string' &&
-    Array.isArray(value.facts) &&
-    value.facts.every(
-      (fact) =>
-        isRecord(fact) &&
-        typeof fact.dictionaryId === 'string' &&
-        typeof fact.key === 'string' &&
-        (fact.confidence === 'used' || fact.confidence === 'possibly-used') &&
-        isEvidence(fact.evidence)
+    Array.isArray(value.observations) &&
+    value.observations.every(
+      (observation) =>
+        isRecord(observation) &&
+        (observation.kind === 'exact' ||
+          observation.kind === 'prefix' ||
+          observation.kind === 'pattern') &&
+        typeof observation.value === 'string' &&
+        (observation.confidence === 'used' || observation.confidence === 'possibly-used') &&
+        (observation.dictionaryIds === undefined ||
+          (Array.isArray(observation.dictionaryIds) &&
+            observation.dictionaryIds.every((id) => typeof id === 'string'))) &&
+        isEvidence(observation.evidence)
     ) &&
     Array.isArray(value.unresolvedReferences) &&
-    value.unresolvedReferences.every(isEvidence)
+    value.unresolvedReferences.every(isEvidence) &&
+    Array.isArray(value.translationObjectCasts) &&
+    value.translationObjectCasts.every(isEvidence)
   );
 }
 
@@ -466,19 +472,38 @@ function affectsGlobalScope(source: ts.SourceFile): boolean {
   return found;
 }
 
-function canonicalJson(value: unknown): string {
-  return JSON.stringify(normalize(value));
+function hashCanonical(value: unknown): string {
+  const digest = createHash('sha256');
+  updateCanonicalHash(digest, value);
+  return digest.digest('hex');
 }
 
-function normalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(normalize);
-  if (!isRecord(value)) return value;
-  return Object.fromEntries(
-    Object.keys(value)
+/** Streams the same canonical JSON bytes previously materialized as one large string. */
+function updateCanonicalHash(digest: ReturnType<typeof createHash>, value: unknown): void {
+  if (Array.isArray(value)) {
+    digest.update('[');
+    value.forEach((entry, index) => {
+      if (index > 0) digest.update(',');
+      updateCanonicalHash(digest, entry);
+    });
+    digest.update(']');
+    return;
+  }
+  if (isRecord(value)) {
+    digest.update('{');
+    const keys = Object.keys(value)
       .sort(comparePaths)
-      .filter((key) => value[key] !== undefined)
-      .map((key) => [key, normalize(value[key])])
-  );
+      .filter((key) => value[key] !== undefined);
+    keys.forEach((key, index) => {
+      if (index > 0) digest.update(',');
+      digest.update(JSON.stringify(key));
+      digest.update(':');
+      updateCanonicalHash(digest, value[key]);
+    });
+    digest.update('}');
+    return;
+  }
+  digest.update(value === undefined ? 'null' : JSON.stringify(value));
 }
 
 function hash(value: string): string {

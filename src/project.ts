@@ -109,23 +109,32 @@ export function loadProjectWithDiagnostics(
       if (createOptions.projectReferences) {
         builderOptions.projectReferences = createOptions.projectReferences;
       }
-      const builder = ts.createIncrementalProgram(builderOptions);
+      let builder: ts.EmitAndSemanticDiagnosticsBuilderProgram | undefined =
+        ts.createIncrementalProgram(builderOptions);
       program = builder.getProgram();
       // Defer emit so malformed projects never establish trusted compiler cache state.
       saveBuildInfo = () => {
+        const currentBuilder = builder;
+        if (!currentBuilder) return;
         pendingBuildInfo = undefined;
-        const result = builder.emit();
-        if (result.diagnostics.length > 0) {
-          throw new Error(
-            ts.formatDiagnostics(result.diagnostics, {
-              getCanonicalFileName: (fileName) => fileName,
-              getCurrentDirectory: () => process.cwd(),
-              getNewLine: () => ts.sys.newLine
-            })
-          );
+        try {
+          const result = currentBuilder.emit();
+          if (result.diagnostics.length > 0) {
+            throw new Error(
+              ts.formatDiagnostics(result.diagnostics, {
+                getCanonicalFileName: (fileName) => fileName,
+                getCurrentDirectory: () => process.cwd(),
+                getNewLine: () => ts.sys.newLine
+              })
+            );
+          }
+          if (pendingBuildInfo !== undefined)
+            writeBuildInfoAtomically(tsBuildInfoFile, pendingBuildInfo);
+        } finally {
+          // Analysis needs the Program, not builder-only emit queues or pending serialized state.
+          builder = undefined;
+          pendingBuildInfo = undefined;
         }
-        if (pendingBuildInfo !== undefined)
-          writeBuildInfoAtomically(tsBuildInfoFile, pendingBuildInfo);
       };
     } catch (error) {
       cacheError = error instanceof Error ? error.message : String(error);

@@ -33,6 +33,11 @@
     "unused18n": "bin/run.js"
   },
   "scripts": {
+    "bench:analyzer": "node --expose-gc bench/analyzer.mjs",
+    "bench:dictionary-tree": "node --expose-gc bench/dictionary-tree.mjs",
+    "bench:generate": "node bench/generate-dictionary.mjs",
+    "bench:observations": "node --expose-gc bench/observations.mjs",
+    "bench:synthetic": "node --expose-gc bench/synthetic.mjs",
     "build": "pnpm schema && pnpm clean && tsc -p tsconfig.build.json",
     "check": "pnpm lint-ci && pnpm test-types && pnpm test",
     "clean": "node --input-type=module -e \"import fs from 'node:fs'; fs.rmSync('dist', { recursive: true, force: true })\"",
@@ -80,6 +85,7 @@
     "@arthurfiorette/biomejs-config": "^2.0.1",
     "@biomejs/biome": "^2.5.10",
     "@types/node": "^26.2.0",
+    "mitata": "^1.0.34",
     "ts-json-schema-generator": "^2.9.0",
     "typescript": "^7.0.2"
   },

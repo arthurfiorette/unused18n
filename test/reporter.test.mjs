@@ -68,3 +68,54 @@ test('reports cache lifecycle only at debug level and through the same throttle'
 
   assert.deepEqual(messages, ['[3.0s] Cache write: files=2']);
 });
+
+test('reports completed stage durations only at debug level', () => {
+  let time = 0;
+  const messages = [];
+  const reporter = createReporter({
+    level: 'debug',
+    isTTY: false,
+    now: () => time,
+    write: (message) => messages.push(message)
+  });
+
+  reporter.event({ type: 'stage', stage: 'dictionary', status: 'start', timestamp: 100 });
+  time = 3_000;
+  reporter.event({ type: 'stage', stage: 'dictionary', status: 'end', timestamp: 350 });
+
+  assert.deepEqual(messages, ['[3.0s] dictionary stage: 250.0ms']);
+});
+
+test('suppresses per-key diagnostics and reports final statistics even in silent mode', () => {
+  const messages = [];
+  const reporter = createReporter({
+    level: 'silent',
+    isTTY: false,
+    write: (message) => messages.push(message)
+  });
+
+  reporter.diagnostic({
+    category: ts.DiagnosticCategory.Error,
+    code: 95_001,
+    messageText: 'unused key'
+  });
+  reporter.diagnostic({
+    category: ts.DiagnosticCategory.Message,
+    code: 95_003,
+    messageText: 'removed key'
+  });
+  reporter.event({
+    type: 'summary',
+    unusedKeys: 4_184,
+    removedKeys: 5,
+    unresolvedReferences: 12,
+    removalFailures: 0,
+    translationObjectCasts: 2,
+    removedCasts: 0
+  });
+
+  assert.deepEqual(messages, [
+    'Summary: 4,184 unused | 5 removed | 12 unresolved | 0 removal failures | 2 casts',
+    'Run --remove to remove 2 translation object casts automatically.'
+  ]);
+});

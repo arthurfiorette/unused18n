@@ -133,7 +133,11 @@ const { cancel } = dictionary.common;
 Object.keys(dictionary.categories);
 ```
 
+Array and readonly-tuple iteration through standard receiver methods such as `map`, `forEach`, `reduce`, `some`, `every`, and `find` conservatively marks every array element as possibly used. A normal dictionary property named `map` remains ordinary property access.
+
 Dictionary paths use `.` separators. i18next namespaces and custom `keySeparator` behavior are not interpreted. Unbounded runtime keys produce source-located warnings; they do not mark unrelated dictionary keys as used, and warnings alone do not fail the command.
+
+Calls with `returnObjects: true` should use the dictionary type inferred by i18next. Wrapping the returned object in `as SomeType` or a type assertion emits `TS95006`; casts remain transparent to usage analysis but can hide dictionary drift from the application type checker. Run `--remove` to delete these assertions automatically.
 
 ## Remove unused keys
 
@@ -144,7 +148,11 @@ npx unused18n lint \
   --remove
 ```
 
-Removal preserves unrelated formatting and comments. It is all-or-nothing: if any unused key cannot be edited safely, the dictionary remains unchanged. Array elements, computed properties, shared or imported objects, unresolved spreads, and ambiguous overwrites must be removed manually.
+Removal preserves unrelated formatting and comments. It is all-or-nothing across dictionary keys and `TS95006` cast fixes: if any edit cannot be applied safely, every source remains unchanged. A wholly unused array-valued object property is removed as one unit; individual array elements, computed properties, shared or imported objects, unresolved spreads, and ambiguous overwrites must be removed manually.
+
+Before using `--remove`, ensure every dictionary is tracked by Git or another version-control system and that you can restore its previous revision. Successful removal does not retain a long-lived backup after the atomic replacement completes.
+
+The CLI summarizes unused and removed key counts instead of printing one diagnostic per key. Unresolved references and removal failures remain source-located. Programmatic `lint()` consumers still receive every detailed diagnostic.
 
 ## Configuration
 
@@ -172,7 +180,7 @@ Use `--config=<path>` to load a different JSON file. Without it, `unused18n` loo
 | `--config <path>`         | Load JSON options from this file instead of `.unused18nrc`    |
 | `-p, --project <path>`    | `tsconfig.json` path or directory; defaults to `./tsconfig.json` |
 | `-d, --dictionary <path>` | Required by flag or config. Repeatable dictionary path/glob  |
-| `-e, --export <name>`     | TypeScript export name; omission prefers `default`, then one export |
+| `-e, --export <name>`     | TypeScript export name; omission prefers `default`, then one value export |
 | `--[no-]remove`           | Enable or override config-file removal                        |
 | `--max-expansions <n>`    | Maximum number of finite key combinations; defaults to `1000` |
 | `--no-cache`              | Disable persistent caching                                    |
@@ -223,5 +231,10 @@ for (const diagnostic of lint({
 | `cacheDir`         | `string`                      | `<tsconfig-directory>/node_modules/.cache/unused18n` |
 | `onCacheEvent`     | `(event: CacheEvent) => void` | No callback                                          |
 | `onEvent`          | `(event: LintEvent) => void`  | No callback                                          |
+| `now`              | `() => number`                | `performance.now`                                    |
 
-The package exports `lint`, `DiagnosticCode`, and the `LintOptions`, `Unused18nConfig`, `LintEvent`, `LogLevel`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary.
+The package exports `lint`, `DiagnosticCode`, and the `LintOptions`, `Unused18nConfig`, `LintEvent`, `LogLevel`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary. `LintEvent` includes final key statistics plus start/end timestamps for the `project`, `dictionary`, `discovery`, `usage`, `replay`, and `removal` stages; the CLI prints stage durations only at debug level.
+
+## Performance benchmarks
+
+Maintainers benchmark direct `lint()` calls with mitata so CLI parsing and rendering do not affect results. See the [benchmark guide](https://github.com/arthurfiorette/unused18n/blob/main/bench/README.md) in the source repository.

@@ -4,5 +4,6 @@ export const DiagnosticCode = {
   UnresolvedReference: 95_002,
   RemovedKey: 95_003,
   RemovalFailure: 95_004,
-  ConfigurationFailure: 95_005
+  ConfigurationFailure: 95_005,
+  TranslationObjectCast: 95_006
 } as const;

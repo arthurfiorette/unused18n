@@ -5,7 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { analyzeLoadedProjectMany } from '../dist/analyzer.js';
+import { prepareAnalysisCache, resolveCachePaths } from '../dist/cache.js';
+import { readDictionary } from '../dist/dictionary.js';
 import { DiagnosticCode, lint } from '../dist/index.js';
+import { loadProject } from '../dist/project.js';
 
 const cli = fileURLToPath(new URL('../bin/run.js', import.meta.url));
 
@@ -84,6 +88,62 @@ test('persists compiler build info and reuses complete analysis facts', (t) => {
   assert.ok(cacheFiles.some((file) => file.endsWith('.json')));
   assert.equal(fs.existsSync(path.join(project, 'usage.js')), false);
   assert.equal(fs.existsSync(path.join(project, 'dictionary.js')), false);
+});
+
+test('persists compact subtree observations and replays deterministic evidence', (t) => {
+  const project = temporaryProject(t);
+  const cacheDir = path.join(project, 'cache');
+  const dictionaryPath = path.join(project, 'dictionary.ts');
+  const entries = Array.from({ length: 200 }, (_, index) => `key${index}: 'Value ${index}'`);
+  fs.writeFileSync(dictionaryPath, `export default { group: { ${entries.join(', ')} } }\n`);
+  fs.writeFileSync(
+    path.join(project, 'usage.ts'),
+    `import dictionary from './dictionary.js'\ndeclare const suffix: string\nObject.values(dictionary.group)\ndictionary.group[\`key\${suffix}\`]\n`
+  );
+
+  const cold = runLint(project, cacheDir);
+  const warm = runLint(project, cacheDir);
+  assert.deepEqual(portableDiagnostics(warm.diagnostics), portableDiagnostics(cold.diagnostics));
+
+  const entryPath = filesUnder(cacheDir).find((file) => file.endsWith('.json'));
+  assert.ok(entryPath);
+  const entry = JSON.parse(fs.readFileSync(entryPath, 'utf8'));
+  assert.equal(entry.schemaVersion, 4);
+  assert.equal(entry.analysisVersion, 9);
+  const usageFacts = entry.sources[path.join(project, 'usage.ts')].facts;
+  assert.equal(Object.hasOwn(usageFacts, 'facts'), false);
+  assert.ok(usageFacts.observations.length < 10);
+  assert.ok(
+    usageFacts.observations.some(
+      ({ kind, value, dictionaryIds }) =>
+        kind === 'prefix' && value === 'group.' && dictionaryIds?.length === 1
+    )
+  );
+  assert.ok(
+    usageFacts.observations.some(
+      ({ kind, value, dictionaryIds }) =>
+        kind === 'pattern' && value === 'group.key*' && dictionaryIds?.length === 1
+    )
+  );
+
+  const loaded = loadProject(project, [dictionaryPath]);
+  const info = readDictionary(loaded.program, loaded.checker, dictionaryPath);
+  const target = {
+    id: `${dictionaryPath}\0${info.exportName}`,
+    path: dictionaryPath,
+    exportName: info.exportName,
+    locale: 'dictionary',
+    info
+  };
+  const prepared = prepareAnalysisCache(loaded, [target], {
+    maxExpansions: 1_000,
+    paths: resolveCachePaths(project, [dictionaryPath], undefined, cacheDir)
+  });
+  assert.equal(prepared.event.type, 'hit');
+  const fresh = analyzeLoadedProjectMany(loaded, [target], {}, { dictionaries: [target] });
+  const replayed = analyzeLoadedProjectMany(loaded, [target], {}, prepared.reuse);
+  assert.deepEqual(replayed.analyses[0].result, fresh.analyses[0].result);
+  assert.deepEqual(replayed.unresolvedReferences, fresh.unresolvedReferences);
 });
 
 test('does not touch the cache until the lint generator is consumed', (t) => {
@@ -226,18 +286,190 @@ test('caches JSON analysis and invalidates changed dictionary keys', (t) => {
   assert.ok(changed.diagnostics.some(({ messageText }) => String(messageText).includes('"added"')));
 });
 
-test('--remove bypasses analysis facts and the next read misses changed content', (t) => {
+test('warm --remove replays facts and does not persist pre-mutation facts', (t) => {
   const project = temporaryProject(t);
   const cacheDir = path.join(project, 'cache');
   runLint(project, cacheDir);
+  const entry = filesUnder(cacheDir).find((file) => file.endsWith('.json'));
+  assert.ok(entry);
+  const cachedBefore = fs.readFileSync(entry, 'utf8');
 
   const removed = runLint(project, cacheDir, { remove: true });
-  assert.deepEqual(removed.events, [{ type: 'bypass', reason: 'remove' }]);
+  assert.deepEqual(
+    removed.events.map(({ type }) => type),
+    ['hit']
+  );
+  assert.equal(removed.events[0]?.analyzedFiles, 0);
   assert.ok(removed.diagnostics.some(({ code }) => code === DiagnosticCode.RemovedKey));
+  assert.equal(fs.readFileSync(entry, 'utf8'), cachedBefore);
+  assert.equal(
+    fs.readFileSync(path.join(project, 'dictionary.ts'), 'utf8').includes('unused'),
+    false
+  );
 
   const after = runLint(project, cacheDir);
   assert.equal(after.events[0]?.type, 'miss');
   assert.equal(after.events[0]?.reason, 'incompatible');
+});
+
+test('warm refused --remove preserves a reusable cache and matches uncached diagnostics', (t) => {
+  const project = temporaryProject(t);
+  const cacheDir = path.join(project, 'cache');
+  fs.writeFileSync(
+    path.join(project, 'dictionary.ts'),
+    `export default { values: ['Used', 'Unsafe'] }\n`
+  );
+  fs.writeFileSync(
+    path.join(project, 'usage.ts'),
+    `import dictionary from './dictionary.js'\ndictionary.values[0]\n`
+  );
+  runLint(project, cacheDir);
+  const before = fs.readFileSync(path.join(project, 'dictionary.ts'), 'utf8');
+
+  const refused = runLint(project, cacheDir, { remove: true });
+  const uncached = runLint(project, path.join(project, 'uncached'), {
+    cache: false,
+    remove: true
+  });
+
+  assert.deepEqual(
+    refused.events.map(({ type }) => type),
+    ['hit']
+  );
+  assert.equal(refused.events[0]?.analyzedFiles, 0);
+  assert.deepEqual(
+    portableDiagnostics(refused.diagnostics),
+    portableDiagnostics(uncached.diagnostics)
+  );
+  assert.ok(refused.diagnostics.some(({ code }) => code === DiagnosticCode.RemovalFailure));
+  assert.equal(fs.readFileSync(path.join(project, 'dictionary.ts'), 'utf8'), before);
+
+  const after = runLint(project, cacheDir);
+  assert.deepEqual(
+    after.events.map(({ type }) => type),
+    ['hit']
+  );
+});
+
+test('cold refused --remove writes fresh facts for the next run', (t) => {
+  const project = temporaryProject(t);
+  const cacheDir = path.join(project, 'cache');
+  fs.writeFileSync(
+    path.join(project, 'dictionary.ts'),
+    `export default { values: ['Used', 'Unsafe'] }\n`
+  );
+  fs.writeFileSync(
+    path.join(project, 'usage.ts'),
+    `import dictionary from './dictionary.js'\ndictionary.values[0]\n`
+  );
+
+  const refused = runLint(project, cacheDir, { remove: true });
+  assert.deepEqual(
+    refused.events.map(({ type }) => type),
+    ['miss', 'write']
+  );
+  assert.ok(refused.diagnostics.some(({ code }) => code === DiagnosticCode.RemovalFailure));
+
+  const warm = runLint(project, cacheDir, { remove: true });
+  assert.deepEqual(
+    warm.events.map(({ type }) => type),
+    ['hit']
+  );
+  assert.equal(warm.events[0]?.analyzedFiles, 0);
+});
+
+test('refused --remove preserves cache parity after partial invalidation and corruption', (t) => {
+  const project = temporaryProject(t);
+  const cacheDir = path.join(project, 'cache');
+  fs.writeFileSync(
+    path.join(project, 'dictionary.ts'),
+    `export default { values: ['Used', 'Unsafe'] }\n`
+  );
+  fs.writeFileSync(
+    path.join(project, 'usage.ts'),
+    `import dictionary from './dictionary.js'\ndictionary.values[0]\n`
+  );
+  runLint(project, cacheDir);
+
+  fs.writeFileSync(path.join(project, 'other.ts'), `export const unrelated = 2\n`);
+  const partial = runLint(project, cacheDir, { remove: true });
+  assert.deepEqual(
+    partial.events.map(({ type }) => type),
+    ['miss', 'write']
+  );
+  assert.equal(partial.events[0]?.reason, 'changed');
+  assert.equal(partial.events[0]?.analyzedFiles, 1);
+  assert.ok(partial.diagnostics.some(({ code }) => code === DiagnosticCode.RemovalFailure));
+
+  const entry = filesUnder(cacheDir).find((file) => file.endsWith('.json'));
+  assert.ok(entry);
+  fs.writeFileSync(entry, '{ corrupt');
+  const corrupt = runLint(project, cacheDir, { remove: true });
+  const uncached = runLint(project, path.join(project, 'uncached'), {
+    cache: false,
+    remove: true
+  });
+  assert.equal(corrupt.events[0]?.type, 'miss');
+  assert.equal(corrupt.events[0]?.reason, 'corrupt');
+  assert.equal(corrupt.events.at(-1)?.type, 'write');
+  assert.deepEqual(
+    portableDiagnostics(corrupt.diagnostics),
+    portableDiagnostics(uncached.diagnostics)
+  );
+});
+
+test('failed mutation rolls back and does not cache pre-mutation facts', (t) => {
+  const project = temporaryProject(t);
+  const cacheDir = path.join(project, 'cache');
+  const dictionary = path.join(project, 'dictionary.ts');
+  const before = fs.readFileSync(dictionary, 'utf8');
+  const renameSync = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    if (String(destination).includes('.unused18n-') && String(destination).endsWith('.bak')) {
+      throw new Error('injected replacement failure');
+    }
+    return renameSync(source, destination);
+  };
+
+  let failed;
+  const lintEvents = [];
+  try {
+    failed = runLint(project, cacheDir, {
+      remove: true,
+      onEvent: (event) => lintEvents.push(event)
+    });
+  } finally {
+    fs.renameSync = renameSync;
+  }
+
+  assert.ok(
+    failed.diagnostics.some(
+      ({ code, messageText }) =>
+        code === DiagnosticCode.RemovalFailure &&
+        String(messageText).includes('injected replacement failure')
+    )
+  );
+  assert.deepEqual(
+    failed.events.map(({ type }) => type),
+    ['miss']
+  );
+  assert.deepEqual(
+    lintEvents.find(({ type }) => type === 'summary'),
+    {
+      type: 'summary',
+      unusedKeys: 1,
+      removedKeys: 0,
+      unresolvedReferences: 0,
+      removalFailures: 1,
+      translationObjectCasts: 0,
+      removedCasts: 0
+    }
+  );
+  assert.equal(fs.readFileSync(dictionary, 'utf8'), before);
+  assert.equal(
+    filesUnder(cacheDir).some((file) => file.endsWith('.json')),
+    false
+  );
 });
 
 test('CLI cache observability respects silent output without changing lint exit behavior', (t) => {

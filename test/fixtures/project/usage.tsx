@@ -33,13 +33,13 @@ export function renderOption(option: 'first' | 'second') {
   return prefixed(`options.${option}`);
 }
 
-const copy = t('objects', { returnObjects: true }) as typeof dictionary.objects;
+const copy = t('objects', { returnObjects: true });
 copy.used;
-const configuredCopy = t('configuredObject', objectOptions) as typeof dictionary.configuredObject;
+const configuredCopy = t('configuredObject', objectOptions);
 configuredCopy.used;
 const { used: destructuredCopy } = t('destructured', {
   returnObjects: true
-}) as typeof dictionary.destructured;
+});
 String(destructuredCopy);
 aliasedT('aliases.hook');
 t('overwritten.live');
@@ -59,7 +59,7 @@ export function renderDynamicCopy(key: 'dynamicA' | 'dynamicB') {
   return copy[key];
 }
 
-const keyofCopy = t('keyofObject', { returnObjects: true }) as typeof dictionary.keyofObject;
+const keyofCopy = t('keyofObject', { returnObjects: true });
 export function renderKeyofCopy(key: keyof typeof dictionary.keyofObject) {
   return keyofCopy[key];
 }
@@ -69,7 +69,7 @@ export function renderPartialPrefix(suffix: string) {
 }
 
 function useWrappedCopy() {
-  return t('wrapped', { returnObjects: true }) as typeof dictionary.wrapped;
+  return t('wrapped', { returnObjects: true });
 }
 
 useWrappedCopy().title;

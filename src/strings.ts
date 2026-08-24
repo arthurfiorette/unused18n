@@ -11,9 +11,19 @@ export interface StringResolver {
   resolve(expression: ts.Expression): StringResolution;
 }
 
+export interface StringResolverIndexes {
+  assignments?: ReadonlyMap<
+    ts.Symbol,
+    readonly { owner: ts.FunctionLikeDeclaration | undefined; right: ts.Expression }[]
+  >;
+  returns?: ReadonlyMap<ts.FunctionLikeDeclaration, readonly ts.Expression[]>;
+  typeAtLocation?: (node: ts.Node) => ts.Type;
+}
+
 export function createStringResolver(
   checker: ts.TypeChecker,
-  maxExpansions: number
+  maxExpansions: number,
+  indexes: StringResolverIndexes = {}
 ): StringResolver {
   const cache = new WeakMap<ts.Expression, StringResolution>();
 
@@ -63,7 +73,9 @@ export function createStringResolver(
 
     const semanticType = shouldAvoidSemanticType(expression)
       ? unresolved()
-      : resolveType(checker.getTypeAtLocation(expression));
+      : resolveType(
+          (indexes.typeAtLocation ?? checker.getTypeAtLocation.bind(checker))(expression)
+        );
     const typeResolution = merge(asserted, semanticType);
     if (typeResolution.values.size > 0 && typeResolution.complete) return typeResolution;
 
@@ -88,8 +100,12 @@ export function createStringResolver(
         let assigned = empty();
         const declaration = symbol.valueDeclaration ?? symbol.declarations?.[0];
         const owner = declaration ? enclosingFunction(declaration) : undefined;
-        const body = owner?.body ?? expression.getSourceFile();
-        if (body) {
+        if (indexes.assignments) {
+          for (const assignment of indexes.assignments.get(symbol) ?? []) {
+            assigned = merge(assigned, resolve(assignment.right, nextSeen));
+          }
+        } else {
+          const body = owner?.body ?? expression.getSourceFile();
           function visitAssignment(node: ts.Node): void {
             if (
               ts.isBinaryExpression(node) &&
@@ -125,15 +141,21 @@ export function createStringResolver(
       const functionLike = resolveFunctionLike(expression.expression, checker);
       if (functionLike?.body) {
         let result = unresolved();
-        function visit(node: ts.Node): void {
-          if (ts.isReturnStatement(node) && node.expression) {
-            result = merge(result, resolve(node.expression, nextSeen));
-            return;
+        if (indexes.returns) {
+          for (const returned of indexes.returns.get(functionLike) ?? []) {
+            result = merge(result, resolve(returned, nextSeen));
           }
-          if (node !== functionLike && ts.isFunctionLike(node)) return;
-          ts.forEachChild(node, visit);
+        } else {
+          function visit(node: ts.Node): void {
+            if (ts.isReturnStatement(node) && node.expression) {
+              result = merge(result, resolve(node.expression, nextSeen));
+              return;
+            }
+            if (node !== functionLike && ts.isFunctionLike(node)) return;
+            ts.forEachChild(node, visit);
+          }
+          visit(functionLike.body);
         }
-        visit(functionLike.body);
         return result;
       }
     }

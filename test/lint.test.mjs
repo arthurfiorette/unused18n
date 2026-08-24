@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import ts from '@typescript/typescript6';
+import { analyzeProject } from '../dist/analyzer.js';
 import { DiagnosticCode, lint } from '../dist/index.js';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -67,6 +68,60 @@ test('emits only statically unused dictionary leaves as error diagnostics', () =
       .every(
         ({ category, source }) => category === ts.DiagnosticCategory.Error && source === 'unused18n'
       )
+  );
+});
+
+test('array receiver iteration marks descendants without confusing a property named map', () => {
+  const project = path.join(fixtures, 'array-usage');
+  const result = analyzeProject({
+    project,
+    dictionary: path.join(project, 'dictionary.ts'),
+    dictionaryExport: 'default'
+  });
+  const statuses = new Map(result.keys.map(({ key, status }) => [key, status]));
+
+  for (let index = 0; index < 5; index += 1) {
+    assert.equal(statuses.get(`calendar.weekDays.${index}`), 'possibly-used');
+  }
+  assert.equal(statuses.get('mutableValues.0'), 'possibly-used');
+  assert.equal(statuses.get('mutableValues.1'), 'possibly-used');
+  assert.equal(statuses.get('forOfValues.0'), 'possibly-used');
+  assert.equal(statuses.get('forOfValues.1'), 'possibly-used');
+  assert.equal(statuses.get('staticValues.0'), 'unused');
+  assert.equal(statuses.get('staticValues.1'), 'used');
+  assert.equal(statuses.get('dynamicValues.0'), 'possibly-used');
+  assert.equal(statuses.get('dynamicValues.1'), 'possibly-used');
+  assert.equal(statuses.get('literalMap.map.label'), 'used');
+  assert.equal(statuses.get('literalMap.map.unused'), 'unused');
+});
+
+test('emits ordered stage timestamps from a caller-provided clock', () => {
+  const events = [];
+  let timestamp = 0;
+
+  [
+    ...lint({
+      ...options(),
+      cache: false,
+      now: () => ++timestamp,
+      onEvent: (event) => events.push(event)
+    })
+  ];
+
+  assert.deepEqual(
+    events.filter(({ type }) => type === 'stage'),
+    [
+      { type: 'stage', stage: 'project', status: 'start', timestamp: 1 },
+      { type: 'stage', stage: 'project', status: 'end', timestamp: 2 },
+      { type: 'stage', stage: 'dictionary', status: 'start', timestamp: 3 },
+      { type: 'stage', stage: 'dictionary', status: 'end', timestamp: 4 },
+      { type: 'stage', stage: 'discovery', status: 'start', timestamp: 5 },
+      { type: 'stage', stage: 'discovery', status: 'end', timestamp: 6 },
+      { type: 'stage', stage: 'usage', status: 'start', timestamp: 7 },
+      { type: 'stage', stage: 'usage', status: 'end', timestamp: 8 },
+      { type: 'stage', stage: 'replay', status: 'start', timestamp: 9 },
+      { type: 'stage', stage: 'replay', status: 'end', timestamp: 10 }
+    ]
   );
 });
 
@@ -136,7 +191,7 @@ dictionary.used
     { encoding: 'utf8' }
   );
   assert.equal(command.status, 1);
-  assert.match(command.stderr, /Translation key "unused" is unused/);
+  assert.match(command.stderr, /Summary: 1 unused/);
 
   const removed = [
     ...lint({
@@ -210,7 +265,7 @@ Object.keys(messages.categories)
     { encoding: 'utf8' }
   );
   assert.equal(command.status, 1);
-  assert.match(command.stderr, /Translation key "common\.unused" is unused/);
+  assert.match(command.stderr, /Summary: 1 unused/);
 });
 
 test('rejects named exports for JSON dictionaries', (t) => {
@@ -262,7 +317,7 @@ messages.common.used
   assert.match(output, /"used": "Used"/);
 });
 
-test('malformed JSON and array removals leave the dictionary unchanged', (t) => {
+test('malformed JSON stays unchanged and wholly unused JSON array properties are removed', (t) => {
   const malformedProject = temporaryProject(t, {
     'tsconfig.json': JSON.stringify({ include: ['usage.ts'] }),
     'messages.json': `{ "broken": }
@@ -290,11 +345,10 @@ messages.used
 `
   });
   const arrayPath = path.join(arrayProject, 'messages.json');
-  const arrayBefore = fs.readFileSync(arrayPath, 'utf8');
   const arrayResult = [...lint({ project: arrayProject, dictionary: arrayPath, remove: true })];
 
-  assert.ok(arrayResult.some(({ code }) => code === DiagnosticCode.RemovalFailure));
-  assert.equal(fs.readFileSync(arrayPath, 'utf8'), arrayBefore);
+  assert.ok(arrayResult.some(({ code }) => code === DiagnosticCode.RemovedKey));
+  assert.deepEqual(JSON.parse(fs.readFileSync(arrayPath, 'utf8')), { used: 'Used' });
 });
 
 test('rejects JSONC syntax before removal', (t) => {
@@ -417,7 +471,8 @@ test('--remove can leave an empty dictionary that lints cleanly', (t) => {
 test('--remove leaves the file unchanged when an unused key is unsafe', (t) => {
   const project = temporaryProject(t, {
     'tsconfig.json': JSON.stringify({ include: ['*.ts'] }),
-    'dictionary.ts': `export const dictionary = { values: ['unused'] }\n`
+    'dictionary.ts': `export const dictionary = { values: ['used', 'unused'] }\n`,
+    'usage.ts': `import { dictionary } from './dictionary.js';\ndictionary.values[0];\n`
   });
   const dictionaryPath = path.join(project, 'dictionary.ts');
   const before = fs.readFileSync(dictionaryPath, 'utf8');
@@ -446,7 +501,7 @@ test('Oclif exits 1 for unused keys and 2 for invalid flags', () => {
   });
 
   assert.equal(unused.status, 1);
-  assert.match(unused.stderr, /TS95001/);
+  assert.match(unused.stderr, /Summary: 3 unused/);
   assert.match(unused.stderr, /TS95002/);
   assert.equal(invalid.status, 2);
   assert.match(invalid.stderr, /Missing required option.*dictionary/s);
@@ -488,9 +543,9 @@ test('Oclif --remove fixes safe unused keys and exits 0', (t) => {
   const clean = spawnSync(process.execPath, args, { encoding: 'utf8' });
 
   assert.equal(removed.status, 0);
-  assert.match(removed.stderr, /TS95003/);
+  assert.match(removed.stderr, /Summary: 0 unused \| 8 removed/);
   assert.equal(clean.status, 0);
-  assert.equal(clean.stderr, '');
+  assert.match(clean.stderr, /Summary: 0 unused \| 0 removed/);
 });
 
 test('defaults the project and infers unambiguous dictionary exports', () => {
@@ -500,6 +555,9 @@ test('defaults the project and infers unambiguous dictionary exports', () => {
   ];
   const soleResult = [
     ...lint({ project, dictionary: path.join(project, 'sole.ts'), cache: false })
+  ];
+  const typedSoleResult = [
+    ...lint({ project, dictionary: path.join(project, 'typed-sole.ts'), cache: false })
   ];
   const explicitResult = [
     ...lint({
@@ -514,6 +572,9 @@ test('defaults the project and infers unambiguous dictionary exports', () => {
   ];
   const emptyResult = [
     ...lint({ project, dictionary: path.join(project, 'empty.ts'), cache: false })
+  ];
+  const factoryResult = [
+    ...lint({ project, dictionary: path.join(project, 'factory-dictionary.ts'), cache: false })
   ];
   const emptySelectorResult = [
     ...lint({
@@ -531,12 +592,19 @@ test('defaults the project and infers unambiguous dictionary exports', () => {
 
   assert.match(String(defaultResult[0]?.messageText), /defaultUnused/);
   assert.match(String(soleResult[0]?.messageText), /soleUnused/);
+  assert.match(String(typedSoleResult[0]?.messageText), /typedSoleUnused/);
   assert.match(String(explicitResult[0]?.messageText), /firstUnused/);
   assert.match(String(ambiguousResult[0]?.messageText), /multiple exports exist/);
   assert.match(String(emptyResult[0]?.messageText), /module has no exports/);
+  assert.deepEqual(
+    factoryResult
+      .filter(({ code }) => code === DiagnosticCode.UnusedKey)
+      .map(({ messageText }) => String(messageText)),
+    ['Translation key "unusedThroughFactory" is unused.']
+  );
   assert.match(String(emptySelectorResult[0]?.messageText), /Export "" not found/);
   assert.equal(cliResult.status, 1);
-  assert.match(cliResult.stderr, /soleUnused/);
+  assert.match(cliResult.stderr, /Summary: 1 unused/);
 });
 
 test('reports a missing default project as a configuration diagnostic', () => {

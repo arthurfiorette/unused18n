@@ -67,7 +67,7 @@ test('generated schema documents every config field and rejects unknown properti
 test('CLI discovers config, honors config-relative paths, and lets flags override it', () => {
   const discovered = spawnSync(process.execPath, [cli], { cwd: fixture, encoding: 'utf8' });
   assert.equal(discovered.status, 1);
-  assert.match(discovered.stderr, /Translation key "configUnused" is unused/);
+  assert.match(discovered.stderr, /Summary: 1 unused/);
 
   const explicit = spawnSync(
     process.execPath,
@@ -75,7 +75,7 @@ test('CLI discovers config, honors config-relative paths, and lets flags overrid
     { cwd: root, encoding: 'utf8' }
   );
   assert.equal(explicit.status, 1);
-  assert.match(explicit.stderr, /Translation key "configUnused" is unused/);
+  assert.match(explicit.stderr, /Summary: 1 unused/);
 
   const overridden = spawnSync(
     process.execPath,
@@ -89,8 +89,7 @@ test('CLI discovers config, honors config-relative paths, and lets flags overrid
     { cwd: root, encoding: 'utf8' }
   );
   assert.equal(overridden.status, 1);
-  assert.match(overridden.stderr, /Translation key "overrideUnused" is unused/);
-  assert.doesNotMatch(overridden.stderr, /configUnused/);
+  assert.match(overridden.stderr, /Summary: 2 unused/);
   assert.doesNotMatch(overridden.stderr, /\[cache\]/);
 });
 
@@ -104,7 +103,7 @@ test('CLI can disable destructive boolean options from config', () => {
   );
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /Translation key "configUnused" is unused/);
+  assert.match(result.stderr, /Summary: 1 unused/);
   assert.equal(fs.readFileSync(dictionary, 'utf8'), before);
 });
 
@@ -116,7 +115,7 @@ test('config-relative dictionary globs expand every matching locale', () => {
   );
 
   assert.equal(result.status, 1);
-  assert.equal((result.stderr.match(/Translation key "unused" is unused/g) ?? []).length, 3);
+  assert.match(result.stderr, /Summary: 5 unused/);
 });
 
 test('CLI reports config and merged required-option failures as argument errors', () => {

@@ -1,5 +1,6 @@
 import ts from '@typescript/typescript6';
 import type { CacheEvent } from './cache.js';
+import { DiagnosticCode } from './diagnostic-codes.js';
 import type { LintEvent } from './lint.js';
 import type { LogLevel } from './types.js';
 
@@ -23,6 +24,7 @@ export function createReporter(options: ReporterOptions): Reporter {
   const minInterval = Math.max(3_000, options.minIntervalMs ?? 3_000);
   const color = options.isTTY && process.env.NO_COLOR === undefined;
   const phases = new Set<string>();
+  const stageStarts = new Map<string, number>();
   let lastOperationalAt = startedAt;
 
   function operational(message: string): void {
@@ -39,6 +41,24 @@ export function createReporter(options: ReporterOptions): Reporter {
 
   return {
     event(event) {
+      if (event.type === 'summary') {
+        const values = [
+          `${event.unusedKeys.toLocaleString('en-US')} unused`,
+          `${event.removedKeys.toLocaleString('en-US')} removed`,
+          `${event.unresolvedReferences.toLocaleString('en-US')} unresolved`,
+          `${event.removalFailures.toLocaleString('en-US')} removal failures`,
+          event.removedCasts > 0
+            ? `${event.removedCasts.toLocaleString('en-US')} casts removed`
+            : `${event.translationObjectCasts.toLocaleString('en-US')} casts`
+        ];
+        options.write(`Summary: ${values.join(' | ')}`);
+        if (event.translationObjectCasts > 0) {
+          options.write(
+            `Run --remove to remove ${event.translationObjectCasts.toLocaleString('en-US')} translation object casts automatically.`
+          );
+        }
+        return;
+      }
       if (options.level === 'silent') return;
       if (event.type === 'phase') {
         if (phases.has(event.phase) || phases.size >= 3) return;
@@ -60,11 +80,28 @@ export function createReporter(options: ReporterOptions): Reporter {
         operational(`${percentage}% of files processed`);
         return;
       }
+      if (event.type === 'stage') {
+        if (event.status === 'start') {
+          stageStarts.set(event.stage, event.timestamp);
+          return;
+        }
+        const started = stageStarts.get(event.stage);
+        if (options.level === 'debug' && started !== undefined) {
+          operational(`${event.stage} stage: ${(event.timestamp - started).toFixed(1)}ms`);
+        }
+        return;
+      }
       if (options.level === 'debug' || event.event.type === 'error') {
         operational(formatCacheEvent(event.event));
       }
     },
     diagnostic(diagnostic) {
+      if (
+        diagnostic.code === DiagnosticCode.UnusedKey ||
+        diagnostic.code === DiagnosticCode.RemovedKey
+      ) {
+        return;
+      }
       const host: ts.FormatDiagnosticsHost = {
         getCanonicalFileName: (fileName) => fileName,
         getCurrentDirectory: () => process.cwd(),

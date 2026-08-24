@@ -1,5 +1,6 @@
 import path from 'node:path';
 import ts from '@typescript/typescript6';
+import { ActiveDictionaryTree } from './dictionary-tree.js';
 
 /** A condition that prevents a source property from being removed without ambiguity. */
 export type DictionaryRemovalBarrier =
@@ -35,6 +36,8 @@ export interface DictionaryInfo {
   readonly declaration: ts.Node;
   readonly symbol: ts.Symbol;
   readonly type: ts.Type;
+  /** Exported value type, preserving explicit shared dictionary aliases across locale files. */
+  readonly declaredType: ts.Type;
   /** Active flattened keys after spreads and later properties have overwritten earlier values. */
   readonly keys: ReadonlySet<string>;
   /** Active key provenance with the same overwrite semantics as {@link keys}. */
@@ -85,17 +88,21 @@ export function readDictionary(
   } else {
     const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
     const exports = moduleSymbol ? checker.getExportsOfModule(moduleSymbol) : [];
+    const valueExports = exports.filter(
+      (candidate) => unwrapAlias(checker, candidate)?.valueDeclaration
+    );
     let exported =
       exportName !== undefined
         ? exports.find((candidate) => candidate.name === exportName)
-        : exports.find((candidate) => candidate.name === 'default');
+        : valueExports.find((candidate) => candidate.name === 'default');
     if (exportName !== undefined && !exported)
       throw new Error(`Export "${exportName}" not found in ${absolutePath}`);
-    if (exportName === undefined && !exported && exports.length === 1) exported = exports[0];
+    if (exportName === undefined && !exported && valueExports.length === 1)
+      exported = valueExports[0];
     if (!exported) {
-      const names = exports.map(({ name }) => `"${name}"`).join(', ');
+      const names = valueExports.map(({ name }) => `"${name}"`).join(', ');
       throw new Error(
-        exports.length === 0
+        valueExports.length === 0
           ? `Cannot infer dictionary export from ${absolutePath}: the module has no exports.`
           : `Cannot infer dictionary export from ${absolutePath}: multiple exports exist: ${names}. Pass --export=<name>.`
       );
@@ -118,18 +125,29 @@ export function readDictionary(
     symbol = resolvedSymbol;
   }
 
-  const keySources = new Map<string, DictionaryKeySource>();
-  flattenExpression(initializer, [], [], keySources, checker, sourceFile, new Set(), false);
+  const activeDictionary = new ActiveDictionaryTree();
+  flattenExpression(initializer, [], [], activeDictionary, checker, sourceFile, new Set(), false);
+  const keySources = activeDictionary.toKeySources();
   if (keySources.size === 0 && !isDictionaryContainer(initializer, checker, new Set())) {
     throw new Error(`Dictionary export "${exportName}" must resolve to an object or array`);
   }
+  let dictionaryType: ts.Type | undefined;
+  let declaredType: ts.Type | undefined;
 
   return {
     exportName,
     sourceFile,
     declaration,
     symbol,
-    type: checker.getTypeAtLocation(initializer),
+    get type() {
+      // Most translation-call analyses never inspect dictionary object identity.
+      if (!dictionaryType) dictionaryType = checker.getTypeAtLocation(initializer);
+      return dictionaryType;
+    },
+    get declaredType() {
+      if (!declaredType) declaredType = checker.getTypeOfSymbolAtLocation(symbol, declaration);
+      return declaredType;
+    },
     keys: new Set(keySources.keys()),
     keySources
   };
@@ -143,20 +161,24 @@ function isDictionaryContainer(
   const expression = unwrapExpression(input);
   if (seen.has(expression)) return false;
   seen.add(expression);
-  if (ts.isObjectLiteralExpression(expression) || ts.isArrayLiteralExpression(expression))
-    return true;
-  if (!ts.isIdentifier(expression)) return false;
-  const declaration = declarationForExpression(expression, checker);
-  return declaration?.initializer
-    ? isDictionaryContainer(declaration.initializer, checker, seen)
-    : false;
+  try {
+    if (ts.isObjectLiteralExpression(expression) || ts.isArrayLiteralExpression(expression))
+      return true;
+    if (!ts.isIdentifier(expression)) return false;
+    const declaration = declarationForExpression(expression, checker);
+    return declaration?.initializer
+      ? isDictionaryContainer(declaration.initializer, checker, seen)
+      : false;
+  } finally {
+    seen.delete(expression);
+  }
 }
 
 function flattenExpression(
   input: ts.Expression,
   prefix: string[],
   propertyChain: DictionarySourceProperty[],
-  keySources: Map<string, DictionaryKeySource>,
+  activeDictionary: ActiveDictionaryTree,
   checker: ts.TypeChecker,
   dictionarySourceFile: ts.SourceFile,
   seen: Set<ts.Node>,
@@ -165,176 +187,167 @@ function flattenExpression(
   const expression = unwrapExpression(input);
   if (seen.has(expression)) return;
   seen.add(expression);
-
-  if (ts.isIdentifier(expression)) {
-    const declaration = declarationForExpression(expression, checker);
-    if (declaration?.initializer) {
-      const imported = declaration.getSourceFile() !== dictionarySourceFile;
-      flattenExpression(
-        declaration.initializer,
-        prefix,
-        imported ? addBarrier(propertyChain, 'imported-declaration') : propertyChain,
-        keySources,
-        checker,
-        dictionarySourceFile,
-        seen,
-        sharedSource || propertyChain.length > 0
-      );
-      return;
-    }
-  }
-
-  if (ts.isObjectLiteralExpression(expression)) {
-    const encounteredPrefixes = new Set<string>();
-    let unresolvedSpreadBefore = false;
-    for (const property of expression.properties) {
-      if (ts.isSpreadAssignment(property)) {
-        const spreadNames = objectPropertyNames(property.expression, checker, new Set());
-        if (spreadNames) {
-          for (const name of spreadNames) encounteredPrefixes.add([...prefix, name].join('.'));
-        } else {
-          unresolvedSpreadBefore = true;
-          addBarrierToSubtree(keySources, prefix.join('.'), 'spread');
-        }
+  try {
+    if (ts.isIdentifier(expression)) {
+      const declaration = declarationForExpression(expression, checker);
+      if (declaration?.initializer) {
+        const imported = declaration.getSourceFile() !== dictionarySourceFile;
         flattenExpression(
-          property.expression,
+          declaration.initializer,
           prefix,
-          addBarrier(propertyChain, 'spread'),
-          keySources,
+          imported ? addBarrier(propertyChain, 'imported-declaration') : propertyChain,
+          activeDictionary,
           checker,
           dictionarySourceFile,
-          new Set(seen),
-          true
+          seen,
+          sharedSource || propertyChain.length > 0
         );
-        continue;
+        return;
       }
+    }
 
-      if (ts.isPropertyAssignment(property)) {
-        const name = propertyName(property.name, checker);
-        if (name === undefined) continue;
-        const propertyPrefix = [...prefix, name];
-        const keyPrefix = propertyPrefix.join('.');
-        const overwritten = encounteredPrefixes.has(keyPrefix) || hasSubtree(keySources, keyPrefix);
-        encounteredPrefixes.add(keyPrefix);
-        deleteSubtree(keySources, keyPrefix);
-        let sourceProperty: DictionarySourceProperty = {
-          node: property,
-          keyPrefix,
-          barriers: sourceBarriers(property, dictionarySourceFile, sharedSource)
-        };
-        const computed = ts.isComputedPropertyName(property.name);
-        if (computed) sourceProperty = withBarrier(sourceProperty, 'computed-property');
-        if (overwritten) sourceProperty = withBarrier(sourceProperty, 'overwrite');
-        if (unresolvedSpreadBefore) sourceProperty = withBarrier(sourceProperty, 'spread');
-        flattenExpression(
-          property.initializer,
-          propertyPrefix,
-          computed
-            ? addBarrier([...propertyChain, sourceProperty], 'computed-property')
-            : [...propertyChain, sourceProperty],
-          keySources,
-          checker,
-          dictionarySourceFile,
-          new Set(seen),
-          sharedSource
-        );
-        continue;
-      }
-
-      if (ts.isShorthandPropertyAssignment(property)) {
-        const keyPrefix = [...prefix, property.name.text].join('.');
-        const overwritten = encounteredPrefixes.has(keyPrefix) || hasSubtree(keySources, keyPrefix);
-        encounteredPrefixes.add(keyPrefix);
-        deleteSubtree(keySources, keyPrefix);
-        let sourceProperty: DictionarySourceProperty = {
-          node: property,
-          keyPrefix,
-          barriers: sourceBarriers(property, dictionarySourceFile, sharedSource)
-        };
-        if (overwritten) sourceProperty = withBarrier(sourceProperty, 'overwrite');
-        if (unresolvedSpreadBefore) sourceProperty = withBarrier(sourceProperty, 'spread');
-        const declaration = declarationForShorthand(property, checker);
-        if (declaration?.initializer) {
-          const imported = declaration.getSourceFile() !== dictionarySourceFile;
+    if (ts.isObjectLiteralExpression(expression)) {
+      const encounteredNames = new Set<string>();
+      let unresolvedSpreadBefore = false;
+      for (const property of expression.properties) {
+        if (ts.isSpreadAssignment(property)) {
+          const spreadNames = objectPropertyNames(property.expression, checker, new Set());
+          if (spreadNames) {
+            for (const name of spreadNames) encounteredNames.add(name);
+          } else {
+            unresolvedSpreadBefore = true;
+            activeDictionary.addBarrier(prefix, 'spread');
+          }
           flattenExpression(
-            declaration.initializer,
-            [...prefix, property.name.text],
-            imported
-              ? addBarrier([...propertyChain, sourceProperty], 'imported-declaration')
-              : [...propertyChain, sourceProperty],
-            keySources,
+            property.expression,
+            prefix,
+            addBarrier(propertyChain, 'spread'),
+            activeDictionary,
             checker,
             dictionarySourceFile,
-            new Set(seen),
+            seen,
             true
           );
-        } else {
-          flattenExpression(
-            property.name,
-            [...prefix, property.name.text],
-            [...propertyChain, sourceProperty],
-            keySources,
-            checker,
-            dictionarySourceFile,
-            new Set(seen),
-            sharedSource
-          );
+          continue;
+        }
+
+        if (ts.isPropertyAssignment(property)) {
+          const name = propertyName(property.name, checker);
+          if (name === undefined) continue;
+          prefix.push(name);
+          try {
+            const overwritten = encounteredNames.has(name) || activeDictionary.hasSubtree(prefix);
+            encounteredNames.add(name);
+            activeDictionary.deleteSubtree(prefix);
+            let sourceProperty: DictionarySourceProperty = {
+              node: property,
+              keyPrefix: prefix.join('.'),
+              barriers: sourceBarriers(property, dictionarySourceFile, sharedSource)
+            };
+            const computed = ts.isComputedPropertyName(property.name);
+            if (computed) sourceProperty = withBarrier(sourceProperty, 'computed-property');
+            if (overwritten) sourceProperty = withBarrier(sourceProperty, 'overwrite');
+            if (unresolvedSpreadBefore) sourceProperty = withBarrier(sourceProperty, 'spread');
+            const nextPropertyChain = [...propertyChain, sourceProperty];
+            flattenExpression(
+              property.initializer,
+              prefix,
+              computed ? addBarrier(nextPropertyChain, 'computed-property') : nextPropertyChain,
+              activeDictionary,
+              checker,
+              dictionarySourceFile,
+              seen,
+              sharedSource
+            );
+          } finally {
+            prefix.pop();
+          }
+          continue;
+        }
+
+        if (ts.isShorthandPropertyAssignment(property)) {
+          const name = property.name.text;
+          prefix.push(name);
+          try {
+            const overwritten = encounteredNames.has(name) || activeDictionary.hasSubtree(prefix);
+            encounteredNames.add(name);
+            activeDictionary.deleteSubtree(prefix);
+            let sourceProperty: DictionarySourceProperty = {
+              node: property,
+              keyPrefix: prefix.join('.'),
+              barriers: sourceBarriers(property, dictionarySourceFile, sharedSource)
+            };
+            if (overwritten) sourceProperty = withBarrier(sourceProperty, 'overwrite');
+            if (unresolvedSpreadBefore) sourceProperty = withBarrier(sourceProperty, 'spread');
+            const declaration = declarationForShorthand(property, checker);
+            if (declaration?.initializer) {
+              const imported = declaration.getSourceFile() !== dictionarySourceFile;
+              const nextPropertyChain = [...propertyChain, sourceProperty];
+              flattenExpression(
+                declaration.initializer,
+                prefix,
+                imported
+                  ? addBarrier(nextPropertyChain, 'imported-declaration')
+                  : nextPropertyChain,
+                activeDictionary,
+                checker,
+                dictionarySourceFile,
+                seen,
+                true
+              );
+            } else {
+              flattenExpression(
+                property.name,
+                prefix,
+                [...propertyChain, sourceProperty],
+                activeDictionary,
+                checker,
+                dictionarySourceFile,
+                seen,
+                sharedSource
+              );
+            }
+          } finally {
+            prefix.pop();
+          }
         }
       }
+      return;
     }
-    return;
-  }
 
-  if (ts.isArrayLiteralExpression(expression)) {
-    const blockedChain = addBarrier(propertyChain, 'array');
-    expression.elements.forEach((element, index) => {
-      if (ts.isExpression(element)) {
-        const elementPrefix = [...prefix, String(index)];
-        flattenExpression(
-          element,
-          elementPrefix,
-          blockedChain,
-          keySources,
-          checker,
-          dictionarySourceFile,
-          new Set(seen),
-          sharedSource
-        );
-        addBarrierToSubtree(keySources, elementPrefix.join('.'), 'array');
+    if (ts.isArrayLiteralExpression(expression)) {
+      const blockedChain = addBarrier(propertyChain, 'array');
+      for (let index = 0; index < expression.elements.length; index += 1) {
+        const element = expression.elements[index];
+        if (!element || !ts.isExpression(element)) continue;
+        prefix.push(String(index));
+        try {
+          flattenExpression(
+            element,
+            prefix,
+            blockedChain,
+            activeDictionary,
+            checker,
+            dictionarySourceFile,
+            seen,
+            sharedSource
+          );
+          activeDictionary.addBarrier(prefix, 'array');
+        } finally {
+          prefix.pop();
+        }
       }
-    });
-    return;
-  }
+      return;
+    }
 
-  if (prefix.length > 0) {
-    keySources.set(prefix.join('.'), {
-      valueNode: expression,
-      propertyChain
-    });
-  }
-}
-
-function hasSubtree(keySources: ReadonlyMap<string, DictionaryKeySource>, prefix: string): boolean {
-  for (const key of keySources.keys()) {
-    if (key === prefix || key.startsWith(`${prefix}.`)) return true;
-  }
-  return false;
-}
-
-function deleteSubtree(keySources: Map<string, DictionaryKeySource>, prefix: string): void {
-  for (const key of keySources.keys()) {
-    if (key === prefix || key.startsWith(`${prefix}.`)) keySources.delete(key);
-  }
-}
-
-function addBarrierToSubtree(
-  keySources: Map<string, DictionaryKeySource>,
-  prefix: string,
-  barrier: DictionaryRemovalBarrier
-): void {
-  for (const [key, source] of keySources) {
-    if (prefix && key !== prefix && !key.startsWith(`${prefix}.`)) continue;
-    keySources.set(key, { ...source, propertyChain: addBarrier(source.propertyChain, barrier) });
+    if (prefix.length > 0) {
+      activeDictionary.set(prefix, {
+        valueNode: expression,
+        propertyChain
+      });
+    }
+  } finally {
+    seen.delete(expression);
   }
 }
 
