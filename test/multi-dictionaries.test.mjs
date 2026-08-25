@@ -40,6 +40,10 @@ test('analyzes locale dictionaries with different valid plural shapes', () => {
     ),
     false
   );
+  assert.equal(
+    diagnostics.some(({ code }) => code === DiagnosticCode.UnresolvedReference),
+    false
+  );
 });
 
 test('CLI accepts repeated dictionary flags', () => {

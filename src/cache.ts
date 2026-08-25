@@ -7,7 +7,7 @@ import type { LoadedProject } from './project.js';
 
 // Bump either version whenever persisted shape or analyzer semantics would make old facts unsafe.
 const CACHE_SCHEMA_VERSION = 4;
-const ANALYSIS_ALGORITHM_VERSION = 10;
+const ANALYSIS_ALGORITHM_VERSION = 11;
 const MAX_CACHE_BYTES = 64 * 1024 * 1024;
 
 /** Cache observability stays separate from TypeScript diagnostics and never affects lint status. */

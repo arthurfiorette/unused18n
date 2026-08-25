@@ -19,6 +19,7 @@ test('tracks translation objects through parameters, JSX props, and returned obj
 
   assert.deepEqual(unused, [
     'billingHistory.stale',
+    'contaminatedFlow',
     'defaultFlow.unused',
     'destructuredFlow.unused',
     'forwardRefFlow.unused',
@@ -71,6 +72,15 @@ test('tracks translation objects through parameters, JSX props, and returned obj
   );
   assert.ok(dynamicIndexWarning);
   assert.equal(dynamicIndexWarning.category, ts.DiagnosticCategory.Warning);
+  assert.equal(
+    diagnostics.some(
+      ({ code, file, length, start }) =>
+        code === DiagnosticCode.UnresolvedReference &&
+        path.basename(file?.fileName ?? '') === 'usage.tsx' &&
+        file.text.slice(start, start + length).includes('message.trim')
+    ),
+    false
+  );
 });
 
 test('preserves object-flow classifications across cold and warm cache replay', (t) => {

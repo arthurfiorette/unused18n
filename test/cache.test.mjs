@@ -109,7 +109,7 @@ test('persists compact subtree observations and replays deterministic evidence',
   assert.ok(entryPath);
   const entry = JSON.parse(fs.readFileSync(entryPath, 'utf8'));
   assert.equal(entry.schemaVersion, 4);
-  assert.equal(entry.analysisVersion, 10);
+  assert.equal(entry.analysisVersion, 11);
   const usageFacts = entry.sources[path.join(project, 'usage.ts')].facts;
   assert.equal(Object.hasOwn(usageFacts, 'facts'), false);
   assert.ok(usageFacts.observations.length < 10);

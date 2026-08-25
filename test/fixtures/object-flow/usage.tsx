@@ -4,6 +4,16 @@ import { ForwardChild } from './forward-child.js';
 
 const { t: translate } = useTranslation();
 
+function Tooltip({ message }: { message: unknown }) {
+  return typeof message === 'string' && message.trim() ? <span>{message}</span> : null;
+}
+const scalarTooltip = translate('scalarFlow.tooltip', { name: 'Account' });
+const contaminatedTooltip = translate('contaminatedFlow', { returnObjects: true });
+const scalarTooltipElement = <Tooltip message={scalarTooltip} />;
+const contaminatedTooltipElement = <Tooltip message={contaminatedTooltip} />;
+void scalarTooltipElement;
+void contaminatedTooltipElement;
+
 const jsxLabels = translate('jsxFlow', { returnObjects: true });
 function Child({ labels }: { labels: any }) {
   return <button type="button" aria-label={labels.used} />;

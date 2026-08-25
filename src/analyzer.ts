@@ -1039,6 +1039,9 @@ export function analyzeLoadedProjectMany(
     if (ts.isPropertyAccessExpression(expression)) {
       const base = resolveObject(expression.expression, nextSeen);
       if (base) {
+        if (isDefinitelyStringLike(typeAtLocation(expression.expression))) {
+          return scalarDictionaryLeaves(base);
+        }
         if (resolvesDictionaryLeaf(base)) return base;
         return appendObject(base, exact(expression.name.text));
       }
@@ -1054,6 +1057,9 @@ export function analyzeLoadedProjectMany(
     if (ts.isElementAccessExpression(expression)) {
       const base = resolveObject(expression.expression, nextSeen);
       if (!base || !expression.argumentExpression) return base;
+      if (isDefinitelyStringLike(typeAtLocation(expression.expression))) {
+        return scalarDictionaryLeaves(base);
+      }
       if (resolvesDictionaryLeaf(base)) return base;
       return appendObject(base, strings.resolve(expression.argumentExpression));
     }
@@ -1294,6 +1300,21 @@ export function analyzeLoadedProjectMany(
     return false;
   }
 
+  function scalarDictionaryLeaves(base: ObjectResolution): ObjectResolution | undefined {
+    const values = new Set<string>();
+    for (const value of base.values) {
+      if (dictionary.keys.has(value)) values.add(value);
+    }
+    if (values.size === 0) return undefined;
+    return {
+      values,
+      patterns: new Set(),
+      complete: true,
+      origin: base.origin,
+      ...(base.dictionaryIds ? { dictionaryIds: base.dictionaryIds } : {})
+    };
+  }
+
   function appendObject(base: ObjectResolution, segment: StringResolution): ObjectResolution {
     const result = prepend(base, segment);
     const unboundedRuntimeKey = !segment.complete && segment.patterns.size === 0;
@@ -1511,20 +1532,16 @@ export function analyzeLoadedProjectMany(
         const declaration = normalizedSymbol(value)?.declarations?.find(ts.isVariableDeclaration);
         if (declaration?.initializer) {
           const configured = booleanOption(declaration.initializer, option);
-          if (configured !== 'absent' && configured !== 'unknown') {
-            if (configured === 'true') return 'true';
-            continue;
-          }
+          if (configured === 'true') return 'true';
+          if (configured === 'false' || configured === 'absent') continue;
           if (configured === 'unknown') unresolvedOption = true;
         } else {
           unresolvedOption = true;
         }
       } else {
         const configured = booleanOption(value, option);
-        if (configured !== 'absent' && configured !== 'unknown') {
-          if (configured === 'true') return 'true';
-          continue;
-        }
+        if (configured === 'true') return 'true';
+        if (configured === 'false' || configured === 'absent') continue;
         if (
           ts.isObjectLiteralExpression(value) ||
           ts.isCallExpression(value) ||
@@ -1548,7 +1565,8 @@ export function analyzeLoadedProjectMany(
       return ts.isStringLiteralLike(value) || ts.isNumericLiteral(value) ? 'absent' : 'unknown';
     }
     let unresolvedSpread = false;
-    for (const property of [...value.properties].reverse()) {
+    for (let index = value.properties.length - 1; index >= 0; index -= 1) {
+      const property = value.properties[index]!;
       if (ts.isSpreadAssignment(property)) {
         const spread = booleanOption(property.expression, option);
         if (spread === 'true' || spread === 'false') return spread;
@@ -2383,6 +2401,14 @@ function staticPropertyName(name: ts.PropertyName): string | undefined {
 function staticBindingElementName(element: ts.BindingElement): string | undefined {
   if (element.propertyName) return staticPropertyName(element.propertyName);
   return ts.isIdentifier(element.name) ? element.name.text : undefined;
+}
+
+function isDefinitelyStringLike(type: ts.Type): boolean {
+  if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return false;
+  if (type.flags & ts.TypeFlags.StringLike) return true;
+  if (type.isUnion()) return type.types.length > 0 && type.types.every(isDefinitelyStringLike);
+  if (type.isIntersection()) return type.types.some(isDefinitelyStringLike);
+  return false;
 }
 
 function returnedTranslatorProperty(

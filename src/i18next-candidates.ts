@@ -37,12 +37,16 @@ export function expandI18nextCandidates(
 
   for (const dictionary of dictionaries) {
     const branches = optionBranches(options, dictionary.locale);
-    unresolved ||= branches.unresolved;
+    let covered = key.values.size > 0;
     const seen = new Set<string>();
     for (const base of key.values) {
       for (const branch of branches.values) {
         const winner = firstExisting(buildLookupChain(base, branch), dictionary.keys);
-        if (!winner || seen.has(winner)) continue;
+        if (!winner) {
+          covered = false;
+          continue;
+        }
+        if (seen.has(winner)) continue;
         seen.add(winner);
         observations.push({
           dictionaryId: dictionary.id,
@@ -51,6 +55,7 @@ export function expandI18nextCandidates(
         });
       }
     }
+    if (branches.unresolved && (!branches.coverageCanResolve || !covered)) unresolved = true;
     for (const pattern of key.patterns) {
       const matcher = globMatcher(pattern);
       for (const candidate of dictionary.keys) {
@@ -91,7 +96,7 @@ interface VariantBranch {
 function optionBranches(
   options: TranslationVariantOptions,
   locale: string
-): { values: VariantBranch[]; unresolved: boolean } {
+): { values: VariantBranch[]; unresolved: boolean; coverageCanResolve: boolean } {
   const contexts = contextBranches(options.context);
   const plurals = pluralBranches(options.count, options.ordinal, locale);
   return {
@@ -102,7 +107,8 @@ function optionBranches(
         complete: context.complete && plural.complete
       }))
     ),
-    unresolved: contexts.unresolved || plurals.unresolved
+    unresolved: contexts.unresolved || plurals.unresolved,
+    coverageCanResolve: !contexts.unresolved && plurals.coverageCanResolve
   };
 }
 
@@ -123,12 +129,22 @@ function pluralBranches(
   count: StringResolution | null | undefined,
   ordinal: boolean | null | undefined,
   locale: string
-): { values: VariantBranch[]; unresolved: boolean } {
+): { values: VariantBranch[]; unresolved: boolean; coverageCanResolve: boolean } {
   if (count === undefined) {
-    return { values: [{ ordinal: false, zero: false, complete: true }], unresolved: false };
+    return {
+      values: [{ ordinal: false, zero: false, complete: true }],
+      unresolved: false,
+      coverageCanResolve: false
+    };
   }
   const rules = pluralRules(locale, ordinal === true ? 'ordinal' : 'cardinal');
-  const numbers = count && [...count.values].map(Number).filter(Number.isFinite);
+  const numbers: number[] | undefined = count ? [] : undefined;
+  if (count && numbers) {
+    for (const value of count.values) {
+      const number = Number(value);
+      if (Number.isFinite(number)) numbers.push(number);
+    }
+  }
   const incomplete = count === null || !count.complete || numbers?.length !== count.values.size;
   const ordinalModes = ordinal === null ? [false, true] : [ordinal ?? false];
   const values: VariantBranch[] = [];
@@ -157,7 +173,6 @@ function pluralBranches(
       continue;
     }
     const categories = new Set(modeRules?.resolvedOptions().pluralCategories ?? allCategories);
-    if (!ordinalMode) categories.add('zero');
     for (const category of categories) {
       values.push({
         category,
@@ -166,8 +181,26 @@ function pluralBranches(
         complete: false
       });
     }
+    if (!ordinalMode) {
+      if (modeRules) {
+        values.push({
+          category: modeRules.select(0),
+          ordinal: false,
+          zero: true,
+          complete: false
+        });
+      } else {
+        for (const category of allCategories) {
+          values.push({ category, ordinal: false, zero: true, complete: false });
+        }
+      }
+    }
   }
-  return { values, unresolved: incomplete || !rules || ordinal === null };
+  return {
+    values,
+    unresolved: incomplete || !rules || ordinal === null,
+    coverageCanResolve: Boolean(rules)
+  };
 }
 
 function buildLookupChain(base: string, branch: VariantBranch): string[] {
@@ -186,11 +219,21 @@ function buildLookupChain(base: string, branch: VariantBranch): string[] {
   if (branch.context && suffix) chain.push(`${base}${suffix}`);
   if (branch.context && branch.ordinal && branch.category) chain.push(`${base}_${branch.category}`);
   chain.push(base);
-  return [...new Set(chain)];
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of chain) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    unique.push(candidate);
+  }
+  return unique;
 }
 
 function firstExisting(chain: readonly string[], keys: ReadonlySet<string>): string | undefined {
-  return chain.find((key) => keys.has(key));
+  for (const key of chain) {
+    if (keys.has(key)) return key;
+  }
+  return undefined;
 }
 
 function pluralRules(locale: string, type: Intl.PluralRuleType): Intl.PluralRules | undefined {

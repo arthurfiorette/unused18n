@@ -24,6 +24,8 @@ export default {
   castFlow: { used: 'Used despite an invalid cast' },
   constOptionsFlow: { used: 'Used with narrowed options' },
   billingHistory: { page_templates: 'Page templates', stale: 'Stale billing label' },
+  scalarFlow: { tooltip: 'Tooltip for {{name}}' },
+  contaminatedFlow: { unused: 'Must remain unused' },
   indexedFlow: { first: 'First dynamic label', second: 'Second dynamic label' },
   typeAssertionCastFlow: { used: 'Used despite an invalid type assertion' },
   defaultFlow: { used: 'Used through a default parameter', unused: 'Unused default sibling' },

@@ -31,6 +31,30 @@ test('expands unknown cardinal counts using each locale plural categories', () =
       ['ja', 'item_other', 'possibly-used']
     ]
   );
+  assert.equal(result.unresolved, false);
+});
+
+test('warns only when an unknown count has an uncovered locale lookup chain', () => {
+  const covered = expandI18nextCandidates(exact('item'), { count: unknown() }, [
+    { id: 'en', locale: 'en', keys: new Set(['item_one', 'item_other']) },
+    { id: 'ar', locale: 'ar', keys: new Set(['item']) },
+    { id: 'ja', locale: 'ja', keys: new Set(['item_other']) }
+  ]);
+  const uncovered = expandI18nextCandidates(exact('item'), { count: unknown() }, [
+    { id: 'en', locale: 'en', keys: new Set(['item_one']) }
+  ]);
+  const localeSpecificBranchMissing = expandI18nextCandidates(exact('item'), { count: unknown() }, [
+    { id: 'pt', locale: 'pt', keys: new Set(['item_one', 'item_other']) }
+  ]);
+
+  assert.equal(covered.unresolved, false);
+  assert.equal(uncovered.unresolved, true);
+  assert.equal(localeSpecificBranchMissing.unresolved, true);
+  assert.ok(
+    covered.observations.some(
+      ({ dictionaryId, key }) => dictionaryId === 'en' && key === 'item_other'
+    )
+  );
 });
 
 test('keeps unknown contexts and unknown locales conservative', () => {
@@ -55,6 +79,8 @@ test('keeps unknown contexts and unknown locales conservative', () => {
   );
   assert.ok(context.observations.every(({ confidence }) => confidence === 'possibly-used'));
   assert.ok(locale.observations.every(({ confidence }) => confidence === 'possibly-used'));
+  assert.equal(context.unresolved, true);
+  assert.equal(locale.unresolved, true);
 });
 
 test('composes context with cardinal and ordinal variants', () => {
