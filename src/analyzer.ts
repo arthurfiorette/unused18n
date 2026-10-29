@@ -267,6 +267,7 @@ export function analyzeLoadedProjectMany(
   const inventories = analysisSourceFiles.map(inventorySource);
   // Assignment indexing below is the first symbol lookup, so the batch has to land before it.
   semantic.prefetchSymbols(inventories.flatMap(collectSemanticTargets));
+  semantic.prefetchShorthandSymbols(inventories.flatMap(collectShorthandTargets));
   const indexedReturns = new Map<FunctionLikeDeclaration, readonly Expression[]>();
   const inventoriedFunctions = new Set<FunctionLikeDeclaration>();
   for (const inventory of inventories) {
@@ -289,7 +290,7 @@ export function analyzeLoadedProjectMany(
     for (const assignment of inventory.assignments) {
       const left = unwrapExpression(assignment.left);
       if (!isIdentifier(left)) continue;
-      const symbol = normalizedSymbol(left);
+      const symbol = semantic.symbol(left);
       if (!symbol) continue;
       const entries = assignmentIndex.get(symbol) ?? [];
       entries.push({ owner: assignment.owner, right: assignment.right });
@@ -339,6 +340,7 @@ export function analyzeLoadedProjectMany(
     discoverHookTranslators();
     propagateTranslatorParameters();
     indexObjectParameterInputs();
+    prefetchObjectInputSymbols();
     discoverTranslationWrappers();
     countWrapperCalls();
   } finally {
@@ -347,6 +349,8 @@ export function analyzeLoadedProjectMany(
 
   emitStage('usage', 'start');
   try {
+    // Runs first because the chain lookahead below already resolves objects through calls.
+    prefetchCallTargetTypes();
     semantic.prefetchTypes(
       withScratchObjectCaches(() => inventories.flatMap(objectChainTypeTargets))
     );
@@ -453,6 +457,11 @@ export function analyzeLoadedProjectMany(
     })
   };
 
+  /**
+   * Registers project hooks that return a `useTranslation` call or an object with a `t` member,
+   * so `const { t } = useProjectHook()` binds the hook's prefix. Runs between the two
+   * discoverHookTranslators passes because returned translators are known only after the first.
+   */
   function discoverTranslationHookWrappers(): void {
     for (const inventory of inventories) {
       const sourceFile = inventory.sourceFile;
@@ -513,6 +522,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Binds translator prefixes to variables initialized from a translation hook result or from
+   * another translator. The second pass picks up hook wrappers found in between.
+   */
   function discoverHookTranslators(): void {
     for (const inventory of inventories) {
       const sourceFile = inventory.sourceFile;
@@ -524,23 +537,22 @@ export function analyzeLoadedProjectMany(
           : undefined;
         if (isObjectBindingPattern(node.name) && hookPrefix) {
           for (const element of node.name.elements) {
-            // 7.1 types every binding element name as optional for array holes; object pattern
-            // elements always carry one.
+            // Binding element names are typed optional because array holes have none; object
+            // pattern elements always carry one.
             if (!element.name) continue;
             const sourceName =
               element.propertyName?.getText(sourceFile) ?? element.name.getText(sourceFile);
             if (sourceName !== 't' || !isIdentifier(element.name)) continue;
-            addTranslator(normalizedSymbol(element.name), hookPrefix);
+            addTranslator(semantic.symbol(element.name), hookPrefix);
           }
           continue;
         }
 
         if (isArrayBindingPattern(node.name) && hookPrefix) {
           const first = node.name.elements[0];
-          // A leading hole is an OmittedExpression in TS 6 and a nameless BindingElement in 7.1;
-          // both are skipped.
+          // A leading hole is a binding element without a name and binds no translator.
           if (first && isBindingElement(first) && first.name && isIdentifier(first.name)) {
-            addTranslator(normalizedSymbol(first.name), hookPrefix);
+            addTranslator(semantic.symbol(first.name), hookPrefix);
           }
           continue;
         }
@@ -550,7 +562,7 @@ export function analyzeLoadedProjectMany(
           if (!isPotentialTranslatorExpression(initializer)) continue;
           const aliasedPrefix = translatorPrefix(initializer);
           if (aliasedPrefix) {
-            addTranslator(normalizedSymbol(node.name), aliasedPrefix);
+            addTranslator(semantic.symbol(node.name), aliasedPrefix);
             continue;
           }
           if (
@@ -559,7 +571,7 @@ export function analyzeLoadedProjectMany(
             translationHookPrefix(initializer.expression)
           ) {
             addTranslator(
-              normalizedSymbol(node.name),
+              semantic.symbol(node.name),
               translationHookPrefix(initializer.expression) ?? empty()
             );
           }
@@ -568,11 +580,32 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Gives each parameter the prefixes of the translators local call sites pass to it, repeating
+   * until nothing changes, so a translator handed through helper functions keeps its prefix.
+   */
   function propagateTranslatorParameters(): void {
+    // The first iteration hands every argument of every call with a local target to
+    // isPotentialTranslatorExpression, which looks up access arguments through their name and as
+    // a whole. Batching exactly those lookups here leaves the loop on the cache; prefetching them
+    // for all calls instead would type-check receivers no lookup ever needs. functionLikeForCall
+    // depends only on Semantic, so calling it ahead of the loop cannot change its answers.
+    const argumentSites: Node[] = [];
+    for (const inventory of inventories) {
+      for (const node of inventory.calls) {
+        if (!functionLikeForCall(node)) continue;
+        for (const argument of node.arguments) {
+          const value = unwrapExpression(argument);
+          if (isPropertyAccessExpression(value)) argumentSites.push(value.name, value);
+          else if (isElementAccessExpression(value)) argumentSites.push(value);
+        }
+      }
+    }
+    semantic.prefetchSymbols(argumentSites);
+
     let changed = true;
     let iteration = 0;
-    // The compatibility engine historically bounds convergence here; retaining the cap avoids
-    // allowing pathological call cycles to make the baseline analysis non-terminating.
+    // The iteration cap keeps pathological call cycles from making the analysis non-terminating.
     while (changed && iteration < 20) {
       changed = false;
       iteration += 1;
@@ -585,7 +618,7 @@ export function analyzeLoadedProjectMany(
             const prefix = translatorPrefix(argument);
             const parameter = target.parameters[index];
             if (!prefix || !parameter || !isIdentifier(parameter.name)) return;
-            const symbol = normalizedSymbol(parameter.name);
+            const symbol = semantic.symbol(parameter.name);
             if (!symbol) return;
             const before = translators.get(symbol);
             const after = before ? merge(before, prefix) : prefix;
@@ -599,6 +632,11 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Records which call arguments and JSX attributes feed each parameter, so object resolution
+   * can follow a translation object into a function or component. Completes during discovery;
+   * the usage pass treats the index as fixed.
+   */
   function indexObjectParameterInputs(): void {
     // Checker types prove component/function identity, while call-site expressions preserve the
     // runtime translation prefix that structural prop types necessarily erase.
@@ -622,16 +660,16 @@ export function analyzeLoadedProjectMany(
             const property = staticBindingElementName(element);
             if (!property) continue;
             const source = jsxPropertyInput(node, property);
-            if (source.input) addObjectInput(normalizedSymbol(element.name), source.input);
+            if (source.input) addObjectInput(semantic.symbol(element.name), source.input);
             if (!source.found && element.initializer) {
-              addObjectInput(normalizedSymbol(element.name), {
+              addObjectInput(semantic.symbol(element.name), {
                 expression: element.initializer,
                 path: []
               });
             }
           }
         } else if (isIdentifier(parameter.name)) {
-          const symbol = normalizedSymbol(parameter.name);
+          const symbol = semantic.symbol(parameter.name);
           if (!symbol) continue;
           for (const property of semantic.propertiesOfType(semantic.typeAt(parameter.name))) {
             const source = jsxPropertyInput(node, property.name);
@@ -642,6 +680,27 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Batches the symbol lookups object resolution makes when it follows a parameter back to its
+   * call-site and JSX inputs. The input index is complete once indexing finishes, so reading it
+   * here involves no resolution order.
+   */
+  function prefetchObjectInputSymbols(): void {
+    const sites: Node[] = [];
+    const addInputs = (inputs: Iterable<ObjectInput>): void => {
+      for (const input of inputs) {
+        const value = unwrapExpression(input.expression);
+        if (isIdentifier(value)) sites.push(value);
+      }
+    };
+    for (const inputs of objectInputs.values()) addInputs(inputs);
+    for (const properties of objectPropertyInputs.values()) {
+      for (const inputs of properties.values()) addInputs(inputs);
+    }
+    semantic.prefetchSymbols(sites);
+  }
+
+  /** Finds the attribute or spread that supplies `property` to a component element. */
   function jsxPropertyInput(
     node: JsxOpeningLikeElement,
     property: string
@@ -668,9 +727,13 @@ export function analyzeLoadedProjectMany(
     return { found: false };
   }
 
+  /**
+   * Records `input` for a parameter, or for each statically named element of a destructured
+   * parameter with that property appended to the input path.
+   */
   function indexParameterInput(parameter: ParameterDeclaration, input: ObjectInput): void {
     if (isIdentifier(parameter.name)) {
-      addObjectInput(normalizedSymbol(parameter.name), input);
+      addObjectInput(semantic.symbol(parameter.name), input);
       return;
     }
     if (!isObjectBindingPattern(parameter.name)) return;
@@ -678,13 +741,14 @@ export function analyzeLoadedProjectMany(
       if (!element.name || !isIdentifier(element.name)) continue;
       const property = staticBindingElementName(element);
       if (!property) continue;
-      addObjectInput(normalizedSymbol(element.name), {
+      addObjectInput(semantic.symbol(element.name), {
         expression: input.expression,
         path: [...input.path, property]
       });
     }
   }
 
+  /** Bindings without a symbol cannot be looked up later, so their inputs are dropped. */
   function addObjectInput(symbol: TsSymbol | undefined, input: ObjectInput): void {
     if (!symbol) return;
     const inputs = objectInputs.get(symbol) ?? [];
@@ -692,6 +756,7 @@ export function analyzeLoadedProjectMany(
     objectInputs.set(symbol, inputs);
   }
 
+  /** Records a value supplied for one prop of a props parameter that is read as a whole. */
   function addObjectPropertyInput(symbol: TsSymbol, property: string, input: ObjectInput): void {
     const properties = objectPropertyInputs.get(symbol) ?? new Map<string, ObjectInput[]>();
     const inputs = properties.get(property) ?? [];
@@ -700,6 +765,10 @@ export function analyzeLoadedProjectMany(
     objectPropertyInputs.set(symbol, properties);
   }
 
+  /**
+   * Finds functions that pass one of their own parameters as the key of a translator call, so
+   * calls to them are analyzed as translation calls with the inner translator's prefix.
+   */
   function discoverTranslationWrappers(): void {
     for (const inventory of inventories) {
       for (const node of inventory.calls) {
@@ -710,8 +779,7 @@ export function analyzeLoadedProjectMany(
         if (!owner) continue;
         const parameterIndex = owner.parameters.findIndex(
           (parameter) =>
-            isIdentifier(parameter.name) &&
-            normalizedSymbol(parameter.name) === normalizedSymbol(key)
+            isIdentifier(parameter.name) && semantic.symbol(parameter.name) === semantic.symbol(key)
         );
         if (parameterIndex < 0) continue;
         const parameter = owner.parameters[parameterIndex];
@@ -726,10 +794,14 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Counts call sites per wrapper; a wrapper nobody calls keeps its inner translator call
+   * analyzed (see isAnalyzedWrapperParameter).
+   */
   function countWrapperCalls(): void {
     for (const inventory of inventories) {
       for (const node of inventory.calls) {
-        const symbol = normalizedSymbol(node.expression);
+        const symbol = semantic.symbol(node.expression);
         if (symbol && wrappers.has(symbol)) {
           wrapperCalls.set(symbol, (wrapperCalls.get(symbol) ?? 0) + 1);
         }
@@ -759,10 +831,31 @@ export function analyzeLoadedProjectMany(
         current = unwrapExpression(current.expression);
       }
       if (!isIdentifier(current)) continue;
-      const symbol = normalizedSymbol(current);
-      if (symbol && resolveObjectSymbol(symbol, new Set())) targets.push(...bases);
+      const symbol = semantic.symbol(current);
+      if (symbol && resolveObjectSymbol(symbol)) targets.push(...bases);
     }
     return targets;
+  }
+
+  /**
+   * Batches the contract types resolveObject compares with dictionaries when a call's returned
+   * values do not resolve: the declared return type node and, for exported targets, the
+   * signature's return type. functionLikeForCall depends only on Semantic, so this lookahead
+   * cannot change what the usage pass computes.
+   */
+  function prefetchCallTargetTypes(): void {
+    const typeNodes: TypeNode[] = [];
+    const exported: FunctionLikeDeclaration[] = [];
+    for (const inventory of inventories) {
+      for (const call of inventory.calls) {
+        const target = functionLikeForCall(call);
+        if (!target) continue;
+        if (target.type) typeNodes.push(target.type);
+        if (isExported(target)) exported.push(target);
+      }
+    }
+    semantic.prefetchTypesFromTypeNodes(typeNodes);
+    semantic.prefetchReturnTypes(exported);
   }
 
   /**
@@ -787,6 +880,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Runs every usage check for one file in source order. The order of resolveObject calls here
+   * decides what the object caches hold, which is why lookahead uses scratch caches.
+   */
   function visitSource(inventory: SourceInventory): void {
     for (const node of inventory.usageNodes) {
       if (isCallExpression(node)) analyzeCall(node);
@@ -812,6 +909,11 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Translator calls mark their keys, wrapper calls mark the forwarded key, array iteration and
+   * `Object.keys`-style enumeration mark whole subtrees, and translation objects passed to
+   * functions without a local body count as escaping.
+   */
   function analyzeCall(call: CallExpression): void {
     const prefix = translatorPrefix(call.expression);
     if (prefix) {
@@ -872,7 +974,7 @@ export function analyzeLoadedProjectMany(
       return;
     }
 
-    const wrapper = wrappers.get(normalizedSymbol(call.expression) as TsSymbol);
+    const wrapper = wrappers.get(semantic.symbol(call.expression) as TsSymbol);
     const argument = wrapper ? call.arguments[wrapper.keyParameter] : undefined;
     if (wrapper && argument) {
       markTranslationResolution(
@@ -899,6 +1001,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Iterating a translation array with a method such as `map` reads every element. The receiver
+   * must also be typed as an array, so an object key named `map` stays ordinary data.
+   */
   function analyzeArrayReceiverCall(call: CallExpression): boolean {
     const expression = unwrapExpression(call.expression);
     if (
@@ -934,9 +1040,13 @@ export function analyzeLoadedProjectMany(
     );
   }
 
+  /**
+   * Handles `<Trans i18nKey>` only when `Trans` comes from react-i18next, applying the prefix of
+   * a translator passed through its `t` attribute.
+   */
   function analyzeTrans(node: JsxOpeningLikeElement): void {
     const tagTarget = isPropertyAccessExpression(node.tagName) ? node.tagName.name : node.tagName;
-    const tagSymbol = normalizedSymbol(tagTarget);
+    const tagSymbol = semantic.symbol(tagTarget);
     if (
       !isImportedName(tagSymbol, 'Trans', 'react-i18next') &&
       !isLibrarySymbol(tagSymbol, 'Trans', 'react-i18next')
@@ -966,6 +1076,10 @@ export function analyzeLoadedProjectMany(
     markResolution(prepend(prefix ?? empty(), key), node, '<Trans i18nKey>');
   }
 
+  /**
+   * Marks keys read through the outermost access of a chain on a translation or dictionary
+   * object. Values that are only stored or returned are analyzed where they are read.
+   */
   function analyzeObjectExpression(expression: Expression): void {
     const object = resolveObject(expression);
     if (!object) return;
@@ -1015,6 +1129,11 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Reports a translator call inside a wrapper whose key is the wrapper's own parameter. Each
+   * wrapper call site marks its argument instead, so the inner call is skipped unless the
+   * wrapper is exported, uncalled, or reassigns the parameter.
+   */
   function isAnalyzedWrapperParameter(key: Expression, call: CallExpression): boolean {
     const value = unwrapExpression(key);
     if (!isIdentifier(value)) return false;
@@ -1024,7 +1143,7 @@ export function analyzeLoadedProjectMany(
     if (!ownerSymbol || !wrappers.has(ownerSymbol) || isExported(owner)) return false;
     const parameter = owner.parameters.find(
       (candidate) =>
-        isIdentifier(candidate.name) && normalizedSymbol(candidate.name) === normalizedSymbol(value)
+        isIdentifier(candidate.name) && semantic.symbol(candidate.name) === semantic.symbol(value)
     );
     return Boolean(
       parameter &&
@@ -1033,11 +1152,13 @@ export function analyzeLoadedProjectMany(
     );
   }
 
+  /** A spread copies every key, so the whole spread object counts as possibly used. */
   function analyzeSpread(node: SpreadAssignment | SpreadElement | JsxSpreadAttribute): void {
     const object = resolveObject(node.expression);
     if (object) markSubtrees(object, node, 'Spread of translation object');
   }
 
+  /** Destructuring marks each named property; a rest element marks the remaining subtree. */
   function analyzeBindingPattern(
     pattern: ObjectBindingPattern,
     object: ObjectResolution,
@@ -1069,6 +1190,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Destructures a value that does not resolve as a whole, such as a call returning a mixed
+   * props bag, by projecting each named property separately.
+   */
   function analyzeProjectedBindingPattern(
     pattern: ObjectBindingPattern,
     initializer: Expression
@@ -1096,6 +1221,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Resolves an expression to the dictionary keys it holds as a translation or dictionary
+   * object. Only top-level calls are cached, because a nested result depends on `seen`.
+   */
   function resolveObject(input: Expression, seen = new Set<Node>()): ObjectResolution | undefined {
     if (seen.size === 0) {
       const cached = objectCache.get(input);
@@ -1107,6 +1236,11 @@ export function analyzeLoadedProjectMany(
     return resolveObjectUncached(input, seen);
   }
 
+  /**
+   * Calls resolve through `returnObjects` translator calls, `useMemo` factories, local function
+   * returns and finally declared or exported return types matched against dictionary types.
+   * Identifiers resolve through their symbol, and access chains append one segment per level.
+   */
   function resolveObjectUncached(input: Expression, seen: Set<Node>): ObjectResolution | undefined {
     const expression = unwrapExpression(input);
     if (seen.has(expression)) return undefined;
@@ -1166,8 +1300,8 @@ export function analyzeLoadedProjectMany(
     }
 
     if (isIdentifier(expression)) {
-      const symbol = normalizedSymbol(expression);
-      return symbol ? resolveObjectSymbol(symbol, nextSeen) : undefined;
+      const symbol = semantic.symbol(expression);
+      return symbol ? resolveObjectSymbol(symbol) : undefined;
     }
 
     if (isPropertyAccessExpression(expression)) {
@@ -1219,6 +1353,10 @@ export function analyzeLoadedProjectMany(
     return undefined;
   }
 
+  /**
+   * Resolves an indexed parameter input and appends its property path. When the input does not
+   * resolve as a whole, the first path segment is projected through it instead.
+   */
   function resolveObjectInput(input: ObjectInput, seen: Set<Node>): ObjectResolution | undefined {
     const direct = resolveObject(input.expression, seen);
     if (direct) {
@@ -1235,6 +1373,7 @@ export function analyzeLoadedProjectMany(
     return result;
   }
 
+  /** Resolves one named property of an object literal, call result or variable. */
   function resolveProjectedObject(
     input: Expression,
     property: string,
@@ -1263,7 +1402,7 @@ export function analyzeLoadedProjectMany(
         } else if (isShorthandPropertyAssignment(member)) {
           const valueSymbol = semantic.aliased(semantic.shorthandValueSymbol(member));
           candidate = valueSymbol
-            ? resolveObjectSymbol(valueSymbol, nextSeen)
+            ? resolveObjectSymbol(valueSymbol)
             : resolveObject(shorthandName(member), nextSeen);
         }
         // Explicit properties always overwrite earlier spreads/properties, including with a
@@ -1299,7 +1438,7 @@ export function analyzeLoadedProjectMany(
     }
 
     if (isIdentifier(expression)) {
-      const symbol = normalizedSymbol(expression);
+      const symbol = semantic.symbol(expression);
       const declaration = semantic.declarations(symbol).find(isVariableDeclaration);
       if (declaration?.initializer) {
         const fromDeclaration = resolveProjectedObject(declaration.initializer, property, nextSeen);
@@ -1361,7 +1500,16 @@ export function analyzeLoadedProjectMany(
     return mergeObjects(left, right);
   }
 
-  function resolveObjectSymbol(symbol: TsSymbol, _seen: Set<Node>): ObjectResolution | undefined {
+  /**
+   * Resolves what a symbol holds from its variable initializer, indexed parameter inputs and
+   * destructuring source, memoized per symbol in objectSymbolCache.
+   *
+   * A symbol already being resolved yields `undefined` to cut cycles, and the symbol that closed
+   * the cycle caches that partial answer. Results therefore depend on resolution order, so
+   * lookahead must run inside withScratchObjectCaches. Each symbol starts a fresh `seen` set
+   * because the in-progress set already bounds recursion across symbols.
+   */
+  function resolveObjectSymbol(symbol: TsSymbol): ObjectResolution | undefined {
     const cached = objectSymbolCache.get(symbol);
     if (cached !== undefined) return cached ?? undefined;
     if (resolvingObjectSymbols.has(symbol)) return undefined;
@@ -1460,8 +1608,13 @@ export function analyzeLoadedProjectMany(
     };
   }
 
+  /**
+   * Returns the key prefix a translator expression applies, or `undefined` when it is not a
+   * translator. Known translator symbols answer first; otherwise `getFixedT` calls, `hook().t`,
+   * `hook()[0]`, `i18next.t`, imported `t` and values typed as i18next's TFunction qualify.
+   */
   function translatorPrefix(expression: Expression): StringResolution | undefined {
-    const symbol = normalizedSymbol(expression);
+    const symbol = semantic.symbol(expression);
     const known = symbol ? translators.get(symbol) : undefined;
     if (known) return known;
 
@@ -1474,7 +1627,7 @@ export function analyzeLoadedProjectMany(
     if (isPropertyAccessExpression(unwrapped) && unwrapped.name.text === 't') {
       const hookPrefix = translationHookPrefix(unwrapped.expression);
       if (hookPrefix) return hookPrefix;
-      const symbol = normalizedSymbol(unwrapped.name);
+      const symbol = semantic.symbol(unwrapped.name);
       if (
         isLibrarySymbol(symbol, 't', 'i18next') ||
         isDefaultImportFrom(unwrapped.expression, 'i18next')
@@ -1490,7 +1643,7 @@ export function analyzeLoadedProjectMany(
       const hookPrefix = translationHookPrefix(unwrapped.expression);
       if (hookPrefix) return hookPrefix;
     }
-    const directSymbol = normalizedSymbol(unwrapped);
+    const directSymbol = semantic.symbol(unwrapped);
     if (
       isImportedName(directSymbol, 't', 'i18next') ||
       isLibrarySymbol(directSymbol, 't', 'i18next') ||
@@ -1501,12 +1654,13 @@ export function analyzeLoadedProjectMany(
     return undefined;
   }
 
+  /** Recognizes `useTranslation` by react-i18next import provenance, including namespaces. */
   function isUseTranslationCall(expression: Expression): boolean {
     const unwrapped = unwrapExpression(expression);
     if (!isCallExpression(unwrapped)) return false;
     const callee = unwrapExpression(unwrapped.expression);
     const target = isPropertyAccessExpression(callee) ? callee.name : callee;
-    const symbol = normalizedSymbol(target);
+    const symbol = semantic.symbol(target);
     // Name-only matching would let unrelated application hooks suppress valid unused diagnostics.
     if (isImportedName(symbol, 'useTranslation', 'react-i18next')) return true;
     if (isLibrarySymbol(symbol, 'useTranslation', 'react-i18next')) return true;
@@ -1517,6 +1671,11 @@ export function analyzeLoadedProjectMany(
     );
   }
 
+  /**
+   * Returns the prefix a `useTranslation` call or project hook wrapper binds, following local
+   * aliases of the hook result. Cached per call; the `null` entry stored before resolving stops
+   * recursion through wrappers that call each other.
+   */
   function translationHookPrefix(
     expression: Expression,
     seen = new Set<Node>()
@@ -1527,7 +1686,7 @@ export function analyzeLoadedProjectMany(
     if (isIdentifier(unwrapped)) {
       // Follow local result aliases so later destructuring retains the prefix proven at hook creation.
       const declaration = semantic
-        .declarations(normalizedSymbol(unwrapped))
+        .declarations(semantic.symbol(unwrapped))
         .find(isVariableDeclaration);
       return declaration?.initializer
         ? translationHookPrefix(declaration.initializer, nextSeen)
@@ -1544,7 +1703,7 @@ export function analyzeLoadedProjectMany(
       return prefix;
     }
 
-    const symbol = normalizedSymbol(unwrapped.expression);
+    const symbol = semantic.symbol(unwrapped.expression);
     const wrapper = symbol ? translationHookWrappers.get(symbol) : undefined;
     if (!wrapper) return undefined;
     let result: StringResolution | undefined;
@@ -1563,11 +1722,16 @@ export function analyzeLoadedProjectMany(
     return result;
   }
 
+  /** An unreadable options argument makes the prefix unresolved; an absent one makes it empty. */
   function keyPrefixFromUseTranslation(call: CallExpression): StringResolution {
     const expression = keyPrefixExpressionFromUseTranslation(call);
     return expression === null ? unresolved() : expression ? strings.resolve(expression) : empty();
   }
 
+  /**
+   * Returns the `keyPrefix` expression of a `useTranslation` call, kept unresolved so hook
+   * wrappers can resolve it per call site; `null` when unreadable, `undefined` when absent.
+   */
   function keyPrefixExpressionFromUseTranslation(
     call: CallExpression
   ): Expression | null | undefined {
@@ -1575,6 +1739,7 @@ export function analyzeLoadedProjectMany(
     return options ? optionExpression(options, 'keyPrefix') : undefined;
   }
 
+  /** A wrapper prefix taken from one of its parameters resolves to the argument at this call. */
   function resolveHookPrefixArgument(
     expression: Expression,
     wrapper: FunctionLikeDeclaration,
@@ -1584,13 +1749,18 @@ export function analyzeLoadedProjectMany(
     if (!isIdentifier(value)) return strings.resolve(value);
     const parameterIndex = wrapper.parameters.findIndex(
       (parameter) =>
-        isIdentifier(parameter.name) && normalizedSymbol(parameter.name) === normalizedSymbol(value)
+        isIdentifier(parameter.name) && semantic.symbol(parameter.name) === semantic.symbol(value)
     );
     if (parameterIndex < 0) return strings.resolve(value);
     const argument = call.arguments[parameterIndex];
     return argument ? strings.resolve(argument) : empty();
   }
 
+  /**
+   * Finds the expression an i18next option such as `keyPrefix` or `count` is set to: `undefined`
+   * when provably absent, `null` when it cannot be determined. Members are read from the last,
+   * since later properties and spreads override earlier ones.
+   */
   function optionExpression(
     expression: Expression,
     option: string,
@@ -1600,9 +1770,7 @@ export function analyzeLoadedProjectMany(
     if (seen.has(value)) return undefined;
     const nextSeen = new Set(seen).add(value);
     if (isIdentifier(value)) {
-      const declaration = semantic
-        .declarations(normalizedSymbol(value))
-        .find(isVariableDeclaration);
+      const declaration = semantic.declarations(semantic.symbol(value)).find(isVariableDeclaration);
       return declaration?.initializer
         ? optionExpression(declaration.initializer, option, nextSeen)
         : null;
@@ -1628,8 +1796,9 @@ export function analyzeLoadedProjectMany(
         continue;
       }
       if (isShorthandPropertyAssignment(property) && shorthandName(property).text === option) {
-        // Kept raw as in v0.2.2: an imported binding has no local declaration to return, so the
-        // shorthand name itself becomes the option expression.
+        // The value symbol stays unaliased. An imported binding is declared by its import
+        // specifier, so the shorthand name itself becomes the option expression; following the
+        // alias would return a declaration from the exporting module.
         const valueSymbol = semantic.shorthandValueSymbol(property);
         for (const declaration of semantic.declarations(valueSymbol)) {
           if (
@@ -1649,13 +1818,17 @@ export function analyzeLoadedProjectMany(
     return undefined;
   }
 
+  /**
+   * Reads a boolean option such as `returnObjects` across every options argument of a call;
+   * `'unknown'` when any argument may set it at runtime.
+   */
   function callBooleanOption(call: CallExpression, option: string): BooleanOptionResolution {
     let unresolvedOption = false;
     for (const argument of call.arguments.slice(1)) {
       const value = unwrapExpression(argument);
       if (isIdentifier(value)) {
         const declaration = semantic
-          .declarations(normalizedSymbol(value))
+          .declarations(semantic.symbol(value))
           .find(isVariableDeclaration);
         if (declaration?.initializer) {
           const configured = booleanOption(declaration.initializer, option);
@@ -1682,12 +1855,14 @@ export function analyzeLoadedProjectMany(
     return unresolvedOption ? 'unknown' : 'absent';
   }
 
+  /**
+   * Reads one boolean option from an options expression, following variables to their
+   * initializers. Members are read from the last, so later definitions win.
+   */
   function booleanOption(expression: Expression, option: string): BooleanOptionResolution {
     const value = unwrapExpression(expression);
     if (isIdentifier(value)) {
-      const declaration = semantic
-        .declarations(normalizedSymbol(value))
-        .find(isVariableDeclaration);
+      const declaration = semantic.declarations(semantic.symbol(value)).find(isVariableDeclaration);
       return declaration?.initializer ? booleanOption(declaration.initializer, option) : 'unknown';
     }
     if (!isObjectLiteralExpression(value)) {
@@ -1705,7 +1880,7 @@ export function analyzeLoadedProjectMany(
       if (isShorthandPropertyAssignment(property) && shorthandName(property).text === option) {
         if (unresolvedSpread) return 'unknown';
         const declaration = semantic
-          .declarations(normalizedSymbol(property.name))
+          .declarations(semantic.symbol(property.name))
           .find(isVariableDeclaration);
         if (!declaration?.initializer) return 'unknown';
         const initializer = unwrapExpression(declaration.initializer);
@@ -1726,11 +1901,13 @@ export function analyzeLoadedProjectMany(
     return unresolvedSpread ? 'unknown' : 'absent';
   }
 
+  /** Keys translators by alias-resolved symbol, so an import and its target share one entry. */
   function addTranslator(symbol: TsSymbol | undefined, prefix: StringResolution): void {
     const normalized = semantic.aliased(symbol);
     if (normalized) translators.set(normalized, prefix);
   }
 
+  /** Marks a resolved `<Trans i18nKey>`; an unbounded key becomes an unresolved warning. */
   function markResolution(resolution: StringResolution, node: Node, reason: string): void {
     markKeys([...resolution.values], 'used', node, reason);
     for (const pattern of resolution.patterns)
@@ -1743,6 +1920,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Marks the keys of a translator or wrapper call. With count, context or ordinal options,
+   * i18next looks up suffixed variants, so candidates are expanded per dictionary and locale.
+   */
   function markTranslationResolution(
     resolution: StringResolution,
     variants: TranslationVariantOptions,
@@ -1799,6 +1980,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Extracts the options that select i18next key variants. A `count` that is not number-typed
+   * selects no plural forms, and one that may be anything marks all of them possibly used.
+   */
   function translationOptions(call: CallExpression): TranslationVariantOptions {
     const options = call.arguments[1];
     if (!options) return {};
@@ -1833,6 +2018,11 @@ export function analyzeLoadedProjectMany(
     };
   }
 
+  /**
+   * Classifies a `count` option's type for plural expansion: `'number'` selects plural forms
+   * from the count's values and `'none'` selects none. `any`, `unknown`, or numbers mixed with
+   * other members give `'unknown'`, which marks every plural form possibly used.
+   */
   function countType(type: Type): 'number' | 'none' | 'unknown' {
     if (type.flags & (TypeFlags.Any | TypeFlags.Unknown)) return 'unknown';
     if (type.isUnionType()) {
@@ -1843,6 +2033,7 @@ export function analyzeLoadedProjectMany(
     return type.flags & (TypeFlags.Number | TypeFlags.NumberLiteral) ? 'number' : 'none';
   }
 
+  /** Used when a translation object escapes key-level analysis: everything below may be read. */
   function markSubtrees(
     resolution: StringResolution & { dictionaryIds?: ReadonlySet<string> },
     node: Node,
@@ -1862,6 +2053,7 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /** Records a possibly used prefix observation that covers every key below `prefix`. */
   function markSubtree(
     prefix: string,
     node: Node,
@@ -1878,6 +2070,7 @@ export function analyzeLoadedProjectMany(
     });
   }
 
+  /** Records a possibly used wildcard observation, as produced by dynamic key segments. */
   function markPattern(
     pattern: string,
     node: Node,
@@ -1893,6 +2086,7 @@ export function analyzeLoadedProjectMany(
     });
   }
 
+  /** Records exact key observations that share one evidence location. */
   function markKeys(
     candidateKeys: Iterable<string>,
     confidence: 'used' | 'possibly-used',
@@ -1952,6 +2146,10 @@ export function analyzeLoadedProjectMany(
     facts.translationObjectCasts.push(evidence);
   }
 
+  /**
+   * Files facts under the file of the node that produced them, so the cache can replay them
+   * per file. A file outside the analyzed set gets its bucket on first use.
+   */
   function factsForNode(node: Node): SourceUsageFacts {
     const fileName = path.resolve(node.getSourceFile().fileName);
     let facts = freshFacts.get(fileName);
@@ -1967,6 +2165,10 @@ export function analyzeLoadedProjectMany(
     return facts;
   }
 
+  /**
+   * Evidence holds a project-relative path and 1-based line and column, so it survives the
+   * cache and lint can relocate it after the compiler process closes.
+   */
   function evidenceFor(
     node: Node,
     confidence: 'used' | 'possibly-used',
@@ -1983,14 +2185,7 @@ export function analyzeLoadedProjectMany(
     };
   }
 
-  /**
-   * Returns the alias-resolved symbol for a node, reading property accesses through their name.
-   * Semantic owns the cache; this name stays so call sites keep reading as in v0.2.2.
-   */
-  function normalizedSymbol(node: Node): TsSymbol | undefined {
-    return semantic.symbol(node);
-  }
-
+  /** Uses the inventory's return index and walks the body only for functions outside it. */
   function returnExpressionsCached(node: FunctionLikeDeclaration): readonly Expression[] {
     const cached = returnExpressionCache.get(node);
     if (cached) return cached;
@@ -2000,13 +2195,17 @@ export function analyzeLoadedProjectMany(
     return expressions;
   }
 
+  /**
+   * A reassigned parameter no longer carries the caller's key, which disqualifies its function
+   * as a wrapper. Uses the assignment index for inventoried functions and a body walk otherwise.
+   */
   function parameterIsReassignedCached(
     parameter: ParameterDeclaration,
     owner: FunctionLikeDeclaration
   ): boolean {
     const cached = reassignmentCache.get(parameter);
     if (cached !== undefined) return cached;
-    const symbol = isIdentifier(parameter.name) ? normalizedSymbol(parameter.name) : undefined;
+    const symbol = isIdentifier(parameter.name) ? semantic.symbol(parameter.name) : undefined;
     const indexed = symbol
       ? (assignmentIndex.get(symbol) ?? []).some((assignment) => assignment.owner === owner)
       : false;
@@ -2016,14 +2215,20 @@ export function analyzeLoadedProjectMany(
     return result;
   }
 
+  /** Resolves the function a call invokes; see functionLikeForExpression. */
   function functionLikeForCall(call: CallExpression): FunctionLikeDeclaration | undefined {
     return functionLikeForExpression(call.expression);
   }
 
+  /**
+   * Resolves a callee or JSX tag to a function: a function-like declaration, a function or arrow
+   * initializer, or the render callback of `forwardRef`. Its answers depend only on Semantic,
+   * so prefetch lookahead may call it in any order.
+   */
   function functionLikeForExpression(expression: Node): FunctionLikeDeclaration | undefined {
     const cached = functionLikeCache.get(expression);
     if (cached !== undefined) return cached ?? undefined;
-    const symbol = normalizedSymbol(expression);
+    const symbol = semantic.symbol(expression);
     for (const declaration of semantic.declarations(symbol)) {
       if (isConcreteFunctionLike(declaration)) {
         functionLikeCache.set(expression, declaration);
@@ -2055,11 +2260,16 @@ export function analyzeLoadedProjectMany(
     return undefined;
   }
 
+  /**
+   * Returns the symbol hooks and wrappers are registered under: the function's own name, or the
+   * variable an anonymous function initializes. Callers reach the same symbol through their
+   * callee, so lookups by call site match.
+   */
   function symbolForFunction(node: FunctionLikeDeclaration): TsSymbol | undefined {
     const name = functionName(node);
-    if (name) return normalizedSymbol(name);
+    if (name) return semantic.symbol(name);
     if (isVariableDeclaration(node.parent) && isIdentifier(node.parent.name)) {
-      return normalizedSymbol(node.parent.name);
+      return semantic.symbol(node.parent.name);
     }
     return undefined;
   }
@@ -2113,6 +2323,10 @@ export function analyzeLoadedProjectMany(
     return leaves;
   }
 
+  /**
+   * Reports an import of `importedName` from `moduleName`. The import statement proves package
+   * origin even when the package's own declarations are never resolved.
+   */
   function isImportedName(
     symbol: TsSymbol | undefined,
     importedName: string,
@@ -2171,6 +2385,7 @@ export function analyzeLoadedProjectMany(
     );
   }
 
+  /** Recognizes React `forwardRef`, whose render callback receives the wrapper's props as-is. */
   function isReactForwardRefCall(call: CallExpression): boolean {
     const callee = unwrapExpression(call.expression);
     const target = isPropertyAccessExpression(callee) ? callee.name : callee;
@@ -2191,6 +2406,12 @@ export function analyzeLoadedProjectMany(
     );
   }
 
+  /**
+   * Reports a value typed as i18next's TFunction, for translators that come from declarations
+   * only, such as a typed prop. A syntactic provenance check runs first, so arbitrary callees
+   * are never typed; the type must then have a call signature and lead to i18next's `TFunction`
+   * or a `t` member. Cached per expression.
+   */
   function isI18nextTFunction(expression: Expression): boolean {
     const cached = i18nextTFunctionCache.get(expression);
     if (cached !== undefined) return cached;
@@ -2247,10 +2468,15 @@ export function analyzeLoadedProjectMany(
     return result;
   }
 
+  /** Syntactic gate in front of the type lookup in isI18nextTFunction. */
   function hasPlausibleI18nextTProvenance(expression: Expression): boolean {
     return expressionHasI18nextTProvenance(unwrapExpression(expression), new Set());
   }
 
+  /**
+   * Follows calls, returned values, forwarded parameters and declarations to a value that could
+   * come from i18next. `seen` is shared across the walk to stop cycles.
+   */
   function expressionHasI18nextTProvenance(expression: Expression, seen: Set<Node>): boolean {
     const value = unwrapExpression(expression);
     if (seen.has(value)) return false;
@@ -2267,7 +2493,7 @@ export function analyzeLoadedProjectMany(
           const parameterIndex = target.parameters.findIndex(
             (parameter) =>
               isIdentifier(parameter.name) &&
-              normalizedSymbol(parameter.name) === normalizedSymbol(returnedValue)
+              semantic.symbol(parameter.name) === semantic.symbol(returnedValue)
           );
           const argument = parameterIndex >= 0 ? value.arguments[parameterIndex] : undefined;
           if (argument && expressionHasI18nextTProvenance(argument, seen)) return true;
@@ -2277,7 +2503,7 @@ export function analyzeLoadedProjectMany(
       return false;
     }
 
-    const symbol = normalizedSymbol(value);
+    const symbol = semantic.symbol(value);
     if (!symbol) return false;
     if (translators.has(symbol)) return true;
     return semantic
@@ -2285,6 +2511,11 @@ export function analyzeLoadedProjectMany(
       .some((declaration) => declarationHasI18nextTProvenance(declaration, seen));
   }
 
+  /**
+   * Checks a declaration's annotation, initializer, destructuring source, alias target or
+   * heritage for i18next translator provenance. Untyped callback parameters pass, since only the
+   * checker knows their contextual type.
+   */
   function declarationHasI18nextTProvenance(declaration: Declaration, seen: Set<Node>): boolean {
     if (seen.has(declaration)) return false;
     seen.add(declaration);
@@ -2330,6 +2561,7 @@ export function analyzeLoadedProjectMany(
     return false;
   }
 
+  /** Reports a declaration in i18next's typings that is, or sits inside, TFunction or `t`. */
   function isI18nextTranslatorDeclaration(declaration: Declaration): boolean {
     if (!declarationBelongsToPackage(declaration, 'i18next')) return false;
     let current: Node | undefined = declaration;
@@ -2357,7 +2589,7 @@ export function analyzeLoadedProjectMany(
 
   /**
    * Follows type references and heritage expressions to an i18next translator declaration.
-   * 7.1 types heritage clause entries apart from type nodes, so both are accepted.
+   * Heritage clause entries are typed apart from type nodes, so both are accepted.
    */
   function typeNodeHasI18nextTProvenance(
     typeNode: TypeNode | HeritageClauseElement,
@@ -2377,32 +2609,38 @@ export function analyzeLoadedProjectMany(
         ? typeNode.expression
         : undefined;
     if (!typeName) return false;
-    // v0.2.2 queried the exact type-name node; semantic.symbol would retarget an `extends a.B`
-    // property access to its name, so the raw lookup is unwrapped explicitly instead.
+    // The lookup must target the type name node as written. semantic.symbol would query only
+    // the `B` of an `extends a.B` property access, so the alias is unwrapped here instead.
     const symbol = semantic.aliased(semantic.rawSymbol(typeName));
     return semantic
       .declarations(symbol)
       .some((declaration) => declarationHasI18nextTProvenance(declaration, seen));
   }
 
+  /**
+   * Cheap gate in front of translationHookPrefix: a `useTranslation` call, a call to a known
+   * hook wrapper, or a variable initialized with either.
+   */
   function couldBeTranslationHookResult(expression: Expression, seen = new Set<Node>()): boolean {
     const value = unwrapExpression(expression);
     if (seen.has(value)) return false;
     seen.add(value);
     if (isIdentifier(value)) {
-      const declaration = semantic
-        .declarations(normalizedSymbol(value))
-        .find(isVariableDeclaration);
+      const declaration = semantic.declarations(semantic.symbol(value)).find(isVariableDeclaration);
       return Boolean(
         declaration?.initializer && couldBeTranslationHookResult(declaration.initializer, seen)
       );
     }
     if (!isCallExpression(value)) return false;
     if (isUseTranslationCall(value)) return true;
-    const symbol = normalizedSymbol(value.expression);
+    const symbol = semantic.symbol(value.expression);
     return Boolean(symbol && translationHookWrappers.has(symbol));
   }
 
+  /**
+   * Gate in front of translatorPrefix for variable initializers and call arguments, so only
+   * values with plausible translator provenance pay for full prefix resolution.
+   */
   function isPotentialTranslatorExpression(expression: Expression): boolean {
     const value = unwrapExpression(expression);
     if (
@@ -2416,7 +2654,7 @@ export function analyzeLoadedProjectMany(
     if (isCallExpression(value)) {
       return isGetFixedTCall(value) || expressionHasI18nextTProvenance(value, new Set());
     }
-    const symbol = normalizedSymbol(value);
+    const symbol = semantic.symbol(value);
     if (symbol && translators.has(symbol)) return true;
     if (isPropertyAccessExpression(value) && value.name.text === 't') {
       return (
@@ -2440,6 +2678,7 @@ export function analyzeLoadedProjectMany(
     );
   }
 
+  /** Applies a call-level `keyPrefix`; a literal `null` or `undefined` keeps the bound prefix. */
   function mergePrefixOverride(
     boundPrefix: StringResolution,
     expression: Expression
@@ -2474,8 +2713,12 @@ export function analyzeLoadedProjectMany(
     );
   }
 
+  /**
+   * Reports a declaration from `packageName`: installed typings under
+   * `node_modules/<package>/`, or an ambient `declare module '<package>'` block, as tests and
+   * projects without the package installed use. Reads only the node and its file path.
+   */
   function declarationBelongsToPackage(declaration: Node, packageName: string): boolean {
-    // Installed declarations and ambient test/consumer declarations encode package ownership differently.
     const marker = `${path.sep}node_modules${path.sep}${packageName}${path.sep}`;
     if (path.resolve(declaration.getSourceFile().fileName).includes(marker)) return true;
     let current: Node | undefined = declaration;
@@ -2531,6 +2774,7 @@ export function analyzeLoadedProjectMany(
   }
 }
 
+/** Returns a member name known without the checker, including literal computed names. */
 function staticPropertyName(name: PropertyName): string | undefined {
   if (isIdentifier(name) || isStringLiteral(name) || isNumericLiteral(name)) {
     return name.text;
@@ -2542,6 +2786,7 @@ function staticPropertyName(name: PropertyName): string | undefined {
   return undefined;
 }
 
+/** Returns the property a binding element reads: its property name, else its own name. */
 function staticBindingElementName(element: BindingElement): string | undefined {
   if (element.propertyName) return staticPropertyName(element.propertyName);
   return element.name && isIdentifier(element.name) ? element.name.text : undefined;
@@ -2549,20 +2794,26 @@ function staticBindingElementName(element: BindingElement): string | undefined {
 
 /**
  * Returns the identifier of a shorthand property. The parser only produces identifiers there,
- * but 7.1 types the name through the shared member base as any property name.
+ * but the AST types the name through the shared member base as any property name.
  */
 function shorthandName(property: ShorthandPropertyAssignment): Identifier {
   return property.name as Identifier;
 }
 
 /**
- * Returns the declared name of a function-like node. 7.1 omits `name` from the constructor and
- * arrow function types, where TS 6 typed it as always absent.
+ * Returns the declared name of a function-like node. Constructor and arrow function types have
+ * no `name` member, so they are excluded before reading it.
  */
 function functionName(node: FunctionLikeDeclaration): PropertyName | undefined {
   return isConstructorDeclaration(node) || isArrowFunction(node) ? undefined : node.name;
 }
 
+/**
+ * Reports a type whose values are all strings. An access on such a base, as in
+ * `dictionary.title.length`, reads a string member, so it marks the dictionary leaf instead of
+ * appending `length` as a key segment. `any` and `unknown` never qualify; a union needs every
+ * member to qualify and an intersection one.
+ */
 function isDefinitelyStringLike(type: Type): boolean {
   if (type.flags & (TypeFlags.Any | TypeFlags.Unknown)) return false;
   if (type.flags & TypeFlags.StringLike) return true;
@@ -2574,6 +2825,7 @@ function isDefinitelyStringLike(type: Type): boolean {
   return false;
 }
 
+/** Returns the `t` member of a returned object literal, which makes its function a hook. */
 function returnedTranslatorProperty(
   property: ObjectLiteralElementLike,
   source: SourceFile
@@ -2585,6 +2837,7 @@ function returnedTranslatorProperty(
   return name === 't' ? property.initializer : undefined;
 }
 
+/** `Object.keys`, `values` and `entries` read every key of their argument at runtime. */
 function isEnumerationCall(call: CallExpression): boolean {
   const expression = unwrapExpression(call.expression);
   return (
@@ -2594,6 +2847,7 @@ function isEnumerationCall(call: CallExpression): boolean {
   );
 }
 
+/** Reports the receiver of a further access; only the outermost access of a chain is analyzed. */
 function isObjectChainBase(node: Expression): boolean {
   const parent = node.parent;
   return (
@@ -2602,6 +2856,7 @@ function isObjectChainBase(node: Expression): boolean {
   );
 }
 
+/** Reports a value that is only stored or returned; it is analyzed where it is later read. */
 function isAliasOrReturn(node: Expression): boolean {
   const parent = node.parent;
   return (
@@ -2614,6 +2869,10 @@ function isAliasOrReturn(node: Expression): boolean {
   );
 }
 
+/**
+ * Returns the outermost source cast around a `returnObjects` call, looking through parentheses,
+ * `!` and `satisfies`, so `--remove` deletes every chained cast.
+ */
 function translationObjectCast(call: CallExpression): AsExpression | TypeAssertion | undefined {
   let expression: Expression = call;
   let result: AsExpression | TypeAssertion | undefined;
@@ -2637,6 +2896,10 @@ function translationObjectCast(call: CallExpression): AsExpression | TypeAsserti
   }
 }
 
+/**
+ * Returns an options argument cast through `any`, `unknown` or `never`, which hides
+ * `returnObjects: true` from the call's type and is reported for removal.
+ */
 function unsafeTranslationArgumentCast(
   argument: Expression
 ): AsExpression | TypeAssertion | undefined {
@@ -2673,6 +2936,11 @@ function skipCastWrappers(input: Expression): Expression {
   return expression;
 }
 
+/**
+ * Reports a `returnObjects` call whose object escapes property-level analysis. Storing it in a
+ * variable, accessing it, or returning it from a non-exported function keeps it analyzable,
+ * since the variable, the access or the function's callers are analyzed instead.
+ */
 function isUnconsumedObjectCall(call: CallExpression): boolean {
   let value: Expression = call;
   while (
@@ -2696,6 +2964,7 @@ function isUnconsumedObjectCall(call: CallExpression): boolean {
   );
 }
 
+/** Returns the innermost concrete function around a node, which scopes wrapper checks. */
 function enclosingFunction(node: Node): FunctionLikeDeclaration | undefined {
   let current: Node | undefined = node.parent;
   while (current) {
@@ -2705,6 +2974,10 @@ function enclosingFunction(node: Node): FunctionLikeDeclaration | undefined {
   return undefined;
 }
 
+/**
+ * Name-based reassignment check for functions outside the assignment index. Nested functions
+ * are not searched.
+ */
 function parameterIsReassigned(
   parameter: ParameterDeclaration,
   owner: FunctionLikeDeclaration
@@ -2712,6 +2985,7 @@ function parameterIsReassigned(
   if (!isIdentifier(parameter.name) || !owner.body) return false;
   const sourceName = parameter.name.text;
   let reassigned = false;
+  /** Stops at the first matching assignment and at nested function boundaries. */
   function visit(node: Node): void {
     const left = isBinaryExpression(node) ? unwrapExpression(node.left) : undefined;
     if (
@@ -2732,17 +3006,23 @@ function parameterIsReassigned(
 }
 
 /**
- * Reports a direct `export` modifier. The 7.1 modifier list also holds decorators, which the kind
- * check skips; `export` on an enclosing variable statement is deliberately ignored, as in v0.2.2.
+ * Reports a direct `export` modifier. The modifier list also holds decorators, which the kind
+ * check skips. Only the node's own modifiers count, so the arrow function of
+ * `export const f = () => ...` is not reported as exported.
  */
 function isExported(node: FunctionLikeDeclaration): boolean {
   return Boolean(node.modifiers?.some((modifier) => modifier.kind === SyntaxKind.ExportKeyword));
 }
 
+/**
+ * Collects a function's returned values, mirroring the inventory's return index for functions
+ * that were not inventoried.
+ */
 function returnExpressions(node: FunctionLikeDeclaration): Expression[] {
   if (!node.body) return [];
   if (!isBlock(node.body)) return [node.body];
   const expressions: Expression[] = [];
+  /** Skips nested functions, whose returns belong to them. */
   function visit(child: Node): void {
     if (isReturnStatement(child) && child.expression) {
       expressions.push(child.expression);
@@ -2755,6 +3035,7 @@ function returnExpressions(node: FunctionLikeDeclaration): Expression[] {
   return expressions;
 }
 
+/** Returns the expression of a `{...}` attribute value; string attributes have none. */
 function jsxAttributeExpression(initializer: JsxAttributeValue): Expression | undefined {
   return isJsxExpression(initializer) ? initializer.expression : undefined;
 }
@@ -2797,6 +3078,7 @@ function observationIdentity(observation: UsageObservation): string {
   ]);
 }
 
+/** Function-like nodes that can own a body; signatures and function types are excluded. */
 function isConcreteFunctionLike(node: Node): node is FunctionLikeDeclaration {
   return (
     isFunctionDeclaration(node) ||
@@ -2815,12 +3097,16 @@ function isConcreteFunctionLike(node: Node): node is FunctionLikeDeclaration {
  *
  * Every entry must be the exact node a later lookup receives, because the caches are keyed by
  * node identity. `semantic.symbol` reads a property access through its name, so the name is
- * collected in that case. Extra entries only cost batch size, and a missed node falls back to a
- * single request, so this list affects request count and never results.
+ * collected in that case. A missed node falls back to a single request, so this list affects
+ * request count and never results. Extra entries still cost server time: resolving a property
+ * name type-checks its receiver, so property accesses are listed only where a lookup always
+ * follows.
  *
- * Types are not prefetched. No type lookup in the analyzer is unconditional, and string
- * resolution deliberately skips typing keys declared with expensive i18next types; batching key
- * types up front would force exactly those computations.
+ * Key types are not prefetched. No key type lookup is unconditional, and string resolution
+ * deliberately skips typing keys declared with expensive i18next types; batching key types up
+ * front would force exactly those computations. Other types are batched elsewhere:
+ * `objectChainTypeTargets` collects the base types of access chains rooted in a dictionary or
+ * translation object, and `prefetchCallTargetTypes` the return types of call targets.
  */
 function collectSemanticTargets(inventory: SourceInventory): Node[] {
   const targets: Node[] = [];
@@ -2829,6 +3115,13 @@ function collectSemanticTargets(inventory: SourceInventory): Node[] {
   };
   const addIdentifier = (node: Node | undefined): void => {
     if (node && isIdentifier(node)) targets.push(node);
+  };
+  // expressionHasI18nextTProvenance looks up non-call initializers and returned values. Property
+  // accesses are left out: resolving their names type-checks the receiver, which costs more
+  // than the single requests it would save.
+  const addProvenanceSite = (expression: Expression): void => {
+    const value = unwrapExpression(expression);
+    if (!isCallExpression(value) && !isPropertyAccessExpression(value)) targets.push(value);
   };
   const addParameterNames = (owner: FunctionLikeDeclaration): void => {
     for (const parameter of owner.parameters) {
@@ -2844,6 +3137,8 @@ function collectSemanticTargets(inventory: SourceInventory): Node[] {
     addSymbolSite(call.expression);
     addSymbolSite(unwrapExpression(call.expression));
     // Arguments reach resolveObject for external calls and translator propagation for local ones.
+    // Property access arguments are prefetched by propagateTranslatorParameters instead, and
+    // only for calls with a local target.
     for (const argument of call.arguments) addIdentifier(unwrapExpression(argument));
   }
 
@@ -2872,7 +3167,10 @@ function collectSemanticTargets(inventory: SourceInventory): Node[] {
 
   for (const node of inventory.translatorCandidates) {
     if (!node.initializer) continue;
-    addSymbolSite(unwrapExpression(node.initializer));
+    const initializer = unwrapExpression(node.initializer);
+    addSymbolSite(initializer);
+    // isPotentialTranslatorExpression also looks up a property access as a whole.
+    if (isPropertyAccessExpression(initializer)) targets.push(initializer);
     addIdentifier(node.name);
     if (isObjectBindingPattern(node.name)) {
       for (const element of node.name.elements) addIdentifier(element.name);
@@ -2883,6 +3181,10 @@ function collectSemanticTargets(inventory: SourceInventory): Node[] {
   }
 
   for (const assignment of inventory.assignments) addIdentifier(unwrapExpression(assignment.left));
+  for (const initializer of inventory.variableInitializers) addProvenanceSite(initializer);
+  for (const returned of inventory.returnsByFunction.values()) {
+    for (const expression of returned) addProvenanceSite(expression);
+  }
 
   for (const owner of inventory.functions) {
     // symbolForFunction keys hooks and wrappers by the function name, or by the variable name
@@ -2893,5 +3195,25 @@ function collectSemanticTargets(inventory: SourceInventory): Node[] {
     addParameterNames(owner);
   }
 
+  return targets;
+}
+
+/**
+ * Lists the shorthand properties whose value symbol analysis reads: those of returned object
+ * literals, which hook wrapper discovery inspects for `t`, and those of object literal call
+ * arguments, which option and projected-object resolution read. Like
+ * {@link collectSemanticTargets}, this list affects request count and never results.
+ */
+function collectShorthandTargets(inventory: SourceInventory): Node[] {
+  const targets: Node[] = [];
+  const addObject = (expression: Expression): void => {
+    const value = unwrapExpression(expression);
+    if (!isObjectLiteralExpression(value)) return;
+    for (const property of value.properties) {
+      if (isShorthandPropertyAssignment(property)) targets.push(property);
+    }
+  };
+  for (const returned of inventory.returnsByFunction.values()) returned.forEach(addObject);
+  for (const call of inventory.calls) call.arguments.forEach(addObject);
   return targets;
 }

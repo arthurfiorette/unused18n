@@ -258,12 +258,17 @@ function uniqueBarriers(
   return [...new Set(propertyChain.flatMap((property) => property.barriers))];
 }
 
+/** Only plain and shorthand property assignments are deleted as a unit; other members stay. */
 function isSupportedProperty(
   node: ObjectLiteralElementLike
 ): node is PropertyAssignment | ShorthandPropertyAssignment {
   return isPropertyAssignment(node) || isShorthandPropertyAssignment(node);
 }
 
+/**
+ * Turns each run of adjacent selected properties in one object literal into a single range, so
+ * the commas between them go with the deletion.
+ */
 function editsForProperties(
   sourceFile: SourceFile,
   selected: ReadonlySet<ObjectLiteralElementLike>
@@ -302,6 +307,10 @@ function editsForProperties(
   return edits.sort((left, right) => left.start - right.start);
 }
 
+/**
+ * Picks the comma that leaves with a run of properties: the one after it when a property
+ * follows, else the one before it, else a trailing comma, so the remaining list stays valid.
+ */
 function removalRange(
   sourceFile: SourceFile,
   properties: readonly ObjectLiteralElementLike[],
@@ -337,6 +346,10 @@ function removalRange(
   };
 }
 
+/**
+ * Requires the comma between two properties; its absence means the plan no longer matches the
+ * text, so planning fails.
+ */
 function commaBetween(
   sourceFile: SourceFile,
   start: number,
@@ -357,7 +370,8 @@ function findCommaBetween(
   end: number
 ): { start: number; end: number } | undefined {
   const scanner = createScanner(true, sourceFile.languageVariant, sourceFile.text);
-  // resetTokenState and getTokenEnd mirror TS 6 setTextPos and getTextPos, so ranges stay identical.
+  // getTokenEnd is the scan position: `start` right after resetTokenState, then the end of each
+  // scanned token, so scanning stops after the first token that ends at or past `end`.
   scanner.resetTokenState(start);
   while (scanner.getTokenEnd() < end) {
     const token = scanner.scan();

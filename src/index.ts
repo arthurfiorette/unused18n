@@ -86,6 +86,10 @@ export default class Unused18n extends Command {
 
   static override flags = cliFlags;
 
+  /**
+   * Flags override the config file. Diagnostics stream to the reporter as lint yields them, and
+   * the exit code becomes 1 once any error or unused key appears.
+   */
   async run(): Promise<void> {
     const { flags } = await this.parse(Unused18n);
     let fileConfig: Unused18nConfig;

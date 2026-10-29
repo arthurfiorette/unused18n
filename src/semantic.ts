@@ -23,11 +23,18 @@ import {
 /** Generators per `api.batch` call; far below the engine's argument-spread limit. */
 const BATCH_CHUNK_SIZE = 4_096;
 
-/** Request accounting used by debug output and tests to spot per-node IPC regressions. */
+/**
+ * Lookup accounting used by debug output and tests to spot per-node IPC regressions.
+ *
+ * The counts approximate compiler traffic without matching it exactly. Methods called on
+ * `Type`, `Symbol` and `Signature` objects, such as `getTypes` or `getCallSignatures`, bypass
+ * this class and are not counted. Declaration lookups are counted even when the declaring file
+ * is already in this process and no request is sent.
+ */
 export interface SemanticStats {
-  /** Lookups that missed every cache and paid one IPC round trip on their own. */
+  /** Lookups through this class that missed its caches and were resolved one at a time. */
   singleRequests: number;
-  /** Batched requests issued by prefetching, each covering many lookups. */
+  /** Batched lookups issued by prefetching, one per batch chunk, each covering many nodes. */
   batchRequests: number;
 }
 
@@ -78,8 +85,8 @@ export class Semantic {
     this.program = program;
   }
 
-  /** The checker of {@link program}, exposed for the few uncached, cold-path queries. */
-  get checker(): Checker {
+  /** The checker of {@link program}; every query goes through a method of this class. */
+  private get checker(): Checker {
     return this.program.getProject().checker;
   }
 
@@ -310,6 +317,30 @@ export class Semantic {
     return property;
   }
 
+  /**
+   * Returns the symbol the binder declared for `node`, such as the module symbol of a JSON file,
+   * which has no name node to look up. Uncached: dictionary reading asks once per dictionary.
+   */
+  symbolOfNode(node: Node): TsSymbol | undefined {
+    this.stats.singleRequests += 1;
+    return this.checker.getSymbolOfNode(node);
+  }
+
+  /** Returns the exports of a module symbol. Uncached for the same reason as {@link symbolOfNode}. */
+  exportsOfModule(symbol: TsSymbol): readonly TsSymbol[] {
+    this.stats.singleRequests += 1;
+    return this.checker.getExportsOfModule(symbol);
+  }
+
+  /**
+   * Returns the type of `symbol` as seen at `location`. Uncached for the same reason as
+   * {@link symbolOfNode}.
+   */
+  typeOfSymbolAtLocation(symbol: TsSymbol, location: Node): Type {
+    this.stats.singleRequests += 1;
+    return this.checker.getTypeOfSymbolAtLocation(symbol, location);
+  }
+
   /** Returns whether a source file is one of the compiler's bundled `lib.*.d.ts` files. */
   isDefaultLibrary(sourceFile: SourceFile): boolean {
     const cached = this.defaultLibraries.get(sourceFile);
@@ -334,7 +365,32 @@ export class Semantic {
     pending.forEach((node, index) => {
       this.rawSymbols.set(node, symbols[index] ?? null);
     });
+    this.resolveFetchedSymbols(symbols);
+  }
 
+  /**
+   * Resolves the value symbols of many shorthand property assignments in one batched request,
+   * then their alias targets and declarations as {@link prefetchSymbols} does.
+   *
+   * @param nodes Shorthand property assignments; duplicates and already-cached nodes are skipped.
+   */
+  prefetchShorthandSymbols(nodes: Iterable<Node>): void {
+    const pending = [...new Set(nodes)].filter((node) => !this.shorthandSymbols.has(node));
+    if (pending.length === 0) return;
+    const symbols = this.batch(pending, (node) =>
+      this.checker.getShorthandAssignmentValueSymbol.gen(node)
+    );
+    pending.forEach((node, index) => {
+      this.shorthandSymbols.set(node, symbols[index] ?? null);
+    });
+    this.resolveFetchedSymbols(symbols);
+  }
+
+  /**
+   * Fills the alias and declaration caches for symbols a prefetch just returned, so the lookups
+   * that typically follow a symbol lookup are local too.
+   */
+  private resolveFetchedSymbols(symbols: readonly (TsSymbol | undefined)[]): void {
     const resolved = new Set<TsSymbol>();
     const aliases = new Set<TsSymbol>();
     for (const symbol of symbols) {
@@ -361,6 +417,50 @@ export class Semantic {
         symbol.declarations.every((handle) => this.loadedPaths.has(handle.path))
       )
     );
+  }
+
+  /**
+   * Batches {@link typeFromTypeNode} for many type nodes.
+   *
+   * @param nodes Type nodes in any order; duplicates and already-cached nodes are skipped.
+   */
+  prefetchTypesFromTypeNodes(nodes: Iterable<TypeNode>): void {
+    this.prefetchInto<TypeNode, Type>(this.typeNodeTypes, nodes, (node) =>
+      this.checker.getTypeFromTypeNode.gen(node)
+    );
+  }
+
+  /**
+   * Batches {@link signatureFromDeclaration} and then {@link returnType} for many declarations,
+   * one round trip each.
+   *
+   * @param declarations Function-like declarations; duplicates and cached entries are skipped.
+   */
+  prefetchReturnTypes(declarations: Iterable<Node>): void {
+    const unique = [...new Set(declarations)];
+    this.prefetchInto(this.signaturesFromDeclarations, unique, (declaration) =>
+      this.checker.getSignatureFromDeclaration.gen(declaration)
+    );
+    const signatures = unique.flatMap((declaration) => {
+      const signature = this.signaturesFromDeclarations.get(declaration);
+      return signature ? [signature] : [];
+    });
+    this.prefetchInto(this.returnTypes, signatures, (signature) =>
+      this.checker.getReturnTypeOfSignature.gen(signature)
+    );
+  }
+
+  /** Fills `cache` for every key it lacks through {@link batch}. */
+  private prefetchInto<Key, Value>(
+    cache: { has(key: Key): boolean; set(key: Key, value: Value): unknown },
+    keys: Iterable<Key>,
+    toGenerator: (key: Key) => APIRequestGenerator<Value>
+  ): void {
+    const pending = [...new Set(keys)].filter((key) => !cache.has(key));
+    const values = this.batch(pending, toGenerator);
+    pending.forEach((key, index) => {
+      cache.set(key, values[index] as Value);
+    });
   }
 
   /**

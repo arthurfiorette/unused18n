@@ -53,6 +53,10 @@ export function createReporter(options: ReporterOptions): Reporter {
   }
 
   return {
+    /**
+     * Summaries always print. Progress is throttled, and stage timings, semantic counts and
+     * cache details print only at debug level, except cache errors.
+     */
     event(event) {
       if (event.type === 'summary') {
         const values = [
@@ -116,6 +120,10 @@ export function createReporter(options: ReporterOptions): Reporter {
         operational(formatCacheEvent(event.event));
       }
     },
+    /**
+     * Unused and removed keys appear only as summary counts. Every other diagnostic prints in
+     * TypeScript's format, with code frames when color is enabled.
+     */
     diagnostic(diagnostic) {
       if (
         diagnostic.code === DiagnosticCode.UnusedKey ||

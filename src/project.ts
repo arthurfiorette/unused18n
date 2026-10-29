@@ -1,12 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { SourceFile } from 'typescript/ast';
-import {
-  API,
-  type Diagnostic,
-  DiagnosticCategory,
-  type Program
-} from 'typescript/sync';
+import { API, type Diagnostic, DiagnosticCategory, type Program } from 'typescript/sync';
 import { DiagnosticCode } from './diagnostic-codes.js';
 import { diagnosticWithoutFile, flattenDiagnosticText } from './diagnostics.js';
 import { Semantic } from './semantic.js';
@@ -14,8 +9,9 @@ import { Semantic } from './semantic.js';
 /**
  * One compiler process and program shared by diagnostics, semantic analysis, and optional fixes.
  *
- * Disposing closes the compiler process. Nodes stay readable afterwards, but every checker
- * query, including lazy ones behind {@link semantic}, throws once disposed.
+ * Disposing closes the compiler process; disposing again does nothing. Nodes stay readable
+ * afterwards, but every checker query, including lazy ones behind {@link semantic}, throws once
+ * disposed.
  */
 export interface LoadedProject extends Disposable {
   api: API;
@@ -121,6 +117,7 @@ export function loadProjectWithDiagnostics(
     const sourceFiles = semantic
       .prefetchSourceFiles(fileNames.filter((fileName) => isApplicationFileName(fileName)))
       .filter((sourceFile): sourceFile is SourceFile => sourceFile !== undefined);
+    let closed = false;
     return {
       loaded: {
         api,
@@ -129,7 +126,10 @@ export function loadProjectWithDiagnostics(
         configPath,
         fileNames,
         sourceFiles,
+        /** lint closes early and again in a `finally`; only the first call reaches the API. */
         [Symbol.dispose]() {
+          if (closed) return;
+          closed = true;
           closeQuietly(api);
         }
       },

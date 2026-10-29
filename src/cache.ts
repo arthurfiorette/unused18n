@@ -172,6 +172,10 @@ export function prepareAnalysisCache(
     cachedFacts
   );
 
+  /**
+   * Packages one reuse decision. `write` closes over the snapshot taken above, so the persisted
+   * hashes and edges describe exactly the sources this run analyzed.
+   */
   function prepared(
     event: CacheEvent,
     dirty: Set<string>,
@@ -180,6 +184,10 @@ export function prepareAnalysisCache(
     return {
       event,
       reuse: { dictionaries, cachedFacts: reusable, filesToAnalyze: dirty },
+      /**
+       * Stores fresh and replayed facts together. Sources without facts get an empty entry, so
+       * the next run sees them as known and unchanged.
+       */
       write(sourceFacts) {
         const facts = new Map(sourceFacts.map((entry) => [path.resolve(entry.fileName), entry]));
         const sources = Object.fromEntries(
@@ -436,6 +444,10 @@ function writeEntry(fileName: string, entry: CacheEntry): void {
   }
 }
 
+/**
+ * Validates an entry read from disk. Any version mismatch, including the TypeScript version,
+ * makes the whole entry unusable because facts may depend on checker behavior.
+ */
 function isCacheEntry(value: unknown): value is CacheEntry {
   if (!isRecord(value) || !isRecord(value.sources)) return false;
   if (
@@ -503,8 +515,8 @@ function isEvidence(value: unknown): boolean {
  * Global scripts and module augmentations can affect files without resolvable import edges.
  *
  * The binder records both `declare global {}` and `declare module "x" {}` of a module in
- * `moduleAugmentations` while plain namespaces never appear there, so no AST walk is needed;
- * 7.x no longer exposes the `GlobalAugmentation` node flag that walk depended on.
+ * `moduleAugmentations` while plain namespaces never appear there, so the check needs no AST
+ * walk.
  */
 function affectsGlobalScope(source: SourceFile): boolean {
   return !isExternalModule(source) || source.moduleAugmentations.length > 0;
@@ -516,7 +528,10 @@ function hashCanonical(value: unknown): string {
   return digest.digest('hex');
 }
 
-/** Streams the same canonical JSON bytes previously materialized as one large string. */
+/**
+ * Feeds canonical JSON (sorted keys, `undefined` members dropped) to the digest in pieces, so
+ * large inputs such as dictionary key lists never become one string.
+ */
 function updateCanonicalHash(digest: ReturnType<typeof createHash>, value: unknown): void {
   if (Array.isArray(value)) {
     digest.update('[');
@@ -544,6 +559,10 @@ function updateCanonicalHash(digest: ReturnType<typeof createHash>, value: unkno
   digest.update(value === undefined ? 'null' : JSON.stringify(value));
 }
 
+/**
+ * Fingerprints source contents. Raw bytes are accepted so external files read from disk are
+ * hashed without decoding them first.
+ */
 function hash(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
 }

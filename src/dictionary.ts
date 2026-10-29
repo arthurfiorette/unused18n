@@ -111,8 +111,8 @@ export function readDictionary(
     }
     const statement = sourceFile.statements.find(isExpressionStatement);
     // A JSON file binds one synthetic `export=` symbol, reachable only through the file symbol.
-    const jsonSymbol = semantic.checker
-      .getSymbolOfNode(sourceFile)
+    const jsonSymbol = semantic
+      .symbolOfNode(sourceFile)
       ?.getExports()
       .get(InternalSymbolName.ExportEquals);
     if (!statement || !jsonSymbol) {
@@ -124,7 +124,7 @@ export function readDictionary(
     exportName = 'default';
   } else {
     const moduleSymbol = semantic.rawSymbol(sourceFile);
-    const exports = moduleSymbol ? semantic.checker.getExportsOfModule(moduleSymbol) : [];
+    const exports = moduleSymbol ? semantic.exportsOfModule(moduleSymbol) : [];
     // Only the handle's presence matters here, so it is never resolved.
     const valueExports = exports.filter(
       (candidate) => semantic.aliased(candidate)?.valueDeclaration
@@ -153,8 +153,8 @@ export function readDictionary(
     const exportAssignment = resolvedDeclarations.find(isExportAssignment);
     const resolvedDeclaration = variableDeclaration ?? exportAssignment;
     const resolvedInitializer = variableDeclaration?.initializer ?? exportAssignment?.expression;
-    // TS 6 mapped an unresolvable alias to the declaration-less unknown symbol, which failed here
-    // too; `aliased` returns `undefined` instead, so it joins the same error for parity.
+    // An unresolvable alias makes `aliased` return `undefined`, which reports the same error as
+    // an export without an initialized declaration.
     if (!resolvedSymbol || !resolvedDeclaration || !resolvedInitializer) {
       throw new Error(
         `Export "${exportName}" must resolve to an initialized dictionary expression`
@@ -178,10 +178,12 @@ export function readDictionary(
     sourceFile,
     declaration,
     symbol,
+    /**
+     * Lazy because most analyses never compare dictionary types and each query is an IPC call.
+     * Only analysis reads it, while the compiler process is still open.
+     */
     get declaredType() {
-      // Lazy because most analyses never compare dictionary types, and each query is an IPC call.
-      if (!declaredType)
-        declaredType = semantic.checker.getTypeOfSymbolAtLocation(symbol, declaration);
+      if (!declaredType) declaredType = semantic.typeOfSymbolAtLocation(symbol, declaration);
       return declaredType;
     },
     keys: new Set(keySources.keys()),
@@ -302,7 +304,7 @@ function flattenExpression(
         }
 
         if (isShorthandPropertyAssignment(property)) {
-          // The parser only builds identifier names here, but the 7.1 type admits any PropertyName.
+          // The parser only builds identifier names here, but the AST type admits any PropertyName.
           if (!isIdentifier(property.name)) continue;
           const name = property.name.text;
           prefix.push(name);
@@ -445,6 +447,10 @@ function withBarrier(
     : { ...property, barriers: [...property.barriers, barrier] };
 }
 
+/**
+ * Barriers that follow from where a property is declared: inside an object other code shares,
+ * or in a file other than the dictionary.
+ */
 function sourceBarriers(
   property: ObjectLiteralElementLike,
   dictionarySourceFile: SourceFile,

@@ -78,6 +78,11 @@ export function createStringResolver(
 ): StringResolver {
   const cache = new WeakMap<Expression, StringResolution>();
 
+  /**
+   * Entry point for every key, prefix and option expression the analyzer resolves. Only
+   * top-level calls are cached: a nested result depends on `seen`, which cuts recursion through
+   * mutually referencing declarations.
+   */
   function resolve(input: Expression, seen = new Set<Node>()): StringResolution {
     if (seen.size === 0) {
       const cached = cache.get(input);
@@ -89,6 +94,12 @@ export function createStringResolver(
     return resolveUncached(input, seen);
   }
 
+  /**
+   * Tries the cheapest source of values first: literal syntax, templates, conditionals and `+`
+   * need no checker. Next comes the checker type, skipped for values declared with expensive
+   * i18next types. When the type yields no complete value set, it follows declarations,
+   * assignments, element accesses and call returns. Asserted types merge into every branch.
+   */
   function resolveUncached(input: Expression, seen: Set<Node>): StringResolution {
     const expression = unwrapExpression(input);
     if (seen.has(expression)) return unresolved();
@@ -152,6 +163,7 @@ export function createStringResolver(
           const declaration = semantic.valueDeclaration(symbol) ?? semantic.declarations(symbol)[0];
           const owner = declaration ? enclosingFunction(declaration) : undefined;
           const body = owner?.body ?? expression.getSourceFile();
+          /** Collects `symbol = value` assignments; used only when no assignment index exists. */
           function visitAssignment(node: Node): void {
             if (
               isBinaryExpression(node) &&
@@ -178,8 +190,8 @@ export function createStringResolver(
     }
 
     if (isCallExpression(expression)) {
-      // A failed overload resolution maps to `undefined`; TS 6 returned a signature whose error
-      // return type resolved to nothing, so both paths fall through to the declaration walk.
+      // A failed overload resolution maps to `undefined` and falls through to the declaration
+      // walk, the same as a resolved signature whose return type yields no string.
       const signature = semantic.resolvedSignature(expression);
       const returnType = signature ? semantic.returnType(signature) : undefined;
       const returnResolution = returnType ? resolveType(returnType) : unresolved();
@@ -193,6 +205,7 @@ export function createStringResolver(
             result = merge(result, resolve(returned, nextSeen));
           }
         } else {
+          /** Collects return values outside nested functions when no return index exists. */
           function visit(node: Node): void {
             if (isReturnStatement(node) && node.expression) {
               result = merge(result, resolve(node.expression, nextSeen));
@@ -210,11 +223,20 @@ export function createStringResolver(
     return typeResolution.values.size > 0 ? typeResolution : unresolved();
   }
 
+  /**
+   * Reads the values of a source cast such as `key as 'a' | 'b'` from its written type, so a
+   * cast key resolves even when the expression's own type is wider.
+   */
   function resolveAssertedType(input: Expression): StringResolution {
     if (!isSourceAssertion(input)) return empty();
     return resolveTypeNode(input.type, new Set());
   }
 
+  /**
+   * Reads literal unions from type syntax, following type aliases through their declarations.
+   * Asserted types are read this way so a cast never asks the checker to compute a type;
+   * `seen` stops recursive aliases.
+   */
   function resolveTypeNode(node: TypeNode, seen: Set<Node>): StringResolution {
     if (seen.has(node)) return unresolved();
     seen.add(node);
@@ -237,13 +259,26 @@ export function createStringResolver(
     return unresolved();
   }
 
+  /**
+   * Reports a value declared with i18next's conditional or mapped key types. Typing such a
+   * value makes the checker expand those types over the whole dictionary, so resolveUncached
+   * skips the type and follows declarations instead. Only identifiers and property accesses
+   * reach a declaration here; other expressions have no symbol, so they return early without a
+   * lookup.
+   */
   function shouldAvoidSemanticType(expression: Expression): boolean {
+    if (!isIdentifier(expression) && !isPropertyAccessExpression(expression)) return false;
     return semantic.declarations(semantic.symbol(expression)).some((declaration) => {
       const type = declaredTypeNode(declaration);
       return type ? isExpensiveTypeNode(type, new Set()) : false;
     });
   }
 
+  /**
+   * Reports conditional, mapped, indexed access or `keyof` type syntax declared in i18next's own
+   * files, reached directly or through type aliases. The same syntax in application code is
+   * typed normally. `seen` stops recursive aliases.
+   */
   function isExpensiveTypeNode(node: TypeNode, seen: Set<Node>): boolean {
     if (seen.has(node)) return false;
     seen.add(node);
@@ -263,6 +298,7 @@ export function createStringResolver(
     return false;
   }
 
+  /** Unresolved spans become `*` wildcards, so a template still yields a matchable pattern. */
   function resolveTemplate(expression: TemplateExpression, seen: Set<Node>): StringResolution {
     let result = exact(expression.head.text);
     for (const span of expression.templateSpans) {
@@ -317,6 +353,7 @@ export function createStringResolver(
   return { resolve };
 }
 
+/** Returns the written annotation of the declaration kinds that can carry one, if present. */
 function declaredTypeNode(declaration: Declaration): TypeNode | undefined {
   if (
     isVariableDeclaration(declaration) ||
@@ -329,6 +366,7 @@ function declaredTypeNode(declaration: Declaration): TypeNode | undefined {
   return undefined;
 }
 
+/** Returns the function whose body scopes the assignment scan for an unindexed variable. */
 function enclosingFunction(node: Node): FunctionLikeDeclaration | undefined {
   let current: Node | undefined = node.parent;
   while (current) {
@@ -356,6 +394,7 @@ function resolveFunctionLike(
   return undefined;
 }
 
+/** Function-like nodes that can own a body; signatures and function types are excluded. */
 function isConcreteFunctionLike(node: Node): node is FunctionLikeDeclaration {
   return (
     isFunctionDeclaration(node) ||

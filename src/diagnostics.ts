@@ -2,7 +2,7 @@ import type { Node, SourceFile } from 'typescript/ast';
 import type { Diagnostic, DiagnosticCategory } from 'typescript/sync';
 
 /** Code prefix printed by TypeScript's formatters, e.g. `error U18N95001: ...`. */
-export const DIAGNOSTIC_SOURCE = 'U18N';
+const DIAGNOSTIC_SOURCE = 'U18N';
 
 /**
  * Creates an unused18n diagnostic covering `[start, end)` in `sourceFile`.
@@ -65,6 +65,7 @@ export function diagnosticWithoutFile(
  */
 export function flattenDiagnosticText(diagnostic: Diagnostic, newLine = '\n'): string {
   const lines: string[] = [];
+  /** Appends one line per chain entry, depth first, so nested reasons follow their parent. */
   function visit(current: Diagnostic, depth: number): void {
     lines.push(`${'  '.repeat(depth)}${current.text}`);
     for (const child of current.messageChain ?? []) visit(child, depth + 1);

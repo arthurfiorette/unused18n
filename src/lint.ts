@@ -64,7 +64,10 @@ export type LintEvent =
     }
   | { type: 'file-progress'; fileName: string; completedFiles: number; totalFiles: number }
   | { type: 'cache'; event: CacheEvent }
-  /** Compiler requests issued by the semantic layer up to the end of analysis. */
+  /**
+   * Semantic-layer lookups up to the end of analysis: cache misses resolved one at a time and
+   * batched prefetches. They approximate compiler requests; see `SemanticStats` in semantic.ts.
+   */
   | { type: 'semantic'; singleRequests: number; batchRequests: number };
 
 export interface LintOptions
@@ -88,9 +91,10 @@ export { DiagnosticCode };
  * optional edits, and diagnostic production in one compiler process.
  *
  * The compiler process is spawned only once iteration reaches project loading, so a `lint()`
- * call that is never iterated starts nothing. From then on the generator owns the process and
- * closes it in a `finally`, which also runs when the consumer stops early through `return()`
- * or an exception. Yielded diagnostics are plain data and stay valid after the process exits.
+ * call that is never iterated starts nothing. The generator closes the process before it yields
+ * the first diagnostic, so an iterator abandoned at any `yield` holds no process. A `finally`
+ * also closes it when loading or analysis throws. Yielded diagnostics are plain data and stay
+ * valid after the process exits.
  */
 export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
   const now = options.now ?? performance.now.bind(performance);
@@ -141,11 +145,18 @@ export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
     projectPath,
     targets.map((target) => target.path)
   );
+  // Every path closes the compiler process before its first `yield`. A consumer that abandons
+  // the iterator without `return()` never resumes it, so neither code after a `yield` nor the
+  // `finally` below would ever run to close the process.
+  const closeCompiler = (): void => project.loaded?.[Symbol.dispose]();
   try {
     stage('project', 'end');
-    yield* project.diagnostics;
     const loaded = project.loaded;
-    if (!loaded) return;
+    // Without a project, loadProjectWithDiagnostics has already closed the process.
+    if (!loaded) {
+      yield* project.diagnostics;
+      return;
+    }
 
     // One batched request instead of three round trips to the compiler process.
     const [configDiagnostics, programDiagnostics, syntacticDiagnostics] = loaded.api.batch(
@@ -158,10 +169,11 @@ export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
       ...programDiagnostics,
       ...syntacticDiagnostics
     ];
-    yield* compilerDiagnostics;
     if (
       compilerDiagnostics.some((diagnostic) => diagnostic.category === DiagnosticCategory.Error)
     ) {
+      closeCompiler();
+      yield* compilerDiagnostics;
       return;
     }
     emit({ type: 'phase', phase: 'analysis' });
@@ -207,6 +219,8 @@ export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
       );
     } catch (error) {
       if (dictionaryStageOpen) stage('dictionary', 'end');
+      closeCompiler();
+      yield* compilerDiagnostics;
       yield diagnosticWithoutFile(
         DiagnosticCode.ConfigurationFailure,
         DiagnosticCategory.Error,
@@ -220,6 +234,15 @@ export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
       batchRequests: loaded.semantic.stats.batchRequests
     });
     emit({ type: 'phase', phase: 'results' });
+    // Evidence is serializable and may come from the cache, so it carries only file positions.
+    // The files it points at are the last compiler data needed: from here on, diagnostics and
+    // edits read only AST nodes and text, which stay readable once the process is closed.
+    const evidenceFiles = sourceFilesForEvidence(loaded.semantic, loaded.configPath, [
+      ...analysis.unresolvedReferences,
+      ...analysis.translationObjectCasts
+    ]);
+    closeCompiler();
+    yield* compilerDiagnostics;
     let unusedKeyCount = 0;
     for (const { result } of analysis.analyses) {
       for (const key of result.keys) {
@@ -229,13 +252,13 @@ export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
 
     if (analysis.unresolvedReferences.length > 0) {
       for (const warning of analysis.unresolvedReferences) {
-        yield diagnosticFromEvidence(loaded.semantic, loaded.configPath, warning);
+        yield diagnosticFromEvidence(evidenceFiles, loaded.configPath, warning);
       }
     }
     if (!options.remove) {
       for (const cast of analysis.translationObjectCasts) {
         yield diagnosticFromEvidence(
-          loaded.semantic,
+          evidenceFiles,
           loaded.configPath,
           cast,
           DiagnosticCode.TranslationObjectCast,
@@ -266,12 +289,12 @@ export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
     const castRemoval = planTranslationObjectCastRemoval(
       analysis.translationObjectCasts,
       loaded.configPath,
-      loaded.semantic
+      evidenceFiles
     );
     if (castRemoval.failures.length > 0) {
       for (const failure of castRemoval.failures) {
         yield diagnosticFromEvidence(
-          loaded.semantic,
+          evidenceFiles,
           loaded.configPath,
           failure,
           DiagnosticCode.RemovalFailure,
@@ -381,9 +404,8 @@ export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
       removedCasts: castRemoval.edits.length
     });
   } finally {
-    // Runs on normal completion, early `return()` from the consumer, and thrown errors alike,
-    // so the compiler process never outlives the iteration that started it.
-    project.loaded?.[Symbol.dispose]();
+    // Covers exceptions thrown before the explicit close; closing twice is a no-op.
+    closeCompiler();
   }
 
   /** Persists fresh source facts unless the cache was disabled or every file was reused. */
@@ -507,20 +529,44 @@ function removalFailureDiagnostic(
   );
 }
 
+/** Resolves an evidence location, which is relative to the project directory, to an absolute path. */
+function evidencePath(configPath: string, evidence: UsageEvidence): string {
+  return path.resolve(path.dirname(configPath), evidence.file);
+}
+
+/**
+ * Fetches the program source files that evidence points at, keyed by {@link evidencePath}, in
+ * one batched request. lint runs this before closing the compiler process, so relocating
+ * evidence afterwards needs no compiler access. Files outside the program are left out.
+ */
+function sourceFilesForEvidence(
+  semantic: Semantic,
+  configPath: string,
+  evidence: readonly UsageEvidence[]
+): ReadonlyMap<string, SourceFile> {
+  const fileNames = [...new Set(evidence.map((entry) => evidencePath(configPath, entry)))];
+  const files = new Map<string, SourceFile>();
+  semantic.prefetchSourceFiles(fileNames).forEach((file, index) => {
+    if (file) files.set(fileNames[index]!, file);
+  });
+  return files;
+}
+
 /**
  * Turns cast evidence back into source edits. Evidence carries only file, line and column, so
- * each cast is relocated in the program's current source file before it is edited.
+ * each cast is relocated in the program's source file before it is edited.
+ *
+ * @param files Source files from {@link sourceFilesForEvidence}; a missing file fails the cast.
  */
 function planTranslationObjectCastRemoval(
   casts: readonly UsageEvidence[],
   configPath: string,
-  semantic: Semantic
+  files: ReadonlyMap<string, SourceFile>
 ): { edits: DictionaryRemovalEdit[]; failures: UsageEvidence[] } {
   const edits: DictionaryRemovalEdit[] = [];
   const failures: UsageEvidence[] = [];
   for (const evidence of casts) {
-    const fileName = path.resolve(path.dirname(configPath), evidence.file);
-    const file = semantic.sourceFile(fileName);
+    const file = files.get(evidencePath(configPath, evidence));
     const line = file
       ? Math.max(0, Math.min(evidence.line - 1, file.getLineStarts().length - 1))
       : 0;
@@ -609,16 +655,18 @@ function propertyNameNode(property: ObjectLiteralElementLike): Node {
  * Rebuilds a positioned diagnostic from serializable evidence, which may come from the analysis
  * cache. The span covers the cast or call starting at the evidence column, or the rest of the
  * line (at least one character) when neither is found there.
+ *
+ * @param files Source files from {@link sourceFilesForEvidence}; a missing file yields a
+ *   diagnostic without a location.
  */
 function diagnosticFromEvidence(
-  semantic: Semantic,
+  files: ReadonlyMap<string, SourceFile>,
   configPath: string,
   evidence: UsageEvidence,
   code: number = DiagnosticCode.UnresolvedReference,
   category: DiagnosticCategory = DiagnosticCategory.Warning
 ): Diagnostic {
-  const absolutePath = path.resolve(path.dirname(configPath), evidence.file);
-  const file = semantic.sourceFile(absolutePath);
+  const file = files.get(evidencePath(configPath, evidence));
   if (!file) {
     return diagnosticWithoutFile(code, category, evidence.reason);
   }
@@ -634,6 +682,7 @@ function diagnosticFromEvidence(
 /** Finds the outermost call expression whose first token begins exactly at `start`. */
 function callExpressionStartingAt(file: SourceFile, start: number): CallExpression | undefined {
   let result: CallExpression | undefined;
+  /** Prunes subtrees that end before `start` or begin after it. */
   function visit(node: Node): void {
     if (result || node.end < start || node.getStart(file) > start) return;
     if (isCallExpression(node) && node.getStart(file) === start) {
@@ -652,6 +701,7 @@ function castExpressionStartingAt(
   start: number
 ): AsExpression | TypeAssertion | undefined {
   let result: AsExpression | TypeAssertion | undefined;
+  /** Prunes subtrees that end before `start` or begin after it. */
   function visit(node: Node): void {
     if (result || node.end < start || node.getStart(file) > start) return;
     if (isSourceAssertion(node) && node.getStart(file) === start) {

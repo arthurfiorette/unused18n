@@ -223,7 +223,7 @@ for (const diagnostic of lint({
 
 Every `Diagnostic` has `code`, `category`, `text`, and `pos`/`end` offsets, plus an optional `source` prefix and nested `messageChain`. Diagnostics attached to a file also carry `fileName`, zero-based `startPosition` and `endPosition` line/character pairs, and the `sourceLines` used to render a code frame. `unused18n` diagnostics set `source` to `'U18N'`. Diagnostics are plain data and stay valid after iteration ends.
 
-`lint()` starts the compiler process when iteration begins and closes it when iteration finishes, throws, or is stopped with `return()`. `for...of` calls `return()` on `break`; if you drive the generator with `next()` and stop early, call `return()` yourself so the compiler process exits.
+`lint()` starts the compiler process on the first `next()` call and closes it before yielding the first diagnostic, or when loading or analysis throws. Stopping iteration early, with or without `return()`, leaves no compiler process running.
 
 ### `LintOptions`
 
@@ -241,7 +241,7 @@ Every `Diagnostic` has `code`, `category`, `text`, and `pos`/`end` offsets, plus
 | `onEvent`          | `(event: LintEvent) => void`  | No callback                                          |
 | `now`              | `() => number`                | `performance.now`                                    |
 
-The package exports `lint`, `DiagnosticCode`, and the `Diagnostic`, `LintOptions`, `Unused18nConfig`, `LintEvent`, `LogLevel`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary. `LintEvent` includes final key statistics plus start/end timestamps for the `project`, `dictionary`, `discovery`, `usage`, `replay`, and `removal` stages. After analysis, a `semantic` event reports how many compiler requests were sent one at a time (`singleRequests`) and in batches (`batchRequests`). The CLI prints stage durations and semantic request counts only at debug level (`--log-level debug` or `--cache-stats`).
+The package exports `lint`, `DiagnosticCode`, and the `Diagnostic`, `LintOptions`, `Unused18nConfig`, `LintEvent`, `LogLevel`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary. `LintEvent` includes final key statistics plus start/end timestamps for the `project`, `dictionary`, `discovery`, `usage`, `replay`, and `removal` stages. After analysis, a `semantic` event reports how many semantic lookups missed the cache and were resolved one at a time (`singleRequests`) and how many batched lookups ran (`batchRequests`). They approximate compiler requests: some counted lookups are answered without one, and queries on type and symbol objects are not counted. The CLI prints stage durations and semantic request counts only at debug level (`--log-level debug` or `--cache-stats`).
 
 ## Migrating from 0.2
 

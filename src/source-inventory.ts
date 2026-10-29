@@ -81,6 +81,8 @@ export interface SourceInventory {
   assignments: AssignmentEntry[];
   translatorCandidates: VariableDeclaration[];
   usageNodes: SourceUsageNode[];
+  /** Initializers of every variable declaration, as written, for symbol prefetching. */
+  variableInitializers: Expression[];
 }
 
 /** Collects syntax-only facts in source order without invoking the type checker. */
@@ -92,8 +94,10 @@ export function inventorySource(sourceFile: SourceFile): SourceInventory {
   const assignments: AssignmentEntry[] = [];
   const translatorCandidates: VariableDeclaration[] = [];
   const usageNodes: SourceUsageNode[] = [];
+  const variableInitializers: Expression[] = [];
   const functionStack: FunctionLikeDeclaration[] = [];
 
+  /** Walks in source order; the function stack attributes each fact to its innermost function. */
   function visit(node: Node): void {
     const owner = functionStack.at(-1);
     const isFunction = isConcreteFunctionLike(node);
@@ -110,6 +114,7 @@ export function inventorySource(sourceFile: SourceFile): SourceInventory {
       callEdges.push({ call: node, owner });
       usageNodes.push(node);
     } else if (isVariableDeclaration(node)) {
+      if (node.initializer) variableInitializers.push(node.initializer);
       if (node.initializer && hasTranslatorCandidateShape(node)) translatorCandidates.push(node);
       if (isObjectBindingPattern(node.name) && node.initializer) usageNodes.push(node);
     } else if (isJsxOpeningElement(node) || isJsxSelfClosingElement(node)) {
@@ -135,6 +140,10 @@ export function inventorySource(sourceFile: SourceFile): SourceInventory {
     if (isFunction) functionStack.pop();
   }
 
+  /**
+   * Indexes a returned value under its innermost function. An arrow's expression body counts as
+   * its return, so the analyzer never walks the body of an inventoried function to find returns.
+   */
   function addReturn(owner: FunctionLikeDeclaration, expression: Expression): void {
     const expressions = returnsByFunction.get(owner) ?? [];
     expressions.push(expression);
@@ -150,10 +159,15 @@ export function inventorySource(sourceFile: SourceFile): SourceInventory {
     returnsByFunction,
     assignments,
     translatorCandidates,
-    usageNodes
+    usageNodes,
+    variableInitializers
   };
 }
 
+/**
+ * Keeps only the variable shapes hook translator discovery can bind from, so it skips the rest
+ * without a symbol lookup.
+ */
 function hasTranslatorCandidateShape(node: VariableDeclaration): boolean {
   if (!node.initializer) return false;
   const expression = unwrapSyntax(node.initializer);
@@ -169,6 +183,11 @@ function hasTranslatorCandidateShape(node: VariableDeclaration): boolean {
   );
 }
 
+/**
+ * Strips the same wrappers as `unwrapExpression` in dictionary.ts, so candidate shapes agree
+ * with what discovery later sees. A local copy keeps this module free of imports beyond the
+ * AST.
+ */
 function unwrapSyntax(input: Expression): Expression {
   let expression = input;
   while (
@@ -183,6 +202,7 @@ function unwrapSyntax(input: Expression): Expression {
   return expression;
 }
 
+/** Matches the analyzer's predicate, so inventoried functions are the ones it resolves. */
 function isConcreteFunctionLike(node: Node): node is FunctionLikeDeclaration {
   return (
     isFunctionDeclaration(node) ||
