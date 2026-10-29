@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { DiagnosticCategory } from 'typescript/sync';
 import { analyzeProject } from '../dist/analyzer.js';
 import { DiagnosticCode, lint } from '../dist/index.js';
-import { diagnosticSource } from './helpers.mjs';
+import { loadProject } from '../dist/project.js';
+import { diagnosticSource, temporaryProject } from './helpers.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const projectFixture = path.join(fixtures, 'project');
@@ -25,15 +26,6 @@ function options(project = projectFixture) {
 
 function diagnostics(project = projectFixture) {
   return [...lint(options(project))];
-}
-
-function temporaryProject(t, sourceFiles) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'unused18n-lint-'));
-  t.after(() => fs.rmSync(directory, { force: true, recursive: true }));
-  for (const [fileName, source] of Object.entries(sourceFiles)) {
-    fs.writeFileSync(path.join(directory, fileName), source);
-  }
-  return directory;
 }
 
 test('lint is a lazy diagnostic generator', () => {
@@ -630,4 +622,119 @@ test('groups maximal fully-unused object subtrees with complete source ranges', 
   const complete = result[0];
   assert.match(diagnosticSource(complete), /^complete: \{[\s\S]*second: 'Second'[\s\S]*\}$/);
   assert.ok(result.every(({ category }) => category === DiagnosticCategory.Error));
+});
+
+/**
+ * Returns the analysis status of every key of `dictionary.ts` in `project`.
+ *
+ * @param {string} project Project directory.
+ */
+function keyStatuses(project) {
+  const { keys } = analyzeProject({ project, dictionary: path.join(project, 'dictionary.ts') });
+  return Object.fromEntries(keys.map(({ key, status }) => [key, status]));
+}
+
+/**
+ * Returns the quoted key of every unused-key diagnostic.
+ *
+ * @param {import('typescript/sync').Diagnostic[]} result
+ */
+function unusedKeys(result) {
+  return result
+    .filter(({ code }) => code === DiagnosticCode.UnusedKey)
+    .map(({ text }) => String(text).match(/"(.+)"/)?.[1]);
+}
+
+test('keys used only inside a referenced project stay unused', () => {
+  const app = path.join(fixtures, 'project-references', 'app');
+
+  assert.deepEqual(keyStatuses(app), { fromApp: 'used', fromLib: 'unused', unused: 'unused' });
+  assert.deepEqual(unusedKeys([...lint({ ...options(app), cache: false })]), ['fromLib', 'unused']);
+
+  // The referenced project contributes its built declarations; its sources would be analyzed
+  // as application code and count `fromLib` as used.
+  const loaded = loadProject(app);
+  try {
+    const fileNames = loaded.fileNames.map((fileName) => fileName.replaceAll('\\', '/'));
+    assert.ok(fileNames.some((fileName) => fileName.endsWith('/lib/out/labels.d.ts')));
+    assert.ok(fileNames.every((fileName) => !fileName.endsWith('/lib/labels.ts')));
+    assert.deepEqual(
+      loaded.sourceFiles.map(({ fileName }) => path.basename(fileName)),
+      ['dictionary.ts', 'usage.ts']
+    );
+  } finally {
+    loaded[Symbol.dispose]();
+  }
+});
+
+test('a .d.<extension>.ts file is a declaration file and its usages do not count', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: { strict: true, module: 'NodeNext', skipLibCheck: true, noEmit: true },
+      include: ['*.ts']
+    }),
+    'dictionary.ts': `export const dictionary = { a: 'A', b: 'B' };\n`,
+    'x.d.foo.bar.ts': `import { dictionary } from './dictionary.js';
+declare function use(v: unknown): void;
+use(dictionary.a);
+export {};
+`
+  });
+
+  assert.deepEqual(keyStatuses(project), { a: 'unused', b: 'unused' });
+});
+
+test('malformed tsconfig JSON and a missing extends target yield compiler diagnostics', (t) => {
+  const dictionary = `export const dictionary = { unused: 'unused' }\n`;
+  const malformed = temporaryProject(t, {
+    'tsconfig.json': '{ "compilerOptions": { ',
+    'dictionary.ts': dictionary
+  });
+  const missingBase = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ extends: './missing.json', include: ['*.ts'] }),
+    'dictionary.ts': dictionary
+  });
+
+  for (const [project, code] of [
+    [malformed, 1005],
+    [missingBase, 5083]
+  ]) {
+    assert.deepEqual(
+      diagnostics(project).map(({ category, code, source }) => ({ category, code, source })),
+      [{ category: DiagnosticCategory.Error, code, source: undefined }]
+    );
+  }
+});
+
+// Permission bits do not block reads on Windows or for root.
+const permissionsUnenforced = process.platform === 'win32' || process.getuid?.() === 0;
+
+test('an unreadable tsconfig yields a compiler diagnostic', {
+  skip: permissionsUnenforced
+}, (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['*.ts'] }),
+    'dictionary.ts': `export const dictionary = { unused: 'unused' }\n`
+  });
+  fs.chmodSync(path.join(project, 'tsconfig.json'), 0o000);
+
+  assert.deepEqual(
+    diagnostics(project).map(({ category, code, source }) => ({ category, code, source })),
+    [{ category: DiagnosticCategory.Error, code: 5083, source: undefined }]
+  );
+});
+
+test('diagnostic source lines exclude a U+2028 line terminator', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['*.ts'] }),
+    'dictionary.ts': `export const dictionary = {\n  used: 'Used',\n  unused: 'Unused',\u2028  other: 'Other'\n}\n`,
+    'usage.ts': `import { dictionary } from './dictionary.js'
+dictionary.used
+dictionary.other
+`
+  });
+  const unused = diagnostics(project).filter(({ code }) => code === DiagnosticCode.UnusedKey);
+
+  assert.equal(unused.length, 1);
+  assert.deepEqual(unused[0]?.sourceLines, [{ line: 2, text: "  unused: 'Unused'," }]);
 });

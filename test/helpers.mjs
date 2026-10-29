@@ -1,6 +1,42 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { API } from 'typescript/sync';
 import { Semantic } from '../dist/semantic.js';
+
+/**
+ * Writes files into a fresh temporary directory that is removed when the test ends.
+ *
+ * @param {import('node:test').TestContext} t Owning test; cleanup runs in `t.after`.
+ * @param {Record<string, string>} files Contents keyed by relative path; parent directories are
+ *   created as needed.
+ * @returns {string} The directory path.
+ */
+export function temporaryProject(t, files) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'unused18n-test-'));
+  t.after(() => fs.rmSync(directory, { force: true, recursive: true }));
+  for (const [fileName, source] of Object.entries(files)) {
+    const filePath = path.join(directory, fileName);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, source);
+  }
+  return directory;
+}
+
+/**
+ * Copies a fixture directory into a temporary directory, so tests that rewrite files (`remove`)
+ * never touch the checked-in fixture.
+ *
+ * @param {import('node:test').TestContext} t Owning test; cleanup runs in `t.after`.
+ * @param {string} fixture Absolute fixture directory.
+ * @returns {string} The copy's directory path.
+ */
+export function copyFixture(t, fixture) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'unused18n-fixture-'));
+  t.after(() => fs.rmSync(directory, { force: true, recursive: true }));
+  fs.cpSync(fixture, directory, { recursive: true });
+  return directory;
+}
 
 /**
  * Opens a TypeScript 7 program over explicit root files and closes its compiler process when

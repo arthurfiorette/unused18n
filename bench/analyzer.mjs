@@ -10,8 +10,8 @@ const project = path.resolve(options.project);
 const dictionary = path.resolve(project, options.dictionary);
 const usagePath = path.resolve(project, options.source);
 const usageText = fs.readFileSync(usagePath, 'utf8');
-/** Request counts from the latest measured `lint()` call; every call issues the same requests. */
-let semanticRequests;
+/** Semantic lookup counts from the latest measured `lint()` call; every call makes the same lookups. */
+let semanticLookups;
 
 // Parsing happens once, outside the measured function, so the inventory case times traversal only.
 const api = new API();
@@ -30,7 +30,7 @@ try {
       dictionaryExport: options.export,
       cache: false,
       onEvent: (event) => {
-        if (event.type === 'semantic') semanticRequests = event;
+        if (event.type === 'semantic') semanticLookups = event;
       }
     })) {
       diagnosticCount += 1;
@@ -39,9 +39,9 @@ try {
   }).gc('inner');
 
   await run({ throw: true });
-  if (semanticRequests) {
+  if (semanticLookups) {
     process.stdout.write(
-      `lint() analyzer semantic requests: single=${semanticRequests.singleRequests} batch=${semanticRequests.batchRequests}\n`
+      `lint() analyzer semantic lookups: single=${semanticLookups.singleRequests} batch=${semanticLookups.batchRequests}\n`
     );
   }
 } finally {

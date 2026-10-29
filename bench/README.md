@@ -51,7 +51,7 @@ pnpm bench:analyzer -- \
   --export default
 ```
 
-The inventory case parses its source outside the measured traversal result, while the analyzer case includes project loading and all lint stages. The analyzer case also prints the semantic layer's compiler request counts (`singleRequests` and `batchRequests`) next to wall time.
+The inventory case parses its source outside the measured traversal result, while the analyzer case includes project loading and all lint stages. The analyzer case also prints the semantic layer's lookup counts next to wall time: lookups that missed the cache and were resolved one at a time (`singleRequests`) and batched lookups (`batchRequests`). They approximate compiler requests without matching them exactly.
 
 ## Active dictionary benchmark
 
