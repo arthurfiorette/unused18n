@@ -1,187 +1,167 @@
-import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from '@typescript/typescript6';
+import type { SourceFile } from 'typescript/ast';
+import { API, type Checker, type Diagnostic, DiagnosticCategory, type Program } from 'typescript/sync';
 import { DiagnosticCode } from './diagnostic-codes.js';
+import { diagnosticWithoutFile, flattenDiagnosticText } from './diagnostics.js';
+import { Semantic } from './semantic.js';
 
-/** One compiler graph shared by diagnostics, semantic analysis, and optional fixes. */
-export interface LoadedProject {
-  program: ts.Program;
-  checker: ts.TypeChecker;
+/**
+ * One compiler process and program shared by diagnostics, semantic analysis, and optional fixes.
+ *
+ * Disposing closes the compiler process. Nodes stay readable afterwards, but every checker
+ * query, including lazy ones behind {@link semantic}, throws once disposed.
+ */
+export interface LoadedProject extends Disposable {
+  api: API;
+  program: Program;
+  checker: Checker;
+  semantic: Semantic;
   configPath: string;
-  /** Persists compiler graph/signature state only after current diagnostics are known to be usable. */
-  saveBuildInfo?: () => void;
-  /** Incremental setup failures are advisory because a normal Program remains fully correct. */
-  cacheError?: string;
+  /** Non-declaration program files outside `node_modules`, in program order. */
+  sourceFiles: readonly SourceFile[];
 }
 
 export interface ProjectLoadResult {
   loaded?: LoadedProject;
-  diagnostics: ts.Diagnostic[];
-}
-
-export interface ProjectLoadOptions {
-  /** Enables cross-process compiler reuse without writing project build artifacts. */
-  tsBuildInfoFile?: string;
+  diagnostics: Diagnostic[];
 }
 
 /** Convenience wrapper for internal callers that treat project configuration failures as exceptions. */
 export function loadProject(projectPath: string, extraFiles: string[] = []): LoadedProject {
   const result = loadProjectWithDiagnostics(projectPath, extraFiles);
   if (result.loaded) return result.loaded;
-  throw new Error(
-    result.diagnostics
-      .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'))
-      .join('\n')
-  );
+  throw new Error(result.diagnostics.map((diagnostic) => flattenDiagnosticText(diagnostic)).join('\n'));
 }
 
 /**
  * Preserves native configuration diagnostics for linter output instead of flattening expected
  * project failures into thrown strings that lose source context.
+ *
+ * The compiler process starts here and is closed before returning whenever no project is
+ * loaded, so callers only own a process when they receive `loaded`.
+ *
+ * @param projectPath A `tsconfig.json` path, or a directory searched upwards for one.
+ * @param extraFiles Root files added on top of the configuration, such as JSON dictionaries.
  */
 export function loadProjectWithDiagnostics(
   projectPath: string,
-  extraFiles: string[] = [],
-  loadOptions: ProjectLoadOptions = {}
+  extraFiles: string[] = []
 ): ProjectLoadResult {
   const resolved = path.resolve(projectPath);
-  const configPath = ts.sys.directoryExists(resolved)
-    ? ts.findConfigFile(resolved, ts.sys.fileExists, 'tsconfig.json')
-    : resolved;
-  if (!configPath || !ts.sys.fileExists(configPath)) {
+  const configPath = isDirectory(resolved) ? findConfigFile(resolved) : resolved;
+  if (!configPath || !isFile(configPath)) {
     return {
-      diagnostics: [createConfigurationDiagnostic(`TypeScript project not found: ${projectPath}`)]
+      diagnostics: [
+        diagnosticWithoutFile(
+          DiagnosticCode.ConfigurationFailure,
+          DiagnosticCategory.Error,
+          `TypeScript project not found: ${projectPath}`
+        )
+      ]
     };
   }
 
-  const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
-  if (configFile.error) return { diagnostics: [configFile.error] };
-  const parsed = ts.parseJsonConfigFileContent(
-    configFile.config,
-    ts.sys,
-    path.dirname(configPath),
-    undefined,
-    configPath
-  );
-  if (parsed.errors.length > 0) return { diagnostics: parsed.errors };
-
-  const roots = new Set(parsed.fileNames.map((file) => path.resolve(file)));
-  for (const file of extraFiles) roots.add(path.resolve(file));
-  const resolveJsonModule = extraFiles.some((file) => path.extname(file).toLowerCase() === '.json');
-  const jsonOptions: ts.CompilerOptions = {
-    ...parsed.options,
-    allowNonTsExtensions: true
-  };
-  if (parsed.options.moduleResolution !== ts.ModuleResolutionKind.Classic) {
-    jsonOptions.resolveJsonModule = true;
-  }
-  const createOptions: ts.CreateProgramOptions = {
-    rootNames: [...roots].sort(comparePaths),
-    options: resolveJsonModule ? jsonOptions : parsed.options
-  };
-  if (parsed.projectReferences) createOptions.projectReferences = parsed.projectReferences;
-  let program: ts.Program;
-  let saveBuildInfo: (() => void) | undefined;
-  let cacheError: string | undefined;
-  if (loadOptions.tsBuildInfoFile) {
-    try {
-      const tsBuildInfoFile = path.resolve(loadOptions.tsBuildInfoFile);
-      const incrementalOptions: ts.CompilerOptions = {
-        ...createOptions.options,
-        incremental: true,
-        tsBuildInfoFile
-      };
-      const host = ts.createIncrementalCompilerHost(incrementalOptions);
-      let pendingBuildInfo: string | undefined;
-      // Builder emit is needed to save `.tsbuildinfo`; discard every normal project output.
-      host.writeFile = (fileName, data, writeByteOrderMark) => {
-        if (path.resolve(fileName) === tsBuildInfoFile) {
-          pendingBuildInfo = writeByteOrderMark ? `\uFEFF${data}` : data;
-        }
-      };
-      const builderOptions: ts.IncrementalProgramOptions<ts.EmitAndSemanticDiagnosticsBuilderProgram> =
-        {
-          rootNames: createOptions.rootNames,
-          options: incrementalOptions,
-          host
-        };
-      if (createOptions.projectReferences) {
-        builderOptions.projectReferences = createOptions.projectReferences;
-      }
-      let builder: ts.EmitAndSemanticDiagnosticsBuilderProgram | undefined =
-        ts.createIncrementalProgram(builderOptions);
-      program = builder.getProgram();
-      // Defer emit so malformed projects never establish trusted compiler cache state.
-      saveBuildInfo = () => {
-        const currentBuilder = builder;
-        if (!currentBuilder) return;
-        pendingBuildInfo = undefined;
-        try {
-          const result = currentBuilder.emit();
-          if (result.diagnostics.length > 0) {
-            throw new Error(
-              ts.formatDiagnostics(result.diagnostics, {
-                getCanonicalFileName: (fileName) => fileName,
-                getCurrentDirectory: () => process.cwd(),
-                getNewLine: () => ts.sys.newLine
-              })
-            );
-          }
-          if (pendingBuildInfo !== undefined)
-            writeBuildInfoAtomically(tsBuildInfoFile, pendingBuildInfo);
-        } finally {
-          // Analysis needs the Program, not builder-only emit queues or pending serialized state.
-          builder = undefined;
-          pendingBuildInfo = undefined;
-        }
-      };
-    } catch (error) {
-      cacheError = error instanceof Error ? error.message : String(error);
-      program = ts.createProgram(createOptions);
-    }
-  } else {
-    program = ts.createProgram(createOptions);
-  }
-  return {
-    loaded: {
-      program,
-      checker: program.getTypeChecker(),
-      configPath: path.resolve(configPath),
-      ...(saveBuildInfo ? { saveBuildInfo } : {}),
-      ...(cacheError ? { cacheError } : {})
-    },
-    diagnostics: []
-  };
-}
-
-/** Concurrent readers see either the previous complete compiler state or the next complete state. */
-function writeBuildInfoAtomically(fileName: string, contents: string): void {
-  fs.mkdirSync(path.dirname(fileName), { mode: 0o700, recursive: true });
-  const temporary = path.join(
-    path.dirname(fileName),
-    `.${path.basename(fileName)}.${randomUUID()}.tmp`
-  );
+  const api = new API();
   try {
-    fs.writeFileSync(temporary, contents, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-    fs.renameSync(temporary, fileName);
-  } finally {
-    fs.rmSync(temporary, { force: true });
+    const parsed = api.parseConfigFile(configPath);
+    if (parsed.errors.length > 0) {
+      api.close();
+      return { diagnostics: [...parsed.errors] };
+    }
+
+    const roots = new Set(parsed.fileNames.map((file) => path.resolve(file)));
+    for (const file of extraFiles) roots.add(path.resolve(file));
+    const program = api.createProgram(
+      [...roots].sort(comparePaths),
+      {
+        ...parsed.options,
+        // Dictionaries may be JSON files the project never imports, so they must be accepted as
+        // roots regardless of the project's own module settings.
+        ...(extraFiles.some((file) => path.extname(file).toLowerCase() === '.json')
+          ? { allowNonTsExtensions: true, resolveJsonModule: true }
+          : {})
+      },
+      { projectReferences: parsed.projectReferences, configFileParsingDiagnostics: parsed.errors }
+    );
+    const semantic = new Semantic(api, program);
+    const applicationFileNames = program
+      .getSourceFileNames()
+      .filter((fileName) => isApplicationFileName(fileName));
+    const sourceFiles = semantic
+      .prefetchSourceFiles(applicationFileNames)
+      .filter((sourceFile): sourceFile is SourceFile => sourceFile !== undefined);
+    return {
+      loaded: {
+        api,
+        program,
+        checker: program.getProject().checker,
+        semantic,
+        configPath,
+        sourceFiles,
+        [Symbol.dispose]() {
+          api.close();
+        }
+      },
+      diagnostics: []
+    };
+  } catch (error) {
+    api.close();
+    throw error;
   }
 }
 
-function createConfigurationDiagnostic(messageText: string): ts.Diagnostic {
-  return {
-    category: ts.DiagnosticCategory.Error,
-    code: DiagnosticCode.ConfigurationFailure,
-    file: undefined,
-    length: undefined,
-    messageText,
-    source: 'unused18n',
-    start: undefined
-  };
+/**
+ * Selects files the analyzer treats as application code. Declaration files are recognized by
+ * name so lib and package typings never have to be transferred from the compiler.
+ */
+export function isApplicationFileName(fileName: string): boolean {
+  const resolved = path.resolve(fileName);
+  return (
+    !isDeclarationFileName(resolved) && !resolved.includes(`${path.sep}node_modules${path.sep}`)
+  );
 }
 
+/**
+ * Mirrors the compiler's declaration file test: `.d.ts`, `.d.mts`, `.d.cts`, and arbitrary
+ * extension declarations such as `styles.d.css.ts`.
+ */
+function isDeclarationFileName(fileName: string): boolean {
+  const base = path.basename(fileName).toLowerCase();
+  return /\.d\.(?:[cm]?ts|[^.]+\.ts)$/.test(base);
+}
+
+/** Walks up from `directory` to the nearest `tsconfig.json`, like `tsc` without `--project`. */
+export function findConfigFile(directory: string): string | undefined {
+  let current = path.resolve(directory);
+  while (true) {
+    const candidate = path.join(current, 'tsconfig.json');
+    if (isFile(candidate)) return candidate;
+    const parent = path.dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+/** Returns whether `fileName` exists and is a directory, treating access errors as absence. */
+export function isDirectory(fileName: string): boolean {
+  try {
+    return fs.statSync(fileName).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Returns whether `fileName` exists and is a regular file, treating access errors as absence. */
+function isFile(fileName: string): boolean {
+  try {
+    return fs.statSync(fileName).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Orders paths by code unit so root order, and therefore program order, is deterministic. */
 function comparePaths(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }

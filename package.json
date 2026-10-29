@@ -1,6 +1,6 @@
 {
   "name": "unused18n",
-  "version": "0.2.2",
+  "version": "1.0.0-rc.0",
   "description": "Type-aware unused i18next dictionary linter for TypeScript and JSON dictionaries.",
   "keywords": [
     "i18n",
@@ -79,15 +79,14 @@
     "@oclif/plugin-help": "^6.2.58",
     "@oclif/plugin-not-found": "^3.2.93",
     "@oclif/plugin-warn-if-update-available": "^3.1.73",
-    "@typescript/typescript6": "^6.0.2"
+    "typescript": "beta"
   },
   "devDependencies": {
     "@arthurfiorette/biomejs-config": "^2.0.1",
     "@biomejs/biome": "^2.5.10",
     "@types/node": "^26.2.0",
     "mitata": "^1.0.34",
-    "ts-json-schema-generator": "^2.9.0",
-    "typescript": "^7.0.2"
+    "ts-json-schema-generator": "^2.9.0"
   },
   "packageManager": "pnpm@11.23.0",
   "devEngines": {
