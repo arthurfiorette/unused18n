@@ -8,16 +8,20 @@ import { lint } from '../dist/index.js';
 const project = fileURLToPath(new URL('./fixtures/project', import.meta.url));
 
 /**
- * Lists the TypeScript compiler processes this test process spawned. `ps --ppid` is GNU-only,
- * so every process is listed and filtered by parent pid. Exited children awaiting reaping show
- * as `<defunct>` without a command line and are not counted.
+ * Lists the live TypeScript compiler processes this test process spawned. `ps --ppid` is
+ * GNU-only, so every process is listed and filtered by parent pid.
+ *
+ * Node reaps exited children asynchronously, and these tests never yield to the event loop, so
+ * a compiler that already exited stays in the table as a zombie (`Z` state, `[tsc] <defunct>`
+ * on Linux) until the test ends. Zombies hold no resources and are not counted.
  */
 function compilerChildren() {
-  return execFileSync('ps', ['-A', '-o', 'ppid=,command='], { encoding: 'utf8' })
+  return execFileSync('ps', ['-A', '-o', 'ppid=,stat=,command='], { encoding: 'utf8' })
     .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.split(/\s+/, 1)[0] === String(process.pid))
-    .filter((line) => /typescript|\btsc\b/.test(line));
+    .map((line) => line.trim().split(/\s+/))
+    .filter(([ppid, stat]) => ppid === String(process.pid) && !stat?.startsWith('Z'))
+    .map((fields) => fields.slice(2).join(' '))
+    .filter((command) => /typescript|\btsc\b/.test(command));
 }
 
 // `ps` is unavailable on Windows.
