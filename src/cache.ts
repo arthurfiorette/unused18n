@@ -248,15 +248,10 @@ function computeCompatibilityHash(
   dictionaries: LoadedDictionaryTarget[],
   options: { maxExpansions: number }
 ): string {
-  const externalNames = loaded.program
-    .getSourceFileNames()
-    .filter((fileName) => !isApplicationFileName(fileName));
-  const metadata =
-    externalNames.length > 0
-      ? loaded.semantic.api.batch(
-          ...externalNames.map((fileName) => loaded.program.getSourceFileMetadata.gen(fileName))
-        )
-      : [];
+  const externalNames = loaded.fileNames.filter((fileName) => !isApplicationFileName(fileName));
+  const metadata = loaded.semantic.batch(externalNames, (fileName) =>
+    loaded.program.getSourceFileMetadata.gen(fileName)
+  );
   const externalSources = externalNames
     // Bundled lib files change only with the compiler, which `typescriptVersion` already covers.
     .filter((_, index) => metadata[index]?.isDefaultLibrary !== true)
@@ -327,14 +322,9 @@ function dependenciesFor(loaded: LoadedProject): string[][] {
       }
     }
   });
-  const resolved =
-    requests.length > 0
-      ? semantic.api.batch(
-          ...requests.map(({ fileName, specifier }) =>
-            program.getResolvedModuleFromModuleSpecifier.gen(specifier, fileName)
-          )
-        )
-      : [];
+  const resolved = semantic.batch(requests, ({ fileName, specifier }) =>
+    program.getResolvedModuleFromModuleSpecifier.gen(specifier, fileName)
+  );
 
   const dependencies = sourceFiles.map(() => new Set<string>());
   requests.forEach(({ index }, position) => {

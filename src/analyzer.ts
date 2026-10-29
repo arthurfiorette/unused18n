@@ -82,7 +82,7 @@ import {
   type TypeAssertion,
   type TypeNode
 } from 'typescript/ast';
-import { type Symbol as TsSymbol, type Type, TypeFlags } from 'typescript/sync';
+import { SymbolFlags, type Symbol as TsSymbol, type Type, TypeFlags } from 'typescript/sync';
 import type { DictionaryTarget } from './dictionaries.js';
 import { readDictionary, unwrapExpression } from './dictionary.js';
 import { DictionaryIndex } from './dictionary-index.js';
@@ -99,6 +99,7 @@ import {
   type StringResolution,
   unresolved
 } from './strings.js';
+import { isSourceAssertion, writtenType } from './syntax.js';
 import type { AnalysisResult, AnalyzeOptions, UsageEvidence } from './types.js';
 
 interface TranslationWrapper {
@@ -318,10 +319,11 @@ export function analyzeLoadedProjectMany(
   const observationIdentities = new WeakMap<SourceUsageFacts, Set<string>>();
   const unresolvedIdentities = new WeakMap<SourceUsageFacts, Set<string>>();
   const translationObjectCastIdentities = new WeakMap<SourceUsageFacts, Set<string>>();
-  const objectCache = new WeakMap<Expression, ObjectResolution | null>();
+  // Reassigned only by withScratchObjectCaches, which swaps in copies for lookahead.
+  let objectCache = new WeakMap<Expression, ObjectResolution | null>();
   // Parameter inputs are indexed before usage analysis, making symbol provenance immutable here;
   // cache misses too so ordinary non-translation property accesses stay cheap.
-  const objectSymbolCache = new Map<TsSymbol, ObjectResolution | null>();
+  let objectSymbolCache = new Map<TsSymbol, ObjectResolution | null>();
   const resolvingObjectSymbols = new Set<TsSymbol>();
   const objectInputs = new Map<TsSymbol, ObjectInput[]>();
   const objectPropertyInputs = new Map<TsSymbol, Map<string, ObjectInput[]>>();
@@ -345,7 +347,9 @@ export function analyzeLoadedProjectMany(
 
   emitStage('usage', 'start');
   try {
-    semantic.prefetchTypes(inventories.flatMap(objectChainTypeTargets));
+    semantic.prefetchTypes(
+      withScratchObjectCaches(() => inventories.flatMap(objectChainTypeTargets))
+    );
     inventories.forEach((inventory, index) => {
       visitSource(inventory);
       try {
@@ -738,9 +742,10 @@ export function analyzeLoadedProjectMany(
    * rooted in a translation or dictionary object.
    *
    * Each chain level whose base resolves asks for the base type, so a 10k-key dictionary read
-   * through `dictionary.a.b.key` costs one request per level when fetched lazily. Roots are
-   * classified with the same memoized `resolveObjectSymbol` the usage pass calls, and object
-   * provenance is fixed once discovery ends, so this only moves those requests into one batch.
+   * through `dictionary.a.b.key` costs one request per level when fetched lazily.
+   *
+   * Roots are classified with `resolveObjectSymbol`, which must run on scratch copies of the
+   * object caches (see {@link withScratchObjectCaches}).
    */
   function objectChainTypeTargets(inventory: SourceInventory): Node[] {
     const targets: Node[] = [];
@@ -758,6 +763,28 @@ export function analyzeLoadedProjectMany(
       if (symbol && resolveObjectSymbol(symbol, new Set())) targets.push(...bases);
     }
     return targets;
+  }
+
+  /**
+   * Runs `work` against throwaway copies of the object resolution caches, then restores them.
+   *
+   * Mutually referencing variables cache a partial result for whichever symbol is resolved
+   * second, so these caches depend on resolution order. Lookahead such as type prefetching
+   * resolves symbols in a different order than the usage pass; isolating it keeps the usage
+   * pass on exactly the cache state discovery left behind. The semantic layer's caches are
+   * order-independent and keep everything the lookahead fetched.
+   */
+  function withScratchObjectCaches<T>(work: () => T): T {
+    const savedObjects = objectCache;
+    const savedSymbols = objectSymbolCache;
+    objectCache = new WeakMap();
+    objectSymbolCache = new Map(savedSymbols);
+    try {
+      return work();
+    } finally {
+      objectCache = savedObjects;
+      objectSymbolCache = savedSymbols;
+    }
   }
 
   function visitSource(inventory: SourceInventory): void {
@@ -2091,6 +2118,10 @@ export function analyzeLoadedProjectMany(
     importedName: string,
     moduleName: string
   ): boolean {
+    // Only alias symbols carry ImportSpecifier declarations. Checking the flag first avoids
+    // resolving the declarations of every callee, which would transfer lib.dom.d.ts for a lone
+    // `console.log` call.
+    if (!symbol || (symbol.flags & SymbolFlags.Alias) === 0) return false;
     return Boolean(
       semantic.declarations(symbol).some((declaration) => {
         if (!isImportSpecifier(declaration)) return false;
@@ -2260,7 +2291,7 @@ export function analyzeLoadedProjectMany(
     if (isI18nextTranslatorDeclaration(declaration)) return true;
     if (
       isParameterDeclaration(declaration) &&
-      !declaration.type &&
+      !writtenType(declaration.type) &&
       (isArrowFunction(declaration.parent) || isFunctionExpression(declaration.parent)) &&
       isCallExpression(declaration.parent.parent) &&
       declaration.parent.parent.arguments.includes(declaration.parent)
@@ -2269,16 +2300,14 @@ export function analyzeLoadedProjectMany(
       return true;
     }
 
-    if (
-      (isVariableDeclaration(declaration) ||
-        isParameterDeclaration(declaration) ||
-        isPropertyDeclaration(declaration) ||
-        isPropertySignatureDeclaration(declaration)) &&
-      declaration.type &&
-      typeNodeHasI18nextTProvenance(declaration.type, seen)
-    ) {
-      return true;
-    }
+    const annotation =
+      isVariableDeclaration(declaration) ||
+      isParameterDeclaration(declaration) ||
+      isPropertyDeclaration(declaration) ||
+      isPropertySignatureDeclaration(declaration)
+        ? writtenType(declaration.type)
+        : undefined;
+    if (annotation && typeNodeHasI18nextTProvenance(annotation, seen)) return true;
     if (isVariableDeclaration(declaration) && declaration.initializer) {
       return expressionHasI18nextTProvenance(declaration.initializer, seen);
     }
@@ -2591,7 +2620,7 @@ function translationObjectCast(call: CallExpression): AsExpression | TypeAsserti
   while (true) {
     const parent = expression.parent;
     if ((isAsExpression(parent) || isTypeAssertion(parent)) && parent.expression === expression) {
-      result = parent;
+      if (isSourceAssertion(parent)) result = parent;
       expression = parent;
       continue;
     }
@@ -2611,17 +2640,10 @@ function translationObjectCast(call: CallExpression): AsExpression | TypeAsserti
 function unsafeTranslationArgumentCast(
   argument: Expression
 ): AsExpression | TypeAssertion | undefined {
-  let expression = argument;
-  while (
-    isParenthesizedExpression(expression) ||
-    isNonNullExpression(expression) ||
-    isSatisfiesExpression(expression)
-  ) {
-    expression = expression.expression;
-  }
-  if (!isAsExpression(expression) && !isTypeAssertion(expression)) return undefined;
+  let expression = skipCastWrappers(argument);
+  if (!isSourceAssertion(expression)) return undefined;
   const outermost = expression;
-  while (isAsExpression(expression) || isTypeAssertion(expression)) {
+  while (isSourceAssertion(expression)) {
     if (
       expression.type.kind === SyntaxKind.AnyKeyword ||
       expression.type.kind === SyntaxKind.UnknownKeyword ||
@@ -2629,16 +2651,26 @@ function unsafeTranslationArgumentCast(
     ) {
       return outermost;
     }
-    expression = expression.expression;
-    while (
-      isParenthesizedExpression(expression) ||
-      isNonNullExpression(expression) ||
-      isSatisfiesExpression(expression)
-    ) {
-      expression = expression.expression;
-    }
+    expression = skipCastWrappers(expression.expression);
   }
   return undefined;
+}
+
+/**
+ * Skips wrappers that sit between casts without being casts themselves: parentheses, `!`,
+ * `satisfies`, and JSDoc type comments that JavaScript files parse as assertions.
+ */
+function skipCastWrappers(input: Expression): Expression {
+  let expression = input;
+  while (
+    isParenthesizedExpression(expression) ||
+    isNonNullExpression(expression) ||
+    isSatisfiesExpression(expression) ||
+    ((isAsExpression(expression) || isTypeAssertion(expression)) && !isSourceAssertion(expression))
+  ) {
+    expression = expression.expression;
+  }
+  return expression;
 }
 
 function isUnconsumedObjectCall(call: CallExpression): boolean {

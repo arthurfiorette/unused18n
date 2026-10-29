@@ -3,7 +3,6 @@ import {
   type Expression,
   type FunctionLikeDeclaration,
   isArrowFunction,
-  isAsExpression,
   isBinaryExpression,
   isCallExpression,
   isConditionalExpression,
@@ -31,7 +30,6 @@ import {
   isStringLiteralLikeNode,
   isTemplateExpression,
   isTypeAliasDeclaration,
-  isTypeAssertion,
   isTypeOperatorNode,
   isTypeReferenceNode,
   isUnionTypeNode,
@@ -44,6 +42,7 @@ import {
 import type { Symbol as TsSymbol, Type } from 'typescript/sync';
 import { unwrapExpression } from './dictionary.js';
 import type { Semantic } from './semantic.js';
+import { isSourceAssertion, writtenType } from './syntax.js';
 
 export interface StringResolution {
   values: Set<string>;
@@ -212,7 +211,7 @@ export function createStringResolver(
   }
 
   function resolveAssertedType(input: Expression): StringResolution {
-    if (!isAsExpression(input) && !isTypeAssertion(input)) return empty();
+    if (!isSourceAssertion(input)) return empty();
     return resolveTypeNode(input.type, new Set());
   }
 
@@ -325,7 +324,7 @@ function declaredTypeNode(declaration: Declaration): TypeNode | undefined {
     isPropertyDeclaration(declaration) ||
     isPropertySignatureDeclaration(declaration)
   ) {
-    return declaration.type;
+    return writtenType(declaration.type);
   }
   return undefined;
 }

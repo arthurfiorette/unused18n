@@ -42,6 +42,7 @@ import {
 } from './dictionary-removal.js';
 import { loadProjectWithDiagnostics } from './project.js';
 import type { Semantic } from './semantic.js';
+import { isSourceAssertion } from './syntax.js';
 import type { Unused18nConfig, UsageEvidence } from './types.js';
 
 export type LintEvent =
@@ -538,7 +539,7 @@ function planTranslationObjectCastRemoval(
     // while chained `as unknown as Type` assertions disappear in the same atomic transaction.
     let expression: Expression = cast;
     while (true) {
-      if (isAsExpression(expression) || isTypeAssertion(expression)) {
+      if (isSourceAssertion(expression)) {
         const editStart = isAsExpression(expression)
           ? expression.expression.end
           : expression.getStart(file);
@@ -564,7 +565,10 @@ function planTranslationObjectCastRemoval(
       if (
         isParenthesizedExpression(expression) ||
         isNonNullExpression(expression) ||
-        isSatisfiesExpression(expression)
+        isSatisfiesExpression(expression) ||
+        // JSDoc type comments in JavaScript parse as assertions but have nothing to delete.
+        isAsExpression(expression) ||
+        isTypeAssertion(expression)
       ) {
         expression = expression.expression;
         continue;
@@ -650,7 +654,7 @@ function castExpressionStartingAt(
   let result: AsExpression | TypeAssertion | undefined;
   function visit(node: Node): void {
     if (result || node.end < start || node.getStart(file) > start) return;
-    if ((isAsExpression(node) || isTypeAssertion(node)) && node.getStart(file) === start) {
+    if (isSourceAssertion(node) && node.getStart(file) === start) {
       result = node;
       return;
     }

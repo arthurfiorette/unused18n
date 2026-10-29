@@ -84,5 +84,6 @@ function lineText(sourceFile: SourceFile, line: number): string {
   const starts = sourceFile.getLineStarts();
   const start = starts[line] ?? sourceFile.text.length;
   const next = starts[line + 1] ?? sourceFile.text.length;
-  return sourceFile.text.slice(start, next).replace(/\r?\n$|\r$/, '');
+  // Line starts also split on U+2028 and U+2029, so those terminators are stripped as well.
+  return sourceFile.text.slice(start, next).replace(/(?:\r\n|[\r\n\u2028\u2029])$/, '');
 }

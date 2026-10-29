@@ -3,7 +3,6 @@ import path from 'node:path';
 import type { SourceFile } from 'typescript/ast';
 import {
   API,
-  type Checker,
   type Diagnostic,
   DiagnosticCategory,
   type Program
@@ -21,9 +20,10 @@ import { Semantic } from './semantic.js';
 export interface LoadedProject extends Disposable {
   api: API;
   program: Program;
-  checker: Checker;
   semantic: Semantic;
   configPath: string;
+  /** Every program file, including default libraries and package typings, in program order. */
+  fileNames: readonly string[];
   /** Non-declaration program files outside `node_modules`, in program order. */
   sourceFiles: readonly SourceFile[];
 }
@@ -70,11 +70,31 @@ export function loadProjectWithDiagnostics(
     };
   }
 
-  const api = new API();
+  let api: API;
   try {
+    api = new API();
+  } catch (error) {
+    return {
+      diagnostics: [
+        diagnosticWithoutFile(
+          DiagnosticCode.ConfigurationFailure,
+          DiagnosticCategory.Error,
+          `Cannot start the TypeScript compiler: ${error instanceof Error ? error.message : String(error)}`
+        )
+      ]
+    };
+  }
+  try {
+    // parseConfigFile tolerates JSON syntax errors and throws on unreadable files, so the raw
+    // read runs first and reports both as diagnostics, the way tsc does.
+    const read = api.readConfigFile(configPath);
+    if (read.error) {
+      closeQuietly(api);
+      return { diagnostics: [read.error] };
+    }
     const parsed = api.parseConfigFile(configPath);
     if (parsed.errors.length > 0) {
-      api.close();
+      closeQuietly(api);
       return { diagnostics: [...parsed.errors] };
     }
 
@@ -84,6 +104,10 @@ export function loadProjectWithDiagnostics(
       [...roots].sort(comparePaths),
       {
         ...parsed.options,
+        // Referenced projects contribute their built declarations, as with `tsc -p`. Loading
+        // their sources instead would analyze another project's files as application code:
+        // keys used only there would count as used, and fixes could edit them.
+        disableSourceOfProjectReferenceRedirect: true,
         // Dictionaries may be JSON files the project never imports, so they must be accepted as
         // roots regardless of the project's own module settings.
         ...(extraFiles.some((file) => path.extname(file).toLowerCase() === '.json')
@@ -93,29 +117,42 @@ export function loadProjectWithDiagnostics(
       { projectReferences: parsed.projectReferences, configFileParsingDiagnostics: parsed.errors }
     );
     const semantic = new Semantic(api, program);
-    const applicationFileNames = program
-      .getSourceFileNames()
-      .filter((fileName) => isApplicationFileName(fileName));
+    const fileNames = program.getSourceFileNames();
     const sourceFiles = semantic
-      .prefetchSourceFiles(applicationFileNames)
+      .prefetchSourceFiles(fileNames.filter((fileName) => isApplicationFileName(fileName)))
       .filter((sourceFile): sourceFile is SourceFile => sourceFile !== undefined);
     return {
       loaded: {
         api,
         program,
-        checker: program.getProject().checker,
         semantic,
         configPath,
+        fileNames,
         sourceFiles,
         [Symbol.dispose]() {
-          api.close();
+          closeQuietly(api);
         }
       },
       diagnostics: []
     };
   } catch (error) {
-    api.close();
+    closeQuietly(api);
     throw error;
+  }
+}
+
+/**
+ * Closes the compiler process without throwing.
+ *
+ * Closing releases remote snapshots first, which fails with EPIPE when the process already
+ * died. The client is torn down regardless, and cleanup must not replace the error or
+ * diagnostic that explains the crash.
+ */
+function closeQuietly(api: API): void {
+  try {
+    api.close();
+  } catch {
+    // The process is gone either way; nothing is left to release.
   }
 }
 
@@ -131,12 +168,11 @@ export function isApplicationFileName(fileName: string): boolean {
 }
 
 /**
- * Mirrors the compiler's declaration file test: `.d.ts`, `.d.mts`, `.d.cts`, and arbitrary
- * extension declarations such as `styles.d.css.ts`.
+ * Mirrors the compiler's case-sensitive declaration file test: `.d.ts`, `.d.mts`, `.d.cts`, and
+ * any `.ts` file whose base name contains `.d.`, such as `styles.d.css.ts`.
  */
 function isDeclarationFileName(fileName: string): boolean {
-  const base = path.basename(fileName).toLowerCase();
-  return /\.d\.(?:[cm]?ts|[^.]+\.ts)$/.test(base);
+  return /\.d\.(?:[cm]?ts|.*\.ts)$/.test(path.basename(fileName));
 }
 
 /** Walks up from `directory` to the nearest `tsconfig.json`, like `tsc` without `--project`. */

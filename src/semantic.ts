@@ -4,18 +4,24 @@ import {
   type Declaration,
   isPropertyAccessExpression,
   type Node,
+  type PathKey,
   type SourceFile,
   type TypeNode
 } from 'typescript/ast';
 import {
   type API,
+  type APIRequestGenerator,
   type Checker,
+  type NodeHandle,
   type Program,
   type Signature,
   SymbolFlags,
   type Symbol as TsSymbol,
   type Type
 } from 'typescript/sync';
+
+/** Generators per `api.batch` call; far below the engine's argument-spread limit. */
+const BATCH_CHUNK_SIZE = 4_096;
 
 /** Request accounting used by debug output and tests to spot per-node IPC regressions. */
 export interface SemanticStats {
@@ -52,8 +58,11 @@ export class Semantic {
   private readonly typeNodeTypes = new WeakMap<Node, Type>();
   private readonly arrayTypes = new Map<Type, boolean>();
   private readonly propertyLists = new Map<Type, readonly TsSymbol[]>();
+  private readonly namedProperties = new Map<Type, Map<string, TsSymbol | null>>();
   private readonly defaultLibraries = new Map<SourceFile, boolean>();
   private readonly sourceFiles = new Map<string, SourceFile | null>();
+  /** Paths of files already transferred to this process; declarations there resolve locally. */
+  private readonly loadedPaths = new Set<PathKey>();
 
   /** The API instance that owns the compiler process, used for batched requests. */
   readonly api: API;
@@ -86,7 +95,34 @@ export class Semantic {
     this.stats.singleRequests += 1;
     const sourceFile = this.program.getSourceFile(key);
     this.sourceFiles.set(key, sourceFile ?? null);
+    if (sourceFile) this.loadedPaths.add(sourceFile.path);
     return sourceFile;
+  }
+
+  /**
+   * Runs one request generator per item through `api.batch`, in chunks.
+   *
+   * `api.batch` takes generators as rest arguments, and spreading a large project's lookups
+   * (tens of thousands of declaration handles) into one call overflows the JS call stack.
+   * Each chunk is still a single round trip, so request counts stay proportional to chunks.
+   *
+   * @param items Inputs in result order.
+   * @param toGenerator Creates the `.gen` request for one item; called lazily per chunk.
+   * @returns One result per item, in the same order as `items`.
+   */
+  batch<Item, Result>(
+    items: readonly Item[],
+    toGenerator: (item: Item) => APIRequestGenerator<Result>
+  ): Result[] {
+    const results: Result[] = [];
+    for (let start = 0; start < items.length; start += BATCH_CHUNK_SIZE) {
+      const chunk = items.slice(start, start + BATCH_CHUNK_SIZE).map(toGenerator);
+      // A one-item chunk, such as one lazily resolved symbol, is an ordinary single request.
+      if (chunk.length === 1) this.stats.singleRequests += 1;
+      else this.stats.batchRequests += 1;
+      for (const result of this.api.batch(...chunk)) results.push(result as Result);
+    }
+    return results;
   }
 
   /**
@@ -99,10 +135,11 @@ export class Semantic {
     const keys = fileNames.map((fileName) => path.resolve(fileName));
     const missing = [...new Set(keys.filter((key) => !this.sourceFiles.has(key)))];
     if (missing.length > 0) {
-      this.stats.batchRequests += 1;
-      const fetched = this.api.batch(...missing.map((key) => this.program.getSourceFile.gen(key)));
+      const fetched = this.batch(missing, (key) => this.program.getSourceFile.gen(key));
       missing.forEach((key, index) => {
-        this.sourceFiles.set(key, fetched[index] ?? null);
+        const sourceFile = fetched[index];
+        this.sourceFiles.set(key, sourceFile ?? null);
+        if (sourceFile) this.loadedPaths.add(sourceFile.path);
       });
     }
     return keys.map((key) => this.sourceFiles.get(key) ?? undefined);
@@ -255,12 +292,22 @@ export class Semantic {
     return properties;
   }
 
-  /** Returns the named property of `type`, reading the cached property list when one exists. */
+  /**
+   * Returns the named property of `type`. This can differ from {@link propertiesOfType}, which
+   * omits apparent members such as `toString`, so it is never answered from that list.
+   */
   propertyOfType(type: Type, name: string): TsSymbol | undefined {
-    const properties = this.propertyLists.get(type);
-    if (properties) return properties.find((property) => property.name === name);
+    let byName = this.namedProperties.get(type);
+    if (!byName) {
+      byName = new Map();
+      this.namedProperties.set(type, byName);
+    }
+    const cached = byName.get(name);
+    if (cached !== undefined) return cached ?? undefined;
     this.stats.singleRequests += 1;
-    return this.checker.getPropertyOfType(type, name);
+    const property = this.checker.getPropertyOfType(type, name);
+    byName.set(name, property ?? null);
+    return property;
   }
 
   /** Returns whether a source file is one of the compiler's bundled `lib.*.d.ts` files. */
@@ -297,10 +344,7 @@ export class Semantic {
     }
     if (aliases.size > 0) {
       const ordered = [...aliases];
-      this.stats.batchRequests += 1;
-      const targets = this.api.batch(
-        ...ordered.map((symbol) => this.checker.getAliasedSymbol.gen(symbol))
-      );
+      const targets = this.batch(ordered, (symbol) => this.checker.getAliasedSymbol.gen(symbol));
       ordered.forEach((symbol, index) => {
         const target = targets[index];
         // The unknown-symbol identity is fetched once per checker, so this check stays local.
@@ -309,7 +353,14 @@ export class Semantic {
         if (known) resolved.add(known);
       });
     }
-    this.resolveDeclarations(resolved);
+    // Only declarations inside already-transferred files are resolved here. Resolving the rest
+    // would fetch every package typing file any symbol touches (React, icon sets, lib.dom),
+    // most of which analysis never reads; those resolve lazily through `declarations`.
+    this.resolveDeclarations(
+      [...resolved].filter((symbol) =>
+        symbol.declarations.every((handle) => this.loadedPaths.has(handle.path))
+      )
+    );
   }
 
   /**
@@ -329,21 +380,29 @@ export class Semantic {
   }
 
   /**
-   * Resolves the declaration handles of several symbols together. Handles in already-fetched
-   * files resolve locally, so the batch only pays for the first fetch of each declaring file.
+   * Resolves the declaration handles of several symbols together.
+   *
+   * Requests inside one `api.batch` run concurrently, so every handle whose file is not yet in
+   * this process would transfer that whole file again. Only the first handle per declaring file
+   * goes into the batch; the rest resolve afterwards against the file it brought in.
    */
   private resolveDeclarations(symbols: Iterable<TsSymbol>): void {
     const pending = [...symbols].filter((symbol) => !this.declarationLists.has(symbol));
-    const handles = pending.flatMap((symbol) => symbol.declarations);
-    if (handles.length > 0) this.stats.batchRequests += 1;
-    const nodes = handles.length > 0 ? this.api.batch(...handles.map((h) => h.resolve.gen())) : [];
-    let offset = 0;
+    const firstPerFile = new Map<PathKey, NodeHandle<Declaration>>();
     for (const symbol of pending) {
-      const count = symbol.declarations.length;
-      const declarations = nodes
-        .slice(offset, offset + count)
-        .filter((node): node is Declaration => node !== undefined);
-      offset += count;
+      for (const handle of symbol.declarations) {
+        if (!firstPerFile.has(handle.path)) firstPerFile.set(handle.path, handle);
+      }
+    }
+    const leaders = [...firstPerFile.values()];
+    const leaderNodes = this.batch(leaders, (handle) => handle.resolve.gen());
+    const resolved = new Map(leaders.map((handle, index) => [handle, leaderNodes[index]]));
+    for (const symbol of pending) {
+      const declarations: Declaration[] = [];
+      for (const handle of symbol.declarations) {
+        const node = resolved.has(handle) ? resolved.get(handle) : handle.resolve();
+        if (node) declarations.push(node);
+      }
       this.declarationLists.set(symbol, declarations);
     }
   }
