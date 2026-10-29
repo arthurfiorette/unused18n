@@ -7,10 +7,10 @@ Find unused keys in TypeScript and JSON [i18next](https://www.i18next.com/) dict
 ## Install
 
 ```sh
-npm install --save-dev unused18n@beta
+npm install --save-dev unused18n
 ```
 
-The 1.0 release candidate is published under the `beta` tag while TypeScript 7.1 is in beta. It installs `typescript@beta` as a dependency. TypeScript 7.1 runs the compiler as a native Go child process, and npm installs the binary for your platform through TypeScript's optional dependencies, so installs with `--omit=optional` cannot run `unused18n`. Supported platforms are the ones TypeScript publishes binaries for.
+`unused18n` installs `typescript@beta` (TypeScript 7.1) as a dependency. TypeScript 7.1 runs the compiler as a native Go child process, and npm installs the binary for your platform through TypeScript's optional dependencies, so installs with `--omit=optional` cannot run `unused18n`. Supported platforms are the ones TypeScript publishes binaries for.
 
 ## Quick start
 
