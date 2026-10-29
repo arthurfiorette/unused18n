@@ -1,5 +1,22 @@
 import path from 'node:path';
-import ts from '@typescript/typescript6';
+import {
+  type AsExpression,
+  type CallExpression,
+  type Expression,
+  isAsExpression,
+  isCallExpression,
+  isNonNullExpression,
+  isParenthesizedExpression,
+  isPropertyAssignment,
+  isSatisfiesExpression,
+  isShorthandPropertyAssignment,
+  isTypeAssertion,
+  type Node,
+  type ObjectLiteralElementLike,
+  type SourceFile,
+  type TypeAssertion
+} from 'typescript/ast';
+import { type Diagnostic, DiagnosticCategory } from 'typescript/sync';
 import { analyzeLoadedProjectMany, type LoadedDictionaryTarget } from './analyzer.js';
 import {
   type CacheEvent,
@@ -9,6 +26,12 @@ import {
   resolveCachePaths
 } from './cache.js';
 import { DiagnosticCode } from './diagnostic-codes.js';
+import {
+  diagnosticAt,
+  diagnosticAtNode,
+  diagnosticWithoutFile,
+  lineEndOfPosition
+} from './diagnostics.js';
 import { resolveDictionaryTargets } from './dictionaries.js';
 import { type DictionaryKeySource, readDictionary } from './dictionary.js';
 import {
@@ -18,6 +41,7 @@ import {
   planDictionaryRemoval
 } from './dictionary-removal.js';
 import { loadProjectWithDiagnostics } from './project.js';
+import type { Semantic } from './semantic.js';
 import type { Unused18nConfig, UsageEvidence } from './types.js';
 
 export type LintEvent =
@@ -38,7 +62,9 @@ export type LintEvent =
       timestamp: number;
     }
   | { type: 'file-progress'; fileName: string; completedFiles: number; totalFiles: number }
-  | { type: 'cache'; event: CacheEvent };
+  | { type: 'cache'; event: CacheEvent }
+  /** Compiler requests issued by the semantic layer up to the end of analysis. */
+  | { type: 'semantic'; singleRequests: number; batchRequests: number };
 
 export interface LintOptions
   extends Omit<Unused18nConfig, '$schema' | 'cacheStats' | 'logLevel' | 'project'> {
@@ -59,8 +85,13 @@ export { DiagnosticCode };
 /**
  * Owns the complete lint lifecycle so consuming the iterator performs project loading, analysis,
  * optional edits, and diagnostic production in one compiler process.
+ *
+ * The compiler process is spawned only once iteration reaches project loading, so a `lint()`
+ * call that is never iterated starts nothing. From then on the generator owns the process and
+ * closes it in a `finally`, which also runs when the consumer stops early through `return()`
+ * or an exception. Yielded diagnostics are plain data and stay valid after the process exits.
  */
-export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void> {
+export function* lint(options: LintOptions): Generator<Diagnostic, void, void> {
   const now = options.now ?? performance.now.bind(performance);
   const projectPath = options.project ?? './tsconfig.json';
   const dictionaryExport = options.dictionaryExport;
@@ -70,9 +101,9 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     if (!patterns) throw new Error('At least one dictionary path or glob is required');
     targets = resolveDictionaryTargets(patterns, dictionaryExport);
   } catch (error) {
-    yield createDiagnostic(
+    yield diagnosticWithoutFile(
       DiagnosticCode.ConfigurationFailure,
-      ts.DiagnosticCategory.Error,
+      DiagnosticCategory.Error,
       error instanceof Error ? error.message : String(error)
     );
     return;
@@ -90,281 +121,271 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     : undefined;
   if (!cacheEnabled) notify({ type: 'bypass', reason: 'disabled' });
   if (cachePaths) {
+    // An unusable directory surfaces again as read or write errors from the analysis cache,
+    // which already degrade to a full analysis.
     try {
       ensureCacheDirectory(cachePaths);
     } catch (error) {
       notify({
         type: 'error',
-        operation: 'compiler',
+        operation: 'directory',
         message: error instanceof Error ? error.message : String(error)
       });
     }
   }
-  const project = loadProjectWithDiagnostics(
-    projectPath,
-    targets.map((target) => target.path),
-    cachePaths && fsCacheAvailable(cachePaths.directory)
-      ? { tsBuildInfoFile: cachePaths.tsBuildInfoFile }
-      : {}
-  );
-  stage('project', 'end');
-  yield* project.diagnostics;
-  if (!project.loaded) return;
-
-  const compilerDiagnostics = [
-    ...project.loaded.program.getConfigFileParsingDiagnostics(),
-    ...project.loaded.program.getOptionsDiagnostics(),
-    ...project.loaded.program.getSyntacticDiagnostics()
-  ];
-  yield* compilerDiagnostics;
-  if (
-    compilerDiagnostics.some((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)
-  ) {
-    return;
-  }
-  if (project.loaded.cacheError) {
-    notify({ type: 'error', operation: 'compiler', message: project.loaded.cacheError });
-  }
-  if (project.loaded.saveBuildInfo) {
-    try {
-      project.loaded.saveBuildInfo();
-    } catch (error) {
-      notify({
-        type: 'error',
-        operation: 'compiler',
-        message: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
-  emit({ type: 'phase', phase: 'analysis' });
 
   let analysis: ReturnType<typeof analyzeLoadedProjectMany>;
-  let loadedDictionaries: LoadedDictionaryTarget[];
   let preparedCache: PreparedAnalysisCache | undefined;
-  let dictionaryStageOpen = false;
+  const project = loadProjectWithDiagnostics(
+    projectPath,
+    targets.map((target) => target.path)
+  );
   try {
-    stage('dictionary', 'start');
-    dictionaryStageOpen = true;
-    loadedDictionaries = targets.map((target) => {
-      const info = readDictionary(
-        project.loaded!.program,
-        project.loaded!.checker,
-        target.path,
-        target.requestedExport
-      );
-      return {
-        ...target,
-        id: `${target.path}\0${info.exportName}`,
-        exportName: info.exportName,
-        info
-      };
-    });
-    stage('dictionary', 'end');
-    dictionaryStageOpen = false;
-    if (cachePaths && cacheEnabled) {
-      // Dictionary provenance is rebuilt above; only serializable usage facts are replayed.
-      preparedCache = prepareAnalysisCache(project.loaded, loadedDictionaries, {
-        maxExpansions: options.maxExpansions ?? 1_000,
-        paths: cachePaths
+    stage('project', 'end');
+    yield* project.diagnostics;
+    const loaded = project.loaded;
+    if (!loaded) return;
+
+    // One batched request instead of three round trips to the compiler process.
+    const [configDiagnostics, programDiagnostics, syntacticDiagnostics] = loaded.api.batch(
+      loaded.program.getConfigFileParsingDiagnostics.gen(),
+      loaded.program.getProgramDiagnostics.gen(),
+      loaded.program.getSyntacticDiagnostics.gen()
+    );
+    const compilerDiagnostics = [
+      ...configDiagnostics,
+      ...programDiagnostics,
+      ...syntacticDiagnostics
+    ];
+    yield* compilerDiagnostics;
+    if (
+      compilerDiagnostics.some((diagnostic) => diagnostic.category === DiagnosticCategory.Error)
+    ) {
+      return;
+    }
+    emit({ type: 'phase', phase: 'analysis' });
+
+    let loadedDictionaries: LoadedDictionaryTarget[];
+    let dictionaryStageOpen = false;
+    try {
+      stage('dictionary', 'start');
+      dictionaryStageOpen = true;
+      loadedDictionaries = targets.map((target) => {
+        const info = readDictionary(loaded.semantic, target.path, target.requestedExport);
+        return {
+          ...target,
+          id: `${target.path}\0${info.exportName}`,
+          exportName: info.exportName,
+          info
+        };
       });
-      notify(preparedCache.event);
-    }
-    analysis = analyzeLoadedProjectMany(
-      project.loaded,
-      loadedDictionaries,
-      {
-        project: projectPath,
-        includeEvidence: true,
-        ...(options.maxExpansions === undefined ? {} : { maxExpansions: options.maxExpansions }),
-        onFileAnalyzed: (fileName, completedFiles, totalFiles) =>
-          emit({ type: 'file-progress', fileName, completedFiles, totalFiles }),
-        onStage: stage
-      },
-      preparedCache?.reuse ?? {
-        dictionaries: loadedDictionaries
+      stage('dictionary', 'end');
+      dictionaryStageOpen = false;
+      if (cachePaths && cacheEnabled) {
+        // Dictionary provenance is rebuilt above; only serializable usage facts are replayed.
+        preparedCache = prepareAnalysisCache(loaded, loadedDictionaries, {
+          maxExpansions: options.maxExpansions ?? 1_000,
+          paths: cachePaths
+        });
+        notify(preparedCache.event);
       }
-    );
-  } catch (error) {
-    if (dictionaryStageOpen) stage('dictionary', 'end');
-    yield createDiagnostic(
-      DiagnosticCode.ConfigurationFailure,
-      ts.DiagnosticCategory.Error,
-      error instanceof Error ? error.message : String(error)
-    );
-    return;
-  }
-  emit({ type: 'phase', phase: 'results' });
-  let unusedKeyCount = 0;
-  for (const { result } of analysis.analyses) {
-    for (const key of result.keys) {
-      if (key.status === 'unused') unusedKeyCount += 1;
-    }
-  }
-
-  let sourceFilesByPath: Map<string, ts.SourceFile> | undefined;
-  function getSourceFilesByPath(): Map<string, ts.SourceFile> {
-    sourceFilesByPath ??= new Map(
-      project
-        .loaded!.program.getSourceFiles()
-        .map((sourceFile) => [path.resolve(sourceFile.fileName), sourceFile])
-    );
-    return sourceFilesByPath;
-  }
-
-  if (analysis.unresolvedReferences.length > 0) {
-    for (const warning of analysis.unresolvedReferences) {
-      yield diagnosticFromEvidence(getSourceFilesByPath(), project.loaded.configPath, warning);
-    }
-  }
-  if (!options.remove) {
-    for (const cast of analysis.translationObjectCasts) {
-      yield diagnosticFromEvidence(
-        getSourceFilesByPath(),
-        project.loaded.configPath,
-        cast,
-        DiagnosticCode.TranslationObjectCast,
-        ts.DiagnosticCategory.Error
+      analysis = analyzeLoadedProjectMany(
+        loaded,
+        loadedDictionaries,
+        {
+          project: projectPath,
+          includeEvidence: true,
+          ...(options.maxExpansions === undefined ? {} : { maxExpansions: options.maxExpansions }),
+          onFileAnalyzed: (fileName, completedFiles, totalFiles) =>
+            emit({ type: 'file-progress', fileName, completedFiles, totalFiles }),
+          onStage: stage
+        },
+        preparedCache?.reuse ?? {
+          dictionaries: loadedDictionaries
+        }
       );
+    } catch (error) {
+      if (dictionaryStageOpen) stage('dictionary', 'end');
+      yield diagnosticWithoutFile(
+        DiagnosticCode.ConfigurationFailure,
+        DiagnosticCategory.Error,
+        error instanceof Error ? error.message : String(error)
+      );
+      return;
+    }
+    emit({
+      type: 'semantic',
+      singleRequests: loaded.semantic.stats.singleRequests,
+      batchRequests: loaded.semantic.stats.batchRequests
+    });
+    emit({ type: 'phase', phase: 'results' });
+    let unusedKeyCount = 0;
+    for (const { result } of analysis.analyses) {
+      for (const key of result.keys) {
+        if (key.status === 'unused') unusedKeyCount += 1;
+      }
     }
 
-    for (const { target, result } of analysis.analyses) {
-      yield* unusedDiagnostics(
-        result.keys.filter(({ status }) => status === 'unused').map(({ key }) => key),
-        target.info.keySources
-      );
+    if (analysis.unresolvedReferences.length > 0) {
+      for (const warning of analysis.unresolvedReferences) {
+        yield diagnosticFromEvidence(loaded.semantic, loaded.configPath, warning);
+      }
     }
-    writeAnalysisCache();
+    if (!options.remove) {
+      for (const cast of analysis.translationObjectCasts) {
+        yield diagnosticFromEvidence(
+          loaded.semantic,
+          loaded.configPath,
+          cast,
+          DiagnosticCode.TranslationObjectCast,
+          DiagnosticCategory.Error
+        );
+      }
+
+      for (const { target, result } of analysis.analyses) {
+        yield* unusedDiagnostics(
+          result.keys.filter(({ status }) => status === 'unused').map(({ key }) => key),
+          target.info.keySources
+        );
+      }
+      writeAnalysisCache();
+      emit({
+        type: 'summary',
+        unusedKeys: unusedKeyCount,
+        removedKeys: 0,
+        unresolvedReferences: analysis.unresolvedReferences.length,
+        removalFailures: 0,
+        translationObjectCasts: analysis.translationObjectCasts.length,
+        removedCasts: 0
+      });
+      return;
+    }
+
+    stage('removal', 'start');
+    const castRemoval = planTranslationObjectCastRemoval(
+      analysis.translationObjectCasts,
+      loaded.configPath,
+      loaded.semantic
+    );
+    if (castRemoval.failures.length > 0) {
+      for (const failure of castRemoval.failures) {
+        yield diagnosticFromEvidence(
+          loaded.semantic,
+          loaded.configPath,
+          failure,
+          DiagnosticCode.RemovalFailure,
+          DiagnosticCategory.Error
+        );
+      }
+      writeAnalysisCache();
+      stage('removal', 'end');
+      emit({
+        type: 'summary',
+        unusedKeys: unusedKeyCount,
+        removedKeys: 0,
+        unresolvedReferences: analysis.unresolvedReferences.length,
+        removalFailures: castRemoval.failures.length,
+        translationObjectCasts: analysis.translationObjectCasts.length,
+        removedCasts: 0
+      });
+      return;
+    }
+    const removals = analysis.analyses.map(({ target, result }) => ({
+      target,
+      removal: planDictionaryRemoval(
+        target.info,
+        new Set(result.keys.filter(({ status }) => status === 'unused').map(({ key }) => key))
+      )
+    }));
+    const failedRemovals = removals.filter(({ removal }) => !removal.ok);
+    if (failedRemovals.length > 0) {
+      for (const { target, removal } of failedRemovals) {
+        if (removal.ok) continue;
+        for (const failure of removal.failures) {
+          yield removalFailureDiagnostic(failure, target.info.keySources.get(failure.key));
+        }
+      }
+      writeAnalysisCache();
+      stage('removal', 'end');
+      emit({
+        type: 'summary',
+        unusedKeys: unusedKeyCount,
+        removedKeys: 0,
+        unresolvedReferences: analysis.unresolvedReferences.length,
+        removalFailures: failedRemovals.reduce(
+          (count, { removal }) => count + (removal.ok ? 0 : removal.failures.length),
+          0
+        ),
+        translationObjectCasts: analysis.translationObjectCasts.length,
+        removedCasts: 0
+      });
+      return;
+    }
+
+    const combinedPlan = {
+      edits: [
+        ...castRemoval.edits,
+        ...removals.flatMap(({ removal }) => (removal.ok ? [...removal.plan.edits] : []))
+      ],
+      removedKeys: new Set(
+        removals.flatMap(({ removal }) => (removal.ok ? [...removal.plan.removedKeys] : []))
+      )
+    };
+    let removedKeyCount = 0;
+    for (const { removal } of removals) {
+      if (removal.ok) removedKeyCount += removal.plan.removedKeys.size;
+    }
+    try {
+      applyDictionaryRemoval(combinedPlan);
+    } catch (error) {
+      stage('removal', 'end');
+      yield diagnosticAtNode(
+        loadedDictionaries[0]!.info.declaration,
+        DiagnosticCode.RemovalFailure,
+        DiagnosticCategory.Error,
+        error instanceof Error ? error.message : String(error)
+      );
+      emit({
+        type: 'summary',
+        unusedKeys: unusedKeyCount,
+        removedKeys: 0,
+        unresolvedReferences: analysis.unresolvedReferences.length,
+        removalFailures: 1,
+        translationObjectCasts: analysis.translationObjectCasts.length,
+        removedCasts: 0
+      });
+      return;
+    }
+    if (combinedPlan.edits.length === 0) writeAnalysisCache();
+    stage('removal', 'end');
+
+    for (const { target, removal } of removals) {
+      if (!removal.ok) continue;
+      for (const key of removal.plan.removedKeys) {
+        yield diagnosticAtSource(
+          target.info.keySources.get(key),
+          DiagnosticCode.RemovedKey,
+          DiagnosticCategory.Message,
+          `Removed unused translation key "${key}".`
+        );
+      }
+    }
     emit({
       type: 'summary',
-      unusedKeys: unusedKeyCount,
-      removedKeys: 0,
+      unusedKeys: 0,
+      removedKeys: removedKeyCount,
       unresolvedReferences: analysis.unresolvedReferences.length,
       removalFailures: 0,
-      translationObjectCasts: analysis.translationObjectCasts.length,
-      removedCasts: 0
+      translationObjectCasts: 0,
+      removedCasts: castRemoval.edits.length
     });
-    return;
+  } finally {
+    // Runs on normal completion, early `return()` from the consumer, and thrown errors alike,
+    // so the compiler process never outlives the iteration that started it.
+    project.loaded?.[Symbol.dispose]();
   }
 
-  stage('removal', 'start');
-  const castRemoval = planTranslationObjectCastRemoval(
-    analysis.translationObjectCasts,
-    project.loaded.configPath,
-    getSourceFilesByPath()
-  );
-  if (castRemoval.failures.length > 0) {
-    for (const failure of castRemoval.failures) {
-      yield diagnosticFromEvidence(
-        getSourceFilesByPath(),
-        project.loaded.configPath,
-        failure,
-        DiagnosticCode.RemovalFailure,
-        ts.DiagnosticCategory.Error
-      );
-    }
-    writeAnalysisCache();
-    stage('removal', 'end');
-    emit({
-      type: 'summary',
-      unusedKeys: unusedKeyCount,
-      removedKeys: 0,
-      unresolvedReferences: analysis.unresolvedReferences.length,
-      removalFailures: castRemoval.failures.length,
-      translationObjectCasts: analysis.translationObjectCasts.length,
-      removedCasts: 0
-    });
-    return;
-  }
-  const removals = analysis.analyses.map(({ target, result }) => ({
-    target,
-    removal: planDictionaryRemoval(
-      target.info,
-      new Set(result.keys.filter(({ status }) => status === 'unused').map(({ key }) => key))
-    )
-  }));
-  const failedRemovals = removals.filter(({ removal }) => !removal.ok);
-  if (failedRemovals.length > 0) {
-    for (const { target, removal } of failedRemovals) {
-      if (removal.ok) continue;
-      for (const failure of removal.failures) {
-        yield removalFailureDiagnostic(failure, target.info.keySources.get(failure.key));
-      }
-    }
-    writeAnalysisCache();
-    stage('removal', 'end');
-    emit({
-      type: 'summary',
-      unusedKeys: unusedKeyCount,
-      removedKeys: 0,
-      unresolvedReferences: analysis.unresolvedReferences.length,
-      removalFailures: failedRemovals.reduce(
-        (count, { removal }) => count + (removal.ok ? 0 : removal.failures.length),
-        0
-      ),
-      translationObjectCasts: analysis.translationObjectCasts.length,
-      removedCasts: 0
-    });
-    return;
-  }
-
-  const combinedPlan = {
-    edits: [
-      ...castRemoval.edits,
-      ...removals.flatMap(({ removal }) => (removal.ok ? [...removal.plan.edits] : []))
-    ],
-    removedKeys: new Set(
-      removals.flatMap(({ removal }) => (removal.ok ? [...removal.plan.removedKeys] : []))
-    )
-  };
-  let removedKeyCount = 0;
-  for (const { removal } of removals) {
-    if (removal.ok) removedKeyCount += removal.plan.removedKeys.size;
-  }
-  try {
-    applyDictionaryRemoval(combinedPlan);
-  } catch (error) {
-    stage('removal', 'end');
-    yield diagnosticAtNode(
-      loadedDictionaries[0]!.info.declaration,
-      DiagnosticCode.RemovalFailure,
-      ts.DiagnosticCategory.Error,
-      error instanceof Error ? error.message : String(error)
-    );
-    emit({
-      type: 'summary',
-      unusedKeys: unusedKeyCount,
-      removedKeys: 0,
-      unresolvedReferences: analysis.unresolvedReferences.length,
-      removalFailures: 1,
-      translationObjectCasts: analysis.translationObjectCasts.length,
-      removedCasts: 0
-    });
-    return;
-  }
-  if (combinedPlan.edits.length === 0) writeAnalysisCache();
-  stage('removal', 'end');
-
-  for (const { target, removal } of removals) {
-    if (!removal.ok) continue;
-    for (const key of removal.plan.removedKeys) {
-      yield diagnosticAtSource(
-        target.info.keySources.get(key),
-        DiagnosticCode.RemovedKey,
-        ts.DiagnosticCategory.Message,
-        `Removed unused translation key "${key}".`
-      );
-    }
-  }
-  emit({
-    type: 'summary',
-    unusedKeys: 0,
-    removedKeys: removedKeyCount,
-    unresolvedReferences: analysis.unresolvedReferences.length,
-    removalFailures: 0,
-    translationObjectCasts: 0,
-    removedCasts: castRemoval.edits.length
-  });
-
+  /** Persists fresh source facts unless the cache was disabled or every file was reused. */
   function writeAnalysisCache(): void {
     if (!preparedCache || preparedCache.event.type === 'hit') return;
     try {
@@ -378,6 +399,7 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     }
   }
 
+  /** Forwards a cache event to both the lifecycle and the dedicated cache callbacks. */
   function notify(event: CacheEvent): void {
     emit({ type: 'cache', event });
     try {
@@ -387,6 +409,7 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     }
   }
 
+  /** Delivers a lifecycle event to the caller's observer. */
   function emit(event: LintEvent): void {
     try {
       options.onEvent?.(event);
@@ -395,6 +418,7 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
     }
   }
 
+  /** Timestamps a stage boundary for the reporter's debug timings. */
   function stage(
     stageName: Extract<LintEvent, { type: 'stage' }>['stage'],
     status: 'start' | 'end'
@@ -403,20 +427,12 @@ export function* lint(options: LintOptions): Generator<ts.Diagnostic, void, void
   }
 }
 
-/** Cache filesystem failures must degrade to the same cold compiler path as `--no-cache`. */
-function fsCacheAvailable(directory: string): boolean {
-  try {
-    return ts.sys.directoryExists(directory);
-  } catch {
-    return false;
-  }
-}
-
-function unusedDiagnostic(key: string, source: DictionaryKeySource | undefined): ts.Diagnostic {
+/** Reports one unused key at its dictionary property, or without a file when provenance is lost. */
+function unusedDiagnostic(key: string, source: DictionaryKeySource | undefined): Diagnostic {
   return diagnosticAtSource(
     source,
     DiagnosticCode.UnusedKey,
-    ts.DiagnosticCategory.Error,
+    DiagnosticCategory.Error,
     `Translation key "${key}" is unused.`
   );
 }
@@ -425,9 +441,9 @@ function unusedDiagnostic(key: string, source: DictionaryKeySource | undefined):
 function* unusedDiagnostics(
   orderedUnusedKeys: readonly string[],
   keySources: ReadonlyMap<string, DictionaryKeySource>
-): Generator<ts.Diagnostic, void, void> {
+): Generator<Diagnostic, void, void> {
   const unusedKeys = new Set(orderedUnusedKeys);
-  const coverage = new Map<ts.ObjectLiteralElementLike, { total: number; unused: number }>();
+  const coverage = new Map<ObjectLiteralElementLike, { total: number; unused: number }>();
   for (const [key, source] of keySources) {
     for (const property of source.propertyChain) {
       const current = coverage.get(property.node) ?? { total: 0, unused: 0 };
@@ -438,7 +454,7 @@ function* unusedDiagnostics(
   }
 
   const boundaries = new Map<string, DictionaryKeySource['propertyChain'][number]>();
-  const groupedNodes = new Set<ts.ObjectLiteralElementLike>();
+  const groupedNodes = new Set<ObjectLiteralElementLike>();
   for (const key of orderedUnusedKeys) {
     const source = keySources.get(key);
     const boundary = source?.propertyChain.find((property, index) => {
@@ -451,7 +467,7 @@ function* unusedDiagnostics(
     }
   }
 
-  const emitted = new Set<ts.ObjectLiteralElementLike>();
+  const emitted = new Set<ObjectLiteralElementLike>();
   for (const key of orderedUnusedKeys) {
     const source = keySources.get(key);
     if (!source) {
@@ -469,36 +485,41 @@ function* unusedDiagnostics(
     yield diagnosticAtNode(
       boundary.node,
       DiagnosticCode.UnusedKey,
-      ts.DiagnosticCategory.Error,
+      DiagnosticCategory.Error,
       `Translation subtree "${boundary.keyPrefix}" is unused.`
     );
   }
 }
 
+/** Explains why a key could not be removed, listing the provenance barriers that blocked it. */
 function removalFailureDiagnostic(
   failure: DictionaryRemovalFailure,
   source: DictionaryKeySource | undefined
-): ts.Diagnostic {
+): Diagnostic {
   const constraints =
     failure.barriers.length > 0 ? failure.barriers.join(', ') : 'no safe source property';
   return diagnosticAtSource(
     source,
     DiagnosticCode.RemovalFailure,
-    ts.DiagnosticCategory.Error,
+    DiagnosticCategory.Error,
     `Cannot remove unused translation key "${failure.key}": ${constraints}.`
   );
 }
 
+/**
+ * Turns cast evidence back into source edits. Evidence carries only file, line and column, so
+ * each cast is relocated in the program's current source file before it is edited.
+ */
 function planTranslationObjectCastRemoval(
   casts: readonly UsageEvidence[],
   configPath: string,
-  sourceFilesByPath: ReadonlyMap<string, ts.SourceFile>
+  semantic: Semantic
 ): { edits: DictionaryRemovalEdit[]; failures: UsageEvidence[] } {
   const edits: DictionaryRemovalEdit[] = [];
   const failures: UsageEvidence[] = [];
   for (const evidence of casts) {
     const fileName = path.resolve(path.dirname(configPath), evidence.file);
-    const file = sourceFilesByPath.get(fileName);
+    const file = semantic.sourceFile(fileName);
     const line = file
       ? Math.max(0, Math.min(evidence.line - 1, file.getLineStarts().length - 1))
       : 0;
@@ -515,13 +536,13 @@ function planTranslationObjectCastRemoval(
     }
     // Each assertion gets its own non-overlapping range so wrappers such as parentheses survive
     // while chained `as unknown as Type` assertions disappear in the same atomic transaction.
-    let expression: ts.Expression = cast;
+    let expression: Expression = cast;
     while (true) {
-      if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
-        const editStart = ts.isAsExpression(expression)
+      if (isAsExpression(expression) || isTypeAssertion(expression)) {
+        const editStart = isAsExpression(expression)
           ? expression.expression.end
           : expression.getStart(file);
-        const editEnd = ts.isAsExpression(expression)
+        const editEnd = isAsExpression(expression)
           ? expression.end
           : expression.expression.getStart(file);
         if (editEnd <= editStart) {
@@ -541,9 +562,9 @@ function planTranslationObjectCastRemoval(
         continue;
       }
       if (
-        ts.isParenthesizedExpression(expression) ||
-        ts.isNonNullExpression(expression) ||
-        ts.isSatisfiesExpression(expression)
+        isParenthesizedExpression(expression) ||
+        isNonNullExpression(expression) ||
+        isSatisfiesExpression(expression)
       ) {
         expression = expression.expression;
         continue;
@@ -554,122 +575,87 @@ function planTranslationObjectCastRemoval(
   return { edits, failures };
 }
 
+/**
+ * Anchors a key diagnostic on the innermost property name, falling back to the value node and
+ * then to a file-less diagnostic when the key has no recoverable source.
+ */
 function diagnosticAtSource(
   source: DictionaryKeySource | undefined,
   code: number,
-  category: ts.DiagnosticCategory,
-  messageText: string
-): ts.Diagnostic {
+  category: DiagnosticCategory,
+  text: string
+): Diagnostic {
   const property = source?.propertyChain.at(-1)?.node;
   return property
-    ? diagnosticAtNode(propertyNameNode(property), code, category, messageText)
+    ? diagnosticAtNode(propertyNameNode(property), code, category, text)
     : source
-      ? diagnosticAtNode(source.valueNode, code, category, messageText)
-      : createDiagnostic(code, category, messageText);
+      ? diagnosticAtNode(source.valueNode, code, category, text)
+      : diagnosticWithoutFile(code, category, text);
 }
 
-function propertyNameNode(property: ts.ObjectLiteralElementLike): ts.Node {
-  if (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property)) {
+/** Narrows the span to the key name where one exists, so the squiggle stays on a single line. */
+function propertyNameNode(property: ObjectLiteralElementLike): Node {
+  if (isPropertyAssignment(property) || isShorthandPropertyAssignment(property)) {
     return property.name;
   }
   return property;
 }
 
+/**
+ * Rebuilds a positioned diagnostic from serializable evidence, which may come from the analysis
+ * cache. The span covers the cast or call starting at the evidence column, or the rest of the
+ * line (at least one character) when neither is found there.
+ */
 function diagnosticFromEvidence(
-  sourceFilesByPath: ReadonlyMap<string, ts.SourceFile>,
+  semantic: Semantic,
   configPath: string,
   evidence: UsageEvidence,
   code: number = DiagnosticCode.UnresolvedReference,
-  category: ts.DiagnosticCategory = ts.DiagnosticCategory.Warning
-): ts.Diagnostic {
+  category: DiagnosticCategory = DiagnosticCategory.Warning
+): Diagnostic {
   const absolutePath = path.resolve(path.dirname(configPath), evidence.file);
-  const file = sourceFilesByPath.get(absolutePath);
+  const file = semantic.sourceFile(absolutePath);
   if (!file) {
-    return createDiagnostic(code, category, evidence.reason);
+    return diagnosticWithoutFile(code, category, evidence.reason);
   }
   const line = Math.max(0, Math.min(evidence.line - 1, file.getLineStarts().length - 1));
   const lineStart = file.getPositionOfLineAndCharacter(line, 0);
-  const lineEnd = file.getLineEndOfPosition(lineStart);
+  const lineEnd = lineEndOfPosition(file, lineStart);
   const start = Math.min(lineEnd, lineStart + Math.max(0, evidence.column - 1));
   const target = castExpressionStartingAt(file, start) ?? callExpressionStartingAt(file, start);
-  return {
-    category,
-    code,
-    file,
-    length: target?.getWidth(file) ?? Math.max(1, lineEnd - start),
-    messageText: evidence.reason,
-    source: 'unused18n',
-    start
-  };
+  const length = target?.getWidth(file) ?? Math.max(1, lineEnd - start);
+  return diagnosticAt(file, start, start + length, code, category, evidence.reason);
 }
 
-function callExpressionStartingAt(
-  file: ts.SourceFile,
-  start: number
-): ts.CallExpression | undefined {
-  let result: ts.CallExpression | undefined;
-  function visit(node: ts.Node): void {
+/** Finds the outermost call expression whose first token begins exactly at `start`. */
+function callExpressionStartingAt(file: SourceFile, start: number): CallExpression | undefined {
+  let result: CallExpression | undefined;
+  function visit(node: Node): void {
     if (result || node.end < start || node.getStart(file) > start) return;
-    if (ts.isCallExpression(node) && node.getStart(file) === start) {
+    if (isCallExpression(node) && node.getStart(file) === start) {
       result = node;
       return;
     }
-    ts.forEachChild(node, visit);
+    node.forEachChild(visit);
   }
   visit(file);
   return result;
 }
 
+/** Finds the outermost `as` or angle-bracket assertion whose first token begins at `start`. */
 function castExpressionStartingAt(
-  file: ts.SourceFile,
+  file: SourceFile,
   start: number
-): ts.AsExpression | ts.TypeAssertion | undefined {
-  let result: ts.AsExpression | ts.TypeAssertion | undefined;
-  function visit(node: ts.Node): void {
+): AsExpression | TypeAssertion | undefined {
+  let result: AsExpression | TypeAssertion | undefined;
+  function visit(node: Node): void {
     if (result || node.end < start || node.getStart(file) > start) return;
-    if (
-      (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) &&
-      node.getStart(file) === start
-    ) {
+    if ((isAsExpression(node) || isTypeAssertion(node)) && node.getStart(file) === start) {
       result = node;
       return;
     }
-    ts.forEachChild(node, visit);
+    node.forEachChild(visit);
   }
   visit(file);
   return result;
-}
-
-function diagnosticAtNode(
-  node: ts.Node,
-  code: number,
-  category: ts.DiagnosticCategory,
-  messageText: string
-): ts.Diagnostic {
-  const file = node.getSourceFile();
-  return {
-    category,
-    code,
-    file,
-    length: node.getWidth(file),
-    messageText,
-    source: 'unused18n',
-    start: node.getStart(file)
-  };
-}
-
-function createDiagnostic(
-  code: number,
-  category: ts.DiagnosticCategory,
-  messageText: string
-): ts.Diagnostic {
-  return {
-    category,
-    code,
-    file: undefined,
-    length: undefined,
-    messageText,
-    source: 'unused18n',
-    start: undefined
-  };
 }

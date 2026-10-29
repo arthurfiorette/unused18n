@@ -1,13 +1,24 @@
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from '@typescript/typescript6';
+import { version as typescriptVersion } from 'typescript';
+import {
+  isExternalModule,
+  isStringLiteralLikeNode,
+  type SourceFile,
+  type StringLiteralLikeNode
+} from 'typescript/ast';
 import type { AnalysisReuse, LoadedDictionaryTarget, SourceUsageFacts } from './analyzer.js';
-import type { LoadedProject } from './project.js';
+import {
+  findConfigFile,
+  isApplicationFileName,
+  isDirectory,
+  type LoadedProject
+} from './project.js';
 
 // Bump either version whenever persisted shape or analyzer semantics would make old facts unsafe.
-const CACHE_SCHEMA_VERSION = 4;
-const ANALYSIS_ALGORITHM_VERSION = 11;
+const CACHE_SCHEMA_VERSION = 5;
+const ANALYSIS_ALGORITHM_VERSION = 12;
 const MAX_CACHE_BYTES = 64 * 1024 * 1024;
 
 /** Cache observability stays separate from TypeScript diagnostics and never affects lint status. */
@@ -20,12 +31,11 @@ export type CacheEvent =
       reusedFiles: number;
     }
   | { type: 'write'; files: number }
-  | { type: 'error'; operation: 'read' | 'write' | 'compiler'; message: string };
+  | { type: 'error'; operation: 'read' | 'write' | 'directory'; message: string };
 
 export interface CachePaths {
   directory: string;
   entryFile: string;
-  tsBuildInfoFile: string;
 }
 
 export interface PreparedAnalysisCache {
@@ -59,7 +69,12 @@ interface CurrentSource {
 
 const packageVersion = readPackageVersion();
 
-/** Keeps different projects, dictionaries, and exports from sharing compiler or analysis state. */
+/**
+ * Keeps different projects, dictionaries, and exports from sharing analysis state.
+ *
+ * The project is located the same way `loadProjectWithDiagnostics` locates it, so the identity
+ * matches the configuration that is actually loaded.
+ */
 export function resolveCachePaths(
   project: string,
   dictionaries: readonly string[],
@@ -67,9 +82,8 @@ export function resolveCachePaths(
   cacheDir?: string
 ): CachePaths {
   const resolvedProject = path.resolve(project);
-  const configPath = ts.sys.directoryExists(resolvedProject)
-    ? (ts.findConfigFile(resolvedProject, ts.sys.fileExists, 'tsconfig.json') ??
-      path.join(resolvedProject, 'tsconfig.json'))
+  const configPath = isDirectory(resolvedProject)
+    ? (findConfigFile(resolvedProject) ?? path.join(resolvedProject, 'tsconfig.json'))
     : resolvedProject;
   const projectDirectory = path.dirname(configPath);
   const directory = cacheDir
@@ -82,8 +96,7 @@ export function resolveCachePaths(
   });
   return {
     directory,
-    entryFile: path.join(directory, `analysis-${identity}.json`),
-    tsBuildInfoFile: path.join(directory, `compiler-${identity}.tsbuildinfo`)
+    entryFile: path.join(directory, `analysis-${identity}.json`)
   };
 }
 
@@ -103,7 +116,7 @@ export function prepareAnalysisCache(
     paths: CachePaths;
   }
 ): PreparedAnalysisCache {
-  const currentSources = snapshotSources(loaded.program);
+  const currentSources = snapshotSources(loaded);
   const compatibilityHash = computeCompatibilityHash(loaded, dictionaries, options);
   let cached = readEntry(options.paths.entryFile);
   if (
@@ -188,7 +201,7 @@ export function prepareAnalysisCache(
           schemaVersion: CACHE_SCHEMA_VERSION,
           analysisVersion: ANALYSIS_ALGORITHM_VERSION,
           packageVersion,
-          typescriptVersion: ts.version,
+          typescriptVersion,
           compatibilityHash,
           sources
         };
@@ -211,21 +224,21 @@ function factsTargetCurrentDictionaries(
   );
 }
 
-function snapshotSources(program: ts.Program): Record<string, CurrentSource> {
-  const applicationFiles = program.getSourceFiles().filter(isApplicationSource);
-  const applicationNames = new Set(applicationFiles.map((source) => path.resolve(source.fileName)));
+/**
+ * Fingerprints every application source, including JSON roots such as dictionaries, so cached
+ * facts are replayed only for files whose content, edges, and global reach are unchanged.
+ */
+function snapshotSources(loaded: LoadedProject): Record<string, CurrentSource> {
+  const dependencies = dependenciesFor(loaded);
   return Object.fromEntries(
-    applicationFiles.map((source) => {
-      const fileName = path.resolve(source.fileName);
-      return [
-        fileName,
-        {
-          hash: hash(source.text),
-          dependencies: dependenciesFor(source, program.getCompilerOptions(), applicationNames),
-          global: affectsGlobalScope(source)
-        }
-      ];
-    })
+    loaded.sourceFiles.map((source, index) => [
+      path.resolve(source.fileName),
+      {
+        hash: hash(source.text),
+        dependencies: dependencies[index] ?? [],
+        global: affectsGlobalScope(source)
+      }
+    ])
   );
 }
 
@@ -235,16 +248,27 @@ function computeCompatibilityHash(
   dictionaries: LoadedDictionaryTarget[],
   options: { maxExpansions: number }
 ): string {
-  const externalSources = loaded.program
-    .getSourceFiles()
-    .filter((source) => !isApplicationSource(source))
-    .map((source) => [path.resolve(source.fileName), hash(source.text)])
+  const externalNames = loaded.program
+    .getSourceFileNames()
+    .filter((fileName) => !isApplicationFileName(fileName));
+  const metadata =
+    externalNames.length > 0
+      ? loaded.semantic.api.batch(
+          ...externalNames.map((fileName) => loaded.program.getSourceFileMetadata.gen(fileName))
+        )
+      : [];
+  const externalSources = externalNames
+    // Bundled lib files change only with the compiler, which `typescriptVersion` already covers.
+    .filter((_, index) => metadata[index]?.isDefaultLibrary !== true)
+    .map((fileName) => [path.resolve(fileName), externalSourceHash(loaded, fileName)])
     .sort(([left], [right]) => comparePaths(left ?? '', right ?? ''));
   const compilerOptions = Object.fromEntries(
     Object.entries(loaded.program.getCompilerOptions()).filter(
       ([key, value]) =>
         value !== undefined &&
+        // `configFilePath` duplicates `configPath` below; the others only steer compiler caching.
         key !== 'configFile' &&
+        key !== 'configFilePath' &&
         key !== 'incremental' &&
         key !== 'tsBuildInfoFile'
     )
@@ -253,7 +277,7 @@ function computeCompatibilityHash(
     schemaVersion: CACHE_SCHEMA_VERSION,
     analysisVersion: ANALYSIS_ALGORITHM_VERSION,
     packageVersion,
-    typescriptVersion: ts.version,
+    typescriptVersion,
     configPath: path.resolve(loaded.configPath),
     compilerOptions,
     dictionaries: dictionaries.map(({ id, locale, info }) => ({
@@ -266,30 +290,66 @@ function computeCompatibilityHash(
   });
 }
 
-function dependenciesFor(
-  source: ts.SourceFile,
-  compilerOptions: ts.CompilerOptions,
-  applicationNames: ReadonlySet<string>
-): string[] {
-  // Static preprocessing gives stable path edges without persisting process-local Symbols or Types.
-  const dependencies = new Set<string>();
-  const preprocessed = ts.preProcessFile(source.text, true, true);
-  for (const imported of preprocessed.importedFiles) {
-    const resolved = ts.resolveModuleName(
-      imported.fileName,
-      source.fileName,
-      compilerOptions,
-      ts.sys
-    ).resolvedModule?.resolvedFileName;
-    if (!resolved) continue;
-    const fileName = path.resolve(resolved);
-    if (applicationNames.has(fileName)) dependencies.add(fileName);
+/**
+ * Hashes an external file from disk so large package typings never cross the compiler IPC
+ * boundary. Files with no disk copy, such as ones the compiler synthesizes, fall back to the
+ * program's text.
+ */
+function externalSourceHash(loaded: LoadedProject, fileName: string): string | null {
+  let contents: Buffer;
+  try {
+    contents = fs.readFileSync(fileName);
+  } catch {
+    const text = loaded.semantic.sourceFile(fileName)?.text;
+    return text === undefined ? null : hash(text);
   }
-  for (const reference of preprocessed.referencedFiles) {
-    const fileName = path.resolve(path.dirname(source.fileName), reference.fileName);
-    if (applicationNames.has(fileName)) dependencies.add(fileName);
-  }
-  return [...dependencies].sort(comparePaths);
+  return hash(contents);
+}
+
+/**
+ * Collects the application files each application source imports, in `loaded.sourceFiles` order.
+ *
+ * Edges are file paths, so they persist without process-local Symbols or Types. Module
+ * specifiers go through the program's own resolution, so an edge exists exactly when the
+ * checker followed it; every source is resolved in a single batched request because each
+ * resolution is otherwise one IPC round trip.
+ */
+function dependenciesFor(loaded: LoadedProject): string[][] {
+  const { program, semantic, sourceFiles } = loaded;
+  const applicationNames = new Set(sourceFiles.map((source) => path.resolve(source.fileName)));
+  const requests: { index: number; fileName: string; specifier: StringLiteralLikeNode }[] = [];
+  sourceFiles.forEach((source, index) => {
+    // Augmentations of other modules are listed separately from imports; `declare global`
+    // names are identifiers and drop out here.
+    for (const node of [...source.imports, ...source.moduleAugmentations]) {
+      if (isStringLiteralLikeNode(node)) {
+        requests.push({ index, fileName: source.fileName, specifier: node });
+      }
+    }
+  });
+  const resolved =
+    requests.length > 0
+      ? semantic.api.batch(
+          ...requests.map(({ fileName, specifier }) =>
+            program.getResolvedModuleFromModuleSpecifier.gen(specifier, fileName)
+          )
+        )
+      : [];
+
+  const dependencies = sourceFiles.map(() => new Set<string>());
+  requests.forEach(({ index }, position) => {
+    const resolvedFileName = resolved[position]?.resolvedFileName;
+    if (!resolvedFileName) return;
+    const fileName = path.resolve(resolvedFileName);
+    if (applicationNames.has(fileName)) dependencies[index]?.add(fileName);
+  });
+  sourceFiles.forEach((source, index) => {
+    for (const reference of source.referencedFiles) {
+      const fileName = path.resolve(path.dirname(source.fileName), reference.fileName);
+      if (applicationNames.has(fileName)) dependencies[index]?.add(fileName);
+    }
+  });
+  return dependencies.map((edges) => [...edges].sort(comparePaths));
 }
 
 function changedFiles(
@@ -392,7 +452,7 @@ function isCacheEntry(value: unknown): value is CacheEntry {
     value.schemaVersion !== CACHE_SCHEMA_VERSION ||
     value.analysisVersion !== ANALYSIS_ALGORITHM_VERSION ||
     value.packageVersion !== packageVersion ||
-    value.typescriptVersion !== ts.version ||
+    value.typescriptVersion !== typescriptVersion ||
     typeof value.compatibilityHash !== 'string'
   )
     return false;
@@ -449,27 +509,15 @@ function isEvidence(value: unknown): boolean {
   );
 }
 
-function isApplicationSource(source: ts.SourceFile): boolean {
-  const fileName = path.resolve(source.fileName);
-  return !source.isDeclarationFile && !fileName.includes(`${path.sep}node_modules${path.sep}`);
-}
-
-/** Global scripts and module augmentations can affect files without resolvable import edges. */
-function affectsGlobalScope(source: ts.SourceFile): boolean {
-  if (!ts.isExternalModule(source)) return true;
-  let found = false;
-  function visit(node: ts.Node): void {
-    if (
-      ts.isModuleDeclaration(node) &&
-      ((node.flags & ts.NodeFlags.GlobalAugmentation) !== 0 || ts.isStringLiteral(node.name))
-    ) {
-      found = true;
-      return;
-    }
-    if (!found) ts.forEachChild(node, visit);
-  }
-  visit(source);
-  return found;
+/**
+ * Global scripts and module augmentations can affect files without resolvable import edges.
+ *
+ * The binder records both `declare global {}` and `declare module "x" {}` of a module in
+ * `moduleAugmentations` while plain namespaces never appear there, so no AST walk is needed;
+ * 7.x no longer exposes the `GlobalAugmentation` node flag that walk depended on.
+ */
+function affectsGlobalScope(source: SourceFile): boolean {
+  return !isExternalModule(source) || source.moduleAugmentations.length > 0;
 }
 
 function hashCanonical(value: unknown): string {
@@ -506,7 +554,7 @@ function updateCanonicalHash(digest: ReturnType<typeof createHash>, value: unkno
   digest.update(value === undefined ? 'null' : JSON.stringify(value));
 }
 
-function hash(value: string): string {
+function hash(value: string | Uint8Array): string {
   return createHash('sha256').update(value).digest('hex');
 }
 

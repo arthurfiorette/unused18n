@@ -1,5 +1,5 @@
 import { Command, Flags } from '@oclif/core';
-import ts from '@typescript/typescript6';
+import { DiagnosticCategory } from 'typescript/sync';
 import { ConfigFileError, loadConfig } from './config.js';
 import { DiagnosticCode, type LintOptions, lint } from './lint.js';
 import { createReporter } from './reporter.js';
@@ -8,7 +8,7 @@ import type { Unused18nConfig } from './types.js';
 const cliFlags = {
   cache: Flags.boolean({
     allowNo: true,
-    summary: 'Reuse persistent compiler and per-file analysis caches (default: true)'
+    summary: 'Reuse the persistent per-file analysis cache (default: true)'
   }),
   'cache-dir': Flags.string({
     helpValue: '<path>',
@@ -137,7 +137,7 @@ export default class Unused18n extends Command {
     for (const diagnostic of lint(lintOptions)) {
       reporter.diagnostic(diagnostic);
       if (
-        diagnostic.category === ts.DiagnosticCategory.Error ||
+        diagnostic.category === DiagnosticCategory.Error ||
         diagnostic.code === DiagnosticCode.UnusedKey
       ) {
         failed = true;
@@ -150,6 +150,7 @@ export default class Unused18n extends Command {
 
 export const COMMANDS = { lint: Unused18n };
 
+export type { Diagnostic } from 'typescript/sync';
 export type { CacheEvent, LintEvent, LintOptions } from './lint.js';
 export type { LogLevel, Unused18nConfig } from './types.js';
 export { DiagnosticCode, lint };

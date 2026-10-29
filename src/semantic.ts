@@ -55,14 +55,19 @@ export class Semantic {
   private readonly defaultLibraries = new Map<SourceFile, boolean>();
   private readonly sourceFiles = new Map<string, SourceFile | null>();
 
+  /** The API instance that owns the compiler process, used for batched requests. */
+  readonly api: API;
+  /** The program every lookup is answered against. */
+  readonly program: Program;
+
   /**
-   * @param api The API instance that owns the compiler process, used for batched requests.
+   * @param api The API instance that owns the compiler process.
    * @param program The program every lookup is answered against.
    */
-  constructor(
-    readonly api: API,
-    readonly program: Program
-  ) {}
+  constructor(api: API, program: Program) {
+    this.api = api;
+    this.program = program;
+  }
 
   /** The checker of {@link program}, exposed for the few uncached, cold-path queries. */
   get checker(): Checker {
@@ -96,7 +101,9 @@ export class Semantic {
     if (missing.length > 0) {
       this.stats.batchRequests += 1;
       const fetched = this.api.batch(...missing.map((key) => this.program.getSourceFile.gen(key)));
-      missing.forEach((key, index) => this.sourceFiles.set(key, fetched[index] ?? null));
+      missing.forEach((key, index) => {
+        this.sourceFiles.set(key, fetched[index] ?? null);
+      });
     }
     return keys.map((key) => this.sourceFiles.get(key) ?? undefined);
   }
@@ -277,7 +284,9 @@ export class Semantic {
     if (pending.length === 0) return;
     this.stats.batchRequests += 1;
     const symbols = this.checker.getSymbolAtLocation(pending);
-    pending.forEach((node, index) => this.rawSymbols.set(node, symbols[index] ?? null));
+    pending.forEach((node, index) => {
+      this.rawSymbols.set(node, symbols[index] ?? null);
+    });
 
     const resolved = new Set<TsSymbol>();
     const aliases = new Set<TsSymbol>();

@@ -1,7 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from '@typescript/typescript6';
+import {
+  createScanner,
+  isObjectLiteralExpression,
+  isPropertyAssignment,
+  isShorthandPropertyAssignment,
+  type ObjectLiteralElementLike,
+  type ObjectLiteralExpression,
+  type PropertyAssignment,
+  type ShorthandPropertyAssignment,
+  type SourceFile,
+  SyntaxKind
+} from 'typescript/ast';
 import type {
   DictionaryInfo,
   DictionaryKeySource,
@@ -42,7 +53,7 @@ export type DictionaryRemovalPlanResult =
   | { readonly ok: true; readonly plan: DictionaryRemovalPlan }
   | { readonly ok: false; readonly failures: readonly DictionaryRemovalFailure[] };
 
-type PropertyCoverage = Map<ts.ObjectLiteralElementLike, { total: number; unused: number }>;
+type PropertyCoverage = Map<ObjectLiteralElementLike, { total: number; unused: number }>;
 
 /**
  * Plans safe source removals without mutating the AST or filesystem.
@@ -56,7 +67,7 @@ export function planDictionaryRemoval(
 ): DictionaryRemovalPlanResult {
   const activeUnusedKeys = new Set([...unusedKeys].filter((key) => dictionary.keySources.has(key)));
   const coverage = propertyCoverage(dictionary.keySources, activeUnusedKeys);
-  const selectedProperties = new Map<ts.ObjectLiteralElementLike, DictionarySourceProperty>();
+  const selectedProperties = new Map<ObjectLiteralElementLike, DictionarySourceProperty>();
   const failures: DictionaryRemovalFailure[] = [];
 
   for (const key of activeUnusedKeys) {
@@ -248,19 +259,19 @@ function uniqueBarriers(
 }
 
 function isSupportedProperty(
-  node: ts.ObjectLiteralElementLike
-): node is ts.PropertyAssignment | ts.ShorthandPropertyAssignment {
-  return ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node);
+  node: ObjectLiteralElementLike
+): node is PropertyAssignment | ShorthandPropertyAssignment {
+  return isPropertyAssignment(node) || isShorthandPropertyAssignment(node);
 }
 
 function editsForProperties(
-  sourceFile: ts.SourceFile,
-  selected: ReadonlySet<ts.ObjectLiteralElementLike>
+  sourceFile: SourceFile,
+  selected: ReadonlySet<ObjectLiteralElementLike>
 ): DictionaryRemovalEdit[] {
   const edits: DictionaryRemovalEdit[] = [];
-  const parents = new Set<ts.ObjectLiteralExpression>();
+  const parents = new Set<ObjectLiteralExpression>();
   for (const property of selected) {
-    if (!ts.isObjectLiteralExpression(property.parent)) {
+    if (!isObjectLiteralExpression(property.parent)) {
       throw new Error('Dictionary property is not inside an object literal');
     }
     parents.add(property.parent);
@@ -292,8 +303,8 @@ function editsForProperties(
 }
 
 function removalRange(
-  sourceFile: ts.SourceFile,
-  properties: readonly ts.ObjectLiteralElementLike[],
+  sourceFile: SourceFile,
+  properties: readonly ObjectLiteralElementLike[],
   first: number,
   last: number
 ): { start: number; end: number } {
@@ -317,7 +328,7 @@ function removalRange(
   }
 
   const parent = firstProperty.parent;
-  const trailingComma = ts.isObjectLiteralExpression(parent)
+  const trailingComma = isObjectLiteralExpression(parent)
     ? findCommaBetween(sourceFile, lastProperty.end, parent.end)
     : undefined;
   return {
@@ -327,7 +338,7 @@ function removalRange(
 }
 
 function commaBetween(
-  sourceFile: ts.SourceFile,
+  sourceFile: SourceFile,
   start: number,
   end: number
 ): { start: number; end: number } {
@@ -336,24 +347,24 @@ function commaBetween(
   throw new Error('Expected a comma between dictionary properties');
 }
 
+/**
+ * Returns the first comma token scanned between `start` and `end`. Commas inside comments and
+ * string literals are trivia or literal text to the scanner, so they never match.
+ */
 function findCommaBetween(
-  sourceFile: ts.SourceFile,
+  sourceFile: SourceFile,
   start: number,
   end: number
 ): { start: number; end: number } | undefined {
-  const scanner = ts.createScanner(
-    sourceFile.languageVersion,
-    true,
-    sourceFile.languageVariant,
-    sourceFile.text
-  );
-  scanner.setTextPos(start);
-  while (scanner.getTextPos() < end) {
+  const scanner = createScanner(true, sourceFile.languageVariant, sourceFile.text);
+  // resetTokenState and getTokenEnd mirror TS 6 setTextPos and getTextPos, so ranges stay identical.
+  scanner.resetTokenState(start);
+  while (scanner.getTokenEnd() < end) {
     const token = scanner.scan();
-    if (token === ts.SyntaxKind.CommaToken) {
-      return { start: scanner.getTokenPos(), end: scanner.getTextPos() };
+    if (token === SyntaxKind.CommaToken) {
+      return { start: scanner.getTokenStart(), end: scanner.getTokenEnd() };
     }
-    if (token === ts.SyntaxKind.EndOfFileToken) break;
+    if (token === SyntaxKind.EndOfFile) break;
   }
   return undefined;
 }

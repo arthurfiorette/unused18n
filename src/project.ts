@@ -1,7 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { SourceFile } from 'typescript/ast';
-import { API, type Checker, type Diagnostic, DiagnosticCategory, type Program } from 'typescript/sync';
+import {
+  API,
+  type Checker,
+  type Diagnostic,
+  DiagnosticCategory,
+  type Program
+} from 'typescript/sync';
 import { DiagnosticCode } from './diagnostic-codes.js';
 import { diagnosticWithoutFile, flattenDiagnosticText } from './diagnostics.js';
 import { Semantic } from './semantic.js';
@@ -31,7 +37,9 @@ export interface ProjectLoadResult {
 export function loadProject(projectPath: string, extraFiles: string[] = []): LoadedProject {
   const result = loadProjectWithDiagnostics(projectPath, extraFiles);
   if (result.loaded) return result.loaded;
-  throw new Error(result.diagnostics.map((diagnostic) => flattenDiagnosticText(diagnostic)).join('\n'));
+  throw new Error(
+    result.diagnostics.map((diagnostic) => flattenDiagnosticText(diagnostic)).join('\n')
+  );
 }
 
 /**
