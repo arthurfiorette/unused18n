@@ -50,10 +50,10 @@ function portableDiagnostics(diagnostics) {
   return diagnostics.map((diagnostic) => ({
     category: diagnostic.category,
     code: diagnostic.code,
-    file: diagnostic.file?.fileName,
-    length: diagnostic.length,
-    message: String(diagnostic.messageText),
-    start: diagnostic.start
+    file: diagnostic.fileName,
+    end: diagnostic.end,
+    message: diagnostic.text,
+    pos: diagnostic.pos
   }));
 }
 
@@ -62,7 +62,7 @@ function filesUnder(directory) {
   return fs.readdirSync(directory, { recursive: true }).map((entry) => path.join(directory, entry));
 }
 
-test('persists compiler build info and reuses complete analysis facts', (t) => {
+test('reuses complete analysis facts without persisting compiler build info', (t) => {
   const project = temporaryProject(t);
   const cacheDir = path.join(project, 'cache');
 
@@ -84,7 +84,10 @@ test('persists compiler build info and reuses complete analysis facts', (t) => {
   assert.equal(warm.events[0]?.reusedFiles, 3);
 
   const cacheFiles = filesUnder(cacheDir);
-  assert.ok(cacheFiles.some((file) => file.endsWith('.tsbuildinfo')));
+  assert.equal(
+    cacheFiles.some((file) => file.endsWith('.tsbuildinfo')),
+    false
+  );
   assert.ok(cacheFiles.some((file) => file.endsWith('.json')));
   assert.equal(fs.existsSync(path.join(project, 'usage.js')), false);
   assert.equal(fs.existsSync(path.join(project, 'dictionary.js')), false);
@@ -108,8 +111,8 @@ test('persists compact subtree observations and replays deterministic evidence',
   const entryPath = filesUnder(cacheDir).find((file) => file.endsWith('.json'));
   assert.ok(entryPath);
   const entry = JSON.parse(fs.readFileSync(entryPath, 'utf8'));
-  assert.equal(entry.schemaVersion, 4);
-  assert.equal(entry.analysisVersion, 11);
+  assert.equal(entry.schemaVersion, 5);
+  assert.equal(entry.analysisVersion, 12);
   const usageFacts = entry.sources[path.join(project, 'usage.ts')].facts;
   assert.equal(Object.hasOwn(usageFacts, 'facts'), false);
   assert.ok(usageFacts.observations.length < 10);
@@ -127,7 +130,8 @@ test('persists compact subtree observations and replays deterministic evidence',
   );
 
   const loaded = loadProject(project, [dictionaryPath]);
-  const info = readDictionary(loaded.program, loaded.checker, dictionaryPath);
+  t.after(() => loaded[Symbol.dispose]());
+  const info = readDictionary(loaded.semantic, dictionaryPath);
   const target = {
     id: `${dictionaryPath}\0${info.exportName}`,
     path: dictionaryPath,
@@ -204,6 +208,31 @@ test('reanalyzes everything when global scope can cross graph edges', (t) => {
   }
 });
 
+test('declare global forces full reanalysis while a module-local namespace does not', (t) => {
+  for (const [contents, analyzedFiles] of [
+    [`export {}\ndeclare global { interface Marker { value: string } }\n`, 4],
+    [`export {}\nnamespace Local { export const value = 1 }\n`, 1]
+  ]) {
+    const project = temporaryProject(t);
+    const cacheDir = path.join(project, 'cache');
+    fs.writeFileSync(path.join(project, 'scope.ts'), contents);
+    runLint(project, cacheDir);
+
+    fs.writeFileSync(path.join(project, 'other.ts'), `export const unrelated = 2\n`);
+    const changed = runLint(project, cacheDir);
+    const uncached = runLint(project, path.join(project, 'uncached'), { cache: false });
+
+    assert.equal(changed.events[0]?.type, 'miss', contents);
+    assert.equal(changed.events[0]?.reason, 'changed', contents);
+    assert.equal(changed.events[0]?.analyzedFiles, analyzedFiles, contents);
+    assert.equal(changed.events[0]?.reusedFiles, 4 - analyzedFiles, contents);
+    assert.deepEqual(
+      portableDiagnostics(changed.diagnostics),
+      portableDiagnostics(uncached.diagnostics)
+    );
+  }
+});
+
 test('invalidates connected dependents and dictionary shape changes', (t) => {
   const project = temporaryProject(t);
   const cacheDir = path.join(project, 'cache');
@@ -224,9 +253,7 @@ test('invalidates connected dependents and dictionary shape changes', (t) => {
   const dictionaryChanged = runLint(project, cacheDir);
   assert.equal(dictionaryChanged.events[0]?.reason, 'incompatible');
   assert.equal(dictionaryChanged.events[0]?.analyzedFiles, 3);
-  assert.ok(
-    dictionaryChanged.diagnostics.some(({ messageText }) => String(messageText).includes('"added"'))
-  );
+  assert.ok(dictionaryChanged.diagnostics.some(({ text }) => text.includes('"added"')));
 });
 
 test('recovers from corrupt entries and bypasses analysis cache when requested', (t) => {
@@ -283,7 +310,7 @@ test('caches JSON analysis and invalidates changed dictionary keys', (t) => {
   );
   const changed = run();
   assert.equal(changed.events[0]?.reason, 'incompatible');
-  assert.ok(changed.diagnostics.some(({ messageText }) => String(messageText).includes('"added"')));
+  assert.ok(changed.diagnostics.some(({ text }) => text.includes('"added"')));
 });
 
 test('warm --remove replays facts and does not persist pre-mutation facts', (t) => {
@@ -444,9 +471,8 @@ test('failed mutation rolls back and does not cache pre-mutation facts', (t) => 
 
   assert.ok(
     failed.diagnostics.some(
-      ({ code, messageText }) =>
-        code === DiagnosticCode.RemovalFailure &&
-        String(messageText).includes('injected replacement failure')
+      ({ code, text }) =>
+        code === DiagnosticCode.RemovalFailure && text.includes('injected replacement failure')
     )
   );
   assert.deepEqual(

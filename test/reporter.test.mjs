@@ -1,7 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import ts from '@typescript/typescript6';
+import { DiagnosticCategory } from 'typescript/sync';
 import { createReporter } from '../dist/reporter.js';
+
+/**
+ * Builds a file-less diagnostic in the shape `lint()` yields.
+ *
+ * @param {DiagnosticCategory} category
+ * @param {number} code
+ * @param {string} text
+ * @param {string | null} [source] `null` builds a compiler diagnostic, which has no source.
+ */
+function diagnostic(category, code, text, source = 'U18N') {
+  return { pos: 0, end: 0, category, code, text, ...(source ? { source } : {}) };
+}
 
 test('throttles operational events while diagnostics remain immediate', () => {
   let time = 0;
@@ -16,7 +28,7 @@ test('throttles operational events while diagnostics remain immediate', () => {
   reporter.event({ type: 'phase', phase: 'project' });
   time = 1_000;
   reporter.event({ type: 'phase', phase: 'analysis' });
-  reporter.diagnostic({ category: ts.DiagnosticCategory.Error, code: 1, messageText: 'failure' });
+  reporter.diagnostic(diagnostic(DiagnosticCategory.Error, 1, 'failure'));
   time = 3_000;
   reporter.event({
     type: 'file-progress',
@@ -28,7 +40,7 @@ test('throttles operational events while diagnostics remain immediate', () => {
   reporter.event({ type: 'phase', phase: 'results' });
 
   assert.equal(messages.length, 3);
-  assert.match(messages[0], /error TS1: failure/);
+  assert.match(messages[0], /error U18N1: failure/);
   assert.match(messages[1], /50% of files processed/);
   assert.match(messages[2], /Preparing diagnostics/);
   assert.ok(messages.every((message) => !message.includes('\u001B[')));
@@ -43,10 +55,42 @@ test('silent suppresses operations but TTY diagnostics use color', () => {
   });
 
   reporter.event({ type: 'phase', phase: 'project' });
-  reporter.diagnostic({ category: ts.DiagnosticCategory.Error, code: 1, messageText: 'failure' });
+  reporter.diagnostic(diagnostic(DiagnosticCategory.Error, 1, 'failure'));
 
   assert.equal(messages.length, 1);
   assert.equal(messages[0].includes('\u001B['), true);
+});
+
+test('prints compiler diagnostics with the TS prefix', () => {
+  const messages = [];
+  const reporter = createReporter({
+    level: 'info',
+    isTTY: false,
+    write: (message) => messages.push(message)
+  });
+
+  reporter.diagnostic(diagnostic(DiagnosticCategory.Error, 5108, 'Option has been removed.', null));
+
+  assert.deepEqual(messages, ['error TS5108: Option has been removed.']);
+});
+
+test('reports semantic request counts only at debug level', () => {
+  const output = (level) => {
+    let time = 0;
+    const messages = [];
+    const reporter = createReporter({
+      level,
+      isTTY: false,
+      now: () => time,
+      write: (message) => messages.push(message)
+    });
+    time = 3_000;
+    reporter.event({ type: 'semantic', singleRequests: 2, batchRequests: 7 });
+    return messages;
+  };
+
+  assert.deepEqual(output('debug'), ['[3.0s] Semantic requests: single=2 batch=7']);
+  assert.deepEqual(output('info'), []);
 });
 
 test('reports cache lifecycle only at debug level and through the same throttle', () => {
@@ -94,16 +138,8 @@ test('suppresses per-key diagnostics and reports final statistics even in silent
     write: (message) => messages.push(message)
   });
 
-  reporter.diagnostic({
-    category: ts.DiagnosticCategory.Error,
-    code: 95_001,
-    messageText: 'unused key'
-  });
-  reporter.diagnostic({
-    category: ts.DiagnosticCategory.Message,
-    code: 95_003,
-    messageText: 'removed key'
-  });
+  reporter.diagnostic(diagnostic(DiagnosticCategory.Error, 95_001, 'unused key'));
+  reporter.diagnostic(diagnostic(DiagnosticCategory.Message, 95_003, 'removed key'));
   reporter.event({
     type: 'summary',
     unusedKeys: 4_184,

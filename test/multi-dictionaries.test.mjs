@@ -21,10 +21,7 @@ test('analyzes locale dictionaries with different valid plural shapes', () => {
   const unused = diagnostics.filter(({ code }) => code === DiagnosticCode.UnusedKey);
 
   assert.deepEqual(
-    unused.map((diagnostic) => [
-      path.basename(diagnostic.file?.fileName ?? ''),
-      diagnostic.messageText
-    ]),
+    unused.map((diagnostic) => [path.basename(diagnostic.fileName ?? ''), diagnostic.text]),
     [
       ['ar.json', 'Translation key "unused" is unused.'],
       ['en.json', 'Translation key "shape" is unused.'],
@@ -34,10 +31,7 @@ test('analyzes locale dictionaries with different valid plural shapes', () => {
     ]
   );
   assert.equal(
-    diagnostics.some(
-      ({ messageText }) =>
-        typeof messageText === 'string' && /item_(one|other|few|many|two|zero)/.test(messageText)
-    ),
+    diagnostics.some(({ text }) => /item_(one|other|few|many|two|zero)/.test(text)),
     false
   );
   assert.equal(
@@ -83,11 +77,11 @@ test('reuses one cached source analysis across every locale dictionary', (t) => 
   const warm = run();
 
   const portable = (diagnostics) =>
-    diagnostics.map(({ code, messageText, file, start }) => ({
+    diagnostics.map(({ code, text, fileName, pos }) => ({
       code,
-      messageText: String(messageText),
-      file: file?.fileName,
-      start
+      text,
+      fileName,
+      pos
     }));
   assert.deepEqual(portable(warm.diagnostics), portable(cold.diagnostics));
   assert.deepEqual(

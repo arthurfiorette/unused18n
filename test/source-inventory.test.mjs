@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import ts from '@typescript/typescript6';
 import { inventorySource } from '../dist/source-inventory.js';
+import { parseSource } from './helpers.mjs';
 
-test('inventories sparse syntax categories in source order with lexical owners', () => {
-  const source = ts.createSourceFile(
+test('inventories sparse syntax categories in source order with lexical owners', (t) => {
+  const source = parseSource(
+    t,
     'usage.tsx',
     `const top = hook()
 function outer(value) {
@@ -15,10 +16,7 @@ function outer(value) {
   }
   return object.child
 }
-`,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TSX
+`
   );
   const inventory = inventorySource(source);
   const text = (node) => node.getText(source);

@@ -4,8 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import ts from '@typescript/typescript6';
+import { DiagnosticCategory } from 'typescript/sync';
 import { DiagnosticCode, lint } from '../dist/index.js';
+import { diagnosticSource } from './helpers.mjs';
 
 const project = fileURLToPath(new URL('./fixtures/object-flow', import.meta.url));
 
@@ -15,7 +16,7 @@ test('tracks translation objects through parameters, JSX props, and returned obj
   ];
   const unused = diagnostics
     .filter(({ code }) => code === DiagnosticCode.UnusedKey)
-    .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]);
+    .map(({ text }) => text.match(/"(.+)"/)?.[1]);
 
   assert.deepEqual(unused, [
     'billingHistory.stale',
@@ -38,46 +39,45 @@ test('tracks translation objects through parameters, JSX props, and returned obj
   assert.deepEqual(
     diagnostics
       .filter(({ code }) => code === DiagnosticCode.TranslationObjectCast)
-      .map(({ category, file, messageText }) => ({
+      .map(({ category, fileName, text }) => ({
         category,
-        file: path.basename(file.fileName),
-        message: String(messageText)
+        file: path.basename(fileName),
+        message: text
       }))
       .sort((left, right) => left.file.localeCompare(right.file)),
     [
       {
-        category: ts.DiagnosticCategory.Error,
+        category: DiagnosticCategory.Error,
         file: 'cast-assertion.ts',
         message: 'Translation object casts hide the inferred dictionary shape; remove this cast.'
       },
       {
-        category: ts.DiagnosticCategory.Error,
+        category: DiagnosticCategory.Error,
         file: 'usage.tsx',
         message: 'Translation object casts hide the inferred dictionary shape; remove this cast.'
       },
       {
-        category: ts.DiagnosticCategory.Error,
+        category: DiagnosticCategory.Error,
         file: 'usage.tsx',
         message: 'Translation object casts hide the inferred dictionary shape; remove this cast.'
       }
     ]
   );
   const dynamicIndexWarning = diagnostics.find(
-    ({ code, file, length, messageText, start }) =>
-      code === DiagnosticCode.UnresolvedReference &&
-      path.basename(file?.fileName ?? '') === 'usage.tsx' &&
-      String(messageText) ===
-        'translation object dynamic property access: unresolved runtime key' &&
-      file.text.slice(start, start + length).startsWith('indexedLabels[')
+    (diagnostic) =>
+      diagnostic.code === DiagnosticCode.UnresolvedReference &&
+      path.basename(diagnostic.fileName ?? '') === 'usage.tsx' &&
+      diagnostic.text === 'translation object dynamic property access: unresolved runtime key' &&
+      diagnosticSource(diagnostic).startsWith('indexedLabels[')
   );
   assert.ok(dynamicIndexWarning);
-  assert.equal(dynamicIndexWarning.category, ts.DiagnosticCategory.Warning);
+  assert.equal(dynamicIndexWarning.category, DiagnosticCategory.Warning);
   assert.equal(
     diagnostics.some(
-      ({ code, file, length, start }) =>
-        code === DiagnosticCode.UnresolvedReference &&
-        path.basename(file?.fileName ?? '') === 'usage.tsx' &&
-        file.text.slice(start, start + length).includes('message.trim')
+      (diagnostic) =>
+        diagnostic.code === DiagnosticCode.UnresolvedReference &&
+        path.basename(diagnostic.fileName ?? '') === 'usage.tsx' &&
+        diagnosticSource(diagnostic).includes('message.trim')
     ),
     false
   );
@@ -88,10 +88,10 @@ test('preserves object-flow classifications across cold and warm cache replay', 
   t.after(() => fs.rmSync(cacheDir, { force: true, recursive: true }));
   const options = { project, dictionary: path.join(project, 'dictionary.ts') };
   const portable = (diagnostics) =>
-    diagnostics.map(({ category, code, messageText }) => ({
+    diagnostics.map(({ category, code, text }) => ({
       category,
       code,
-      message: String(messageText)
+      message: text
     }));
 
   const uncached = portable([...lint({ ...options, cache: false })]);
