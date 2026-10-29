@@ -141,5 +141,7 @@ test('npm package includes the generated schema at the documented path', () => {
   });
   assert.equal(packed.status, 0, packed.stderr);
   const manifest = JSON.parse(packed.stdout);
-  assert.ok(manifest[0]?.files?.some(({ path: fileName }) => fileName === 'schema.json'));
+  // npm 11 keys the dry-run report by package name; older npm versions return an array.
+  const entry = Array.isArray(manifest) ? manifest[0] : Object.values(manifest)[0];
+  assert.ok(entry?.files?.some(({ path: fileName }) => fileName === 'schema.json'));
 });

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from '@typescript/typescript6';
 import { bench, do_not_optimize, run } from 'mitata';
+import { API } from 'typescript/sync';
 import { lint } from '../dist/index.js';
 import { inventorySource } from '../dist/source-inventory.js';
 
@@ -10,33 +10,49 @@ const project = path.resolve(options.project);
 const dictionary = path.resolve(project, options.dictionary);
 const usagePath = path.resolve(project, options.source);
 const usageText = fs.readFileSync(usagePath, 'utf8');
-const usageSource = ts.createSourceFile(
-  usagePath,
-  usageText,
-  ts.ScriptTarget.Latest,
-  true,
-  usagePath.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
-);
+/** Semantic lookup counts from the latest measured `lint()` call; every call makes the same lookups. */
+let semanticLookups;
 
-bench('inventorySource()', () => {
-  return do_not_optimize(inventorySource(usageSource).usageNodes.length);
-});
+// Parsing happens once, outside the measured function, so the inventory case times traversal only.
+const api = new API();
+try {
+  const usageSource = api.createSourceFile(usagePath, usageText).sourceFile;
 
-bench('lint() analyzer', () => {
-  let diagnosticCount = 0;
-  for (const _diagnostic of lint({
-    project,
-    dictionaries: dictionary,
-    dictionaryExport: options.export,
-    cache: false
-  })) {
-    diagnosticCount += 1;
+  bench('inventorySource()', () => {
+    return do_not_optimize(inventorySource(usageSource).usageNodes.length);
+  });
+
+  bench('lint() analyzer', () => {
+    let diagnosticCount = 0;
+    for (const _diagnostic of lint({
+      project,
+      dictionaries: dictionary,
+      dictionaryExport: options.export,
+      cache: false,
+      onEvent: (event) => {
+        if (event.type === 'semantic') semanticLookups = event;
+      }
+    })) {
+      diagnosticCount += 1;
+    }
+    return do_not_optimize(diagnosticCount);
+  }).gc('inner');
+
+  await run({ throw: true });
+  if (semanticLookups) {
+    process.stdout.write(
+      `lint() analyzer semantic lookups: single=${semanticLookups.singleRequests} batch=${semanticLookups.batchRequests}\n`
+    );
   }
-  return do_not_optimize(diagnosticCount);
-}).gc('inner');
+} finally {
+  api.close();
+}
 
-await run({ throw: true });
-
+/**
+ * Reads `--name value` and `--name=value` flags.
+ *
+ * @param {string[]} arguments_ Process arguments after the script path.
+ */
 function parseArguments(arguments_) {
   const values = Object.create(null);
   for (let index = 0; index < arguments_.length; index += 1) {

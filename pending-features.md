@@ -8,7 +8,7 @@ This document defines potential `unused18n` capabilities independently from the 
 - Never let an uncertain reference silently suppress unrelated unused-key diagnostics.
 - Preserve the distinction between exact usage, possible usage, and unresolved runtime usage.
 - Analyze one TypeScript `Program` per invocation and share source observations across dictionaries.
-- Persist only serializable facts. Never cache AST, `ts.Symbol`, or `ts.Type` identities.
+- Persist only serializable facts. Never cache AST nodes, `Symbol`, or `Type` identities.
 - Cache compatibility must include every option that changes key interpretation or diagnostics.
 - Keep removal formatting-preserving and all-or-nothing. New input formats are read-only until they have equivalent edit provenance and safety barriers.
 - Add CLI behavior through the programmatic API first so both surfaces share one contract.
@@ -96,7 +96,7 @@ Report finite source references that target the selected dictionary but do not e
 - Add `failOnMissing?: boolean` and `--fail-on-missing` for CI enforcement.
 - Keep missing-key collection enabled by default if it is advisory; the flag controls exit status, not whether analysis occurs.
 - Missing diagnostics identify the key, namespace when configured, and source expression.
-- Programmatic consumers receive standard TypeScript diagnostics through `lint()`.
+- Programmatic consumers receive TypeScript 7.1 `Diagnostic` objects through `lint()`.
 - Calls carrying `count`, `ordinal`, or `context` are not reported missing until variant semantics can compare their runtime candidates.
 
 ### Internal changes
@@ -209,7 +209,7 @@ interface LintManyOptions {
   onCacheEvent?: (event: CacheEvent) => void;
 }
 
-declare function lintMany(options: LintManyOptions): Generator<ts.Diagnostic, void, void>;
+declare function lintMany(options: LintManyOptions): Generator<Diagnostic, void, void>;
 ```
 
 The CLI may accept repeated `--dictionary` descriptors or a configuration file once descriptor syntax stabilizes. It should not recursively discover arbitrary locale files by default.
@@ -227,7 +227,6 @@ The CLI may accept repeated `--dictionary` descriptors or a configuration file o
 
 ### Cache design
 
-- Compiler state is keyed by project/compiler compatibility, not by one dictionary.
 - Source-reference facts are independent of dictionary key shape.
 - Dictionary comparison entries are keyed by descriptor identity and content hash.
 - Changing one dictionary does not invalidate source-reference facts or unrelated dictionary comparisons.
@@ -439,7 +438,7 @@ These features may be useful but should not displace analyzer correctness work:
 - JavaScript dictionaries using statically analyzable CommonJS export assignments.
 - A stable structured analysis-result API after namespace and missing-key result shapes settle.
 - Shell-oriented reporting formats such as JSON or SARIF.
-- Editor integrations consuming standard TypeScript diagnostics.
+- Editor integrations consuming TypeScript 7.1 diagnostics.
 
 Each requires concrete consumer demand and independent packaging or API tests.
 

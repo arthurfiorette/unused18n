@@ -1,7 +1,90 @@
 import path from 'node:path';
-import ts from '@typescript/typescript6';
+import {
+  type AsExpression,
+  type BindingElement,
+  type CallExpression,
+  type Declaration,
+  type Expression,
+  type FunctionLikeDeclaration,
+  type HeritageClauseElement,
+  type Identifier,
+  isArrayBindingPattern,
+  isArrowFunction,
+  isAsExpression,
+  isBinaryExpression,
+  isBindingElement,
+  isBlock,
+  isCallExpression,
+  isComputedPropertyName,
+  isConditionalExpression,
+  isConstructorDeclaration,
+  isElementAccessExpression,
+  isExpressionWithTypeArguments,
+  isForInStatement,
+  isForOfStatement,
+  isFunctionDeclaration,
+  isFunctionExpression,
+  isGetAccessorDeclaration,
+  isIdentifier,
+  isImportClause,
+  isImportDeclaration,
+  isImportSpecifier,
+  isInterfaceDeclaration,
+  isIntersectionTypeNode,
+  isJsxAttribute,
+  isJsxExpression,
+  isJsxOpeningElement,
+  isJsxSelfClosingElement,
+  isJsxSpreadAttribute,
+  isMethodDeclaration,
+  isMethodSignatureDeclaration,
+  isModuleDeclaration,
+  isNamespaceImport,
+  isNonNullExpression,
+  isNumericLiteral,
+  isObjectBindingPattern,
+  isObjectLiteralExpression,
+  isParameterDeclaration,
+  isParenthesizedExpression,
+  isParenthesizedTypeNode,
+  isPropertyAccessExpression,
+  isPropertyAssignment,
+  isPropertyDeclaration,
+  isPropertySignatureDeclaration,
+  isReturnStatement,
+  isSatisfiesExpression,
+  isSetAccessorDeclaration,
+  isShorthandPropertyAssignment,
+  isSignatureDeclaration,
+  isSpreadAssignment,
+  isSpreadElement,
+  isStringLiteral,
+  isStringLiteralLikeNode,
+  isTypeAliasDeclaration,
+  isTypeAssertion,
+  isTypeReferenceNode,
+  isUnionTypeNode,
+  isVariableDeclaration,
+  type JsxAttribute,
+  type JsxAttributeValue,
+  type JsxOpeningLikeElement,
+  type JsxSpreadAttribute,
+  type Node,
+  type ObjectBindingPattern,
+  type ObjectLiteralElementLike,
+  type ParameterDeclaration,
+  type PropertyName,
+  type ShorthandPropertyAssignment,
+  type SourceFile,
+  type SpreadAssignment,
+  type SpreadElement,
+  SyntaxKind,
+  type TypeAssertion,
+  type TypeNode
+} from 'typescript/ast';
+import { SymbolFlags, type Symbol as TsSymbol, type Type, TypeFlags } from 'typescript/sync';
 import type { DictionaryTarget } from './dictionaries.js';
-import { readDictionary, unwrapAlias, unwrapExpression } from './dictionary.js';
+import { readDictionary, unwrapExpression } from './dictionary.js';
 import { DictionaryIndex } from './dictionary-index.js';
 import { expandI18nextCandidates, type TranslationVariantOptions } from './i18next-candidates.js';
 import { type LoadedProject, loadProject } from './project.js';
@@ -16,6 +99,7 @@ import {
   type StringResolution,
   unresolved
 } from './strings.js';
+import { isSourceAssertion, writtenType } from './syntax.js';
 import type { AnalysisResult, AnalyzeOptions, UsageEvidence } from './types.js';
 
 interface TranslationWrapper {
@@ -24,8 +108,8 @@ interface TranslationWrapper {
 }
 
 interface TranslationHookWrapper {
-  owner: ts.FunctionLikeDeclaration;
-  prefixExpressions: Array<ts.Expression | null | undefined>;
+  owner: FunctionLikeDeclaration;
+  prefixExpressions: Array<Expression | null | undefined>;
   staticPrefixes: StringResolution[];
 }
 
@@ -36,7 +120,7 @@ interface ObjectResolution extends StringResolution {
 }
 
 interface ObjectInput {
-  expression: ts.Expression;
+  expression: Expression;
   path: string[];
 }
 
@@ -103,11 +187,20 @@ export interface LoadedProjectManyAnalysis {
   translationObjectCasts: UsageEvidence[];
 }
 
-/** Creates the compatibility Program for API callers that do not already own one. */
+/**
+ * Creates the compatibility Program for API callers that do not already own one.
+ *
+ * The compiler process is closed before returning because the result is plain data and nothing
+ * outside this call can reach the project.
+ */
 export function analyzeProject(options: AnalyzeOptions): AnalysisResult {
   const dictionaryPath = path.resolve(options.dictionary);
   const loaded = loadProject(options.project ?? './tsconfig.json', [dictionaryPath]);
-  return analyzeLoadedProject(loaded, options).result;
+  try {
+    return analyzeLoadedProject(loaded, options).result;
+  } finally {
+    loaded[Symbol.dispose]();
+  }
 }
 
 /**
@@ -115,13 +208,13 @@ export function analyzeProject(options: AnalyzeOptions): AnalysisResult {
  * compiler graphs in the same process.
  */
 export function analyzeLoadedProject(
-  { program, checker, configPath }: LoadedProject,
+  loaded: LoadedProject,
   options: AnalyzeOptions,
   reuse: AnalysisReuse = {}
 ): LoadedProjectAnalysis {
   const dictionaryPath = path.resolve(options.dictionary);
   const info =
-    reuse.dictionary ?? readDictionary(program, checker, dictionaryPath, options.dictionaryExport);
+    reuse.dictionary ?? readDictionary(loaded.semantic, dictionaryPath, options.dictionaryExport);
   const target: LoadedDictionaryTarget = {
     id: `${dictionaryPath}\0${info.exportName}`,
     path: dictionaryPath,
@@ -132,7 +225,7 @@ export function analyzeLoadedProject(
     locale: path.basename(dictionaryPath, path.extname(dictionaryPath)),
     info
   };
-  const many = analyzeLoadedProjectMany({ program, checker, configPath }, [target], options, {
+  const many = analyzeLoadedProjectMany(loaded, [target], options, {
     ...reuse,
     dictionaries: [target]
   });
@@ -145,7 +238,7 @@ export function analyzeLoadedProject(
 
 /** Traverses source once and replays dictionary-targeted facts into each locale result. */
 export function analyzeLoadedProjectMany(
-  { program, checker, configPath }: LoadedProject,
+  { semantic, configPath, sourceFiles }: LoadedProject,
   targets: LoadedDictionaryTarget[],
   options: Pick<AnalyzeOptions, 'includeEvidence' | 'maxExpansions' | 'project'> & {
     onFileAnalyzed?: (fileName: string, completedFiles: number, totalFiles: number) => void;
@@ -168,16 +261,15 @@ export function analyzeLoadedProjectMany(
   }
   const maxExpansions = options.maxExpansions ?? 1_000;
   const projectRoot = path.dirname(configPath);
-  const sourceFiles = program.getSourceFiles().filter((source) => {
-    const file = path.resolve(source.fileName);
-    return !source.isDeclarationFile && !file.includes(`${path.sep}node_modules${path.sep}`);
-  });
   const analysisSourceFiles = reuse.filesToAnalyze
     ? sourceFiles.filter((source) => reuse.filesToAnalyze?.has(path.resolve(source.fileName)))
     : sourceFiles;
   const inventories = analysisSourceFiles.map(inventorySource);
-  const indexedReturns = new Map<ts.FunctionLikeDeclaration, readonly ts.Expression[]>();
-  const inventoriedFunctions = new Set<ts.FunctionLikeDeclaration>();
+  // Assignment indexing below is the first symbol lookup, so the batch has to land before it.
+  semantic.prefetchSymbols(inventories.flatMap(collectSemanticTargets));
+  semantic.prefetchShorthandSymbols(inventories.flatMap(collectShorthandTargets));
+  const indexedReturns = new Map<FunctionLikeDeclaration, readonly Expression[]>();
+  const inventoriedFunctions = new Set<FunctionLikeDeclaration>();
   for (const inventory of inventories) {
     for (const owner of inventory.functions) inventoriedFunctions.add(owner);
     for (const [owner, expressions] of inventory.returnsByFunction) {
@@ -185,38 +277,35 @@ export function analyzeLoadedProjectMany(
     }
   }
 
-  const normalizedSymbolCache = new WeakMap<ts.Node, ts.Symbol | null>();
-  const functionLikeCache = new WeakMap<ts.Node, ts.FunctionLikeDeclaration | null>();
-  const expressionTypeCache = new WeakMap<ts.Node, ts.Type>();
-  const dictionaryReturnIdsCache = new WeakMap<ts.FunctionLikeDeclaration, ReadonlySet<string>>();
-  const i18nextTFunctionCache = new WeakMap<ts.Expression, boolean>();
-  const returnExpressionCache = new WeakMap<ts.FunctionLikeDeclaration, readonly ts.Expression[]>();
-  const reassignmentCache = new WeakMap<ts.ParameterDeclaration, boolean>();
+  const functionLikeCache = new WeakMap<Node, FunctionLikeDeclaration | null>();
+  const dictionaryReturnIdsCache = new WeakMap<FunctionLikeDeclaration, ReadonlySet<string>>();
+  const i18nextTFunctionCache = new WeakMap<Expression, boolean>();
+  const returnExpressionCache = new WeakMap<FunctionLikeDeclaration, readonly Expression[]>();
+  const reassignmentCache = new WeakMap<ParameterDeclaration, boolean>();
   const assignmentIndex = new Map<
-    ts.Symbol,
-    Array<{ owner: ts.FunctionLikeDeclaration | undefined; right: ts.Expression }>
+    TsSymbol,
+    Array<{ owner: FunctionLikeDeclaration | undefined; right: Expression }>
   >();
   for (const inventory of inventories) {
     for (const assignment of inventory.assignments) {
       const left = unwrapExpression(assignment.left);
-      if (!ts.isIdentifier(left)) continue;
-      const symbol = normalizedSymbol(left);
+      if (!isIdentifier(left)) continue;
+      const symbol = semantic.symbol(left);
       if (!symbol) continue;
       const entries = assignmentIndex.get(symbol) ?? [];
       entries.push({ owner: assignment.owner, right: assignment.right });
       assignmentIndex.set(symbol, entries);
     }
   }
-  const strings = createStringResolver(checker, maxExpansions, {
+  const strings = createStringResolver(semantic, maxExpansions, {
     assignments: assignmentIndex,
-    returns: indexedReturns,
-    typeAtLocation
+    returns: indexedReturns
   });
 
-  const translators = new Map<ts.Symbol, StringResolution>();
-  const translationHookWrappers = new Map<ts.Symbol, TranslationHookWrapper>();
-  const wrappers = new Map<ts.Symbol, TranslationWrapper>();
-  const wrapperCalls = new Map<ts.Symbol, number>();
+  const translators = new Map<TsSymbol, StringResolution>();
+  const translationHookWrappers = new Map<TsSymbol, TranslationHookWrapper>();
+  const wrappers = new Map<TsSymbol, TranslationWrapper>();
+  const wrapperCalls = new Map<TsSymbol, number>();
   // Discovery still uses live Symbols, but only dirty connected components need new observations.
   const freshFacts = new Map<string, SourceUsageFacts>();
   for (const sourceFile of analysisSourceFiles) {
@@ -231,14 +320,15 @@ export function analyzeLoadedProjectMany(
   const observationIdentities = new WeakMap<SourceUsageFacts, Set<string>>();
   const unresolvedIdentities = new WeakMap<SourceUsageFacts, Set<string>>();
   const translationObjectCastIdentities = new WeakMap<SourceUsageFacts, Set<string>>();
-  const objectCache = new WeakMap<ts.Expression, ObjectResolution | null>();
+  // Reassigned only by withScratchObjectCaches, which swaps in copies for lookahead.
+  let objectCache = new WeakMap<Expression, ObjectResolution | null>();
   // Parameter inputs are indexed before usage analysis, making symbol provenance immutable here;
   // cache misses too so ordinary non-translation property accesses stay cheap.
-  const objectSymbolCache = new Map<ts.Symbol, ObjectResolution | null>();
-  const resolvingObjectSymbols = new Set<ts.Symbol>();
-  const objectInputs = new Map<ts.Symbol, ObjectInput[]>();
-  const objectPropertyInputs = new Map<ts.Symbol, Map<string, ObjectInput[]>>();
-  let translationHookCache = new WeakMap<ts.CallExpression, StringResolution | null>();
+  let objectSymbolCache = new Map<TsSymbol, ObjectResolution | null>();
+  const resolvingObjectSymbols = new Set<TsSymbol>();
+  const objectInputs = new Map<TsSymbol, ObjectInput[]>();
+  const objectPropertyInputs = new Map<TsSymbol, Map<string, ObjectInput[]>>();
+  let translationHookCache = new WeakMap<CallExpression, StringResolution | null>();
 
   // The first pass establishes direct translator provenance needed to recognize hooks that expose
   // `t` inside a returned object. Resetting the call cache lets the second pass observe new wrappers.
@@ -250,6 +340,7 @@ export function analyzeLoadedProjectMany(
     discoverHookTranslators();
     propagateTranslatorParameters();
     indexObjectParameterInputs();
+    prefetchObjectInputSymbols();
     discoverTranslationWrappers();
     countWrapperCalls();
   } finally {
@@ -258,6 +349,11 @@ export function analyzeLoadedProjectMany(
 
   emitStage('usage', 'start');
   try {
+    // Runs first because the chain lookahead below already resolves objects through calls.
+    prefetchCallTargetTypes();
+    semantic.prefetchTypes(
+      withScratchObjectCaches(() => inventories.flatMap(objectChainTypeTargets))
+    );
     inventories.forEach((inventory, index) => {
       visitSource(inventory);
       try {
@@ -361,6 +457,11 @@ export function analyzeLoadedProjectMany(
     })
   };
 
+  /**
+   * Registers project hooks that return a `useTranslation` call or an object with a `t` member,
+   * so `const { t } = useProjectHook()` binds the hook's prefix. Runs between the two
+   * discoverHookTranslators passes because returned translators are known only after the first.
+   */
   function discoverTranslationHookWrappers(): void {
     for (const inventory of inventories) {
       const sourceFile = inventory.sourceFile;
@@ -390,10 +491,10 @@ export function analyzeLoadedProjectMany(
         if (!symbol) continue;
         for (const returned of returnExpressionsCached(node)) {
           const value = unwrapExpression(returned);
-          if (!ts.isObjectLiteralExpression(value)) continue;
+          if (!isObjectLiteralExpression(value)) continue;
           for (const property of value.properties) {
-            const shorthandSymbol = ts.isShorthandPropertyAssignment(property)
-              ? unwrapAlias(checker, checker.getShorthandAssignmentValueSymbol(property))
+            const shorthandSymbol = isShorthandPropertyAssignment(property)
+              ? semantic.aliased(semantic.shorthandValueSymbol(property))
               : undefined;
             const translator = returnedTranslatorProperty(property, sourceFile);
             const prefix = shorthandSymbol
@@ -421,6 +522,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Binds translator prefixes to variables initialized from a translation hook result or from
+   * another translator. The second pass picks up hook wrappers found in between.
+   */
   function discoverHookTranslators(): void {
     for (const inventory of inventories) {
       const sourceFile = inventory.sourceFile;
@@ -430,39 +535,43 @@ export function analyzeLoadedProjectMany(
         const hookPrefix = couldBeTranslationHookResult(node.initializer)
           ? translationHookPrefix(node.initializer)
           : undefined;
-        if (ts.isObjectBindingPattern(node.name) && hookPrefix) {
+        if (isObjectBindingPattern(node.name) && hookPrefix) {
           for (const element of node.name.elements) {
+            // Binding element names are typed optional because array holes have none; object
+            // pattern elements always carry one.
+            if (!element.name) continue;
             const sourceName =
               element.propertyName?.getText(sourceFile) ?? element.name.getText(sourceFile);
-            if (sourceName !== 't' || !ts.isIdentifier(element.name)) continue;
-            addTranslator(normalizedSymbol(element.name), hookPrefix);
+            if (sourceName !== 't' || !isIdentifier(element.name)) continue;
+            addTranslator(semantic.symbol(element.name), hookPrefix);
           }
           continue;
         }
 
-        if (ts.isArrayBindingPattern(node.name) && hookPrefix) {
+        if (isArrayBindingPattern(node.name) && hookPrefix) {
           const first = node.name.elements[0];
-          if (first && ts.isBindingElement(first) && ts.isIdentifier(first.name)) {
-            addTranslator(normalizedSymbol(first.name), hookPrefix);
+          // A leading hole is a binding element without a name and binds no translator.
+          if (first && isBindingElement(first) && first.name && isIdentifier(first.name)) {
+            addTranslator(semantic.symbol(first.name), hookPrefix);
           }
           continue;
         }
 
-        if (ts.isIdentifier(node.name)) {
+        if (isIdentifier(node.name)) {
           const initializer = unwrapExpression(node.initializer);
           if (!isPotentialTranslatorExpression(initializer)) continue;
           const aliasedPrefix = translatorPrefix(initializer);
           if (aliasedPrefix) {
-            addTranslator(normalizedSymbol(node.name), aliasedPrefix);
+            addTranslator(semantic.symbol(node.name), aliasedPrefix);
             continue;
           }
           if (
-            ts.isPropertyAccessExpression(initializer) &&
+            isPropertyAccessExpression(initializer) &&
             initializer.name.text === 't' &&
             translationHookPrefix(initializer.expression)
           ) {
             addTranslator(
-              normalizedSymbol(node.name),
+              semantic.symbol(node.name),
               translationHookPrefix(initializer.expression) ?? empty()
             );
           }
@@ -471,11 +580,32 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Gives each parameter the prefixes of the translators local call sites pass to it, repeating
+   * until nothing changes, so a translator handed through helper functions keeps its prefix.
+   */
   function propagateTranslatorParameters(): void {
+    // The first iteration hands every argument of every call with a local target to
+    // isPotentialTranslatorExpression, which looks up access arguments through their name and as
+    // a whole. Batching exactly those lookups here leaves the loop on the cache; prefetching them
+    // for all calls instead would type-check receivers no lookup ever needs. functionLikeForCall
+    // depends only on Semantic, so calling it ahead of the loop cannot change its answers.
+    const argumentSites: Node[] = [];
+    for (const inventory of inventories) {
+      for (const node of inventory.calls) {
+        if (!functionLikeForCall(node)) continue;
+        for (const argument of node.arguments) {
+          const value = unwrapExpression(argument);
+          if (isPropertyAccessExpression(value)) argumentSites.push(value.name, value);
+          else if (isElementAccessExpression(value)) argumentSites.push(value);
+        }
+      }
+    }
+    semantic.prefetchSymbols(argumentSites);
+
     let changed = true;
     let iteration = 0;
-    // The compatibility engine historically bounds convergence here; retaining the cap avoids
-    // allowing pathological call cycles to make the baseline analysis non-terminating.
+    // The iteration cap keeps pathological call cycles from making the analysis non-terminating.
     while (changed && iteration < 20) {
       changed = false;
       iteration += 1;
@@ -487,8 +617,8 @@ export function analyzeLoadedProjectMany(
             if (!isPotentialTranslatorExpression(argument)) return;
             const prefix = translatorPrefix(argument);
             const parameter = target.parameters[index];
-            if (!prefix || !parameter || !ts.isIdentifier(parameter.name)) return;
-            const symbol = normalizedSymbol(parameter.name);
+            if (!prefix || !parameter || !isIdentifier(parameter.name)) return;
+            const symbol = semantic.symbol(parameter.name);
             if (!symbol) return;
             const before = translators.get(symbol);
             const after = before ? merge(before, prefix) : prefix;
@@ -502,6 +632,11 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Records which call arguments and JSX attributes feed each parameter, so object resolution
+   * can follow a translation object into a function or component. Completes during discovery;
+   * the usage pass treats the index as fixed.
+   */
   function indexObjectParameterInputs(): void {
     // Checker types prove component/function identity, while call-site expressions preserve the
     // runtime translation prefix that structural prop types necessarily erase.
@@ -515,28 +650,28 @@ export function analyzeLoadedProjectMany(
         });
       }
       for (const node of inventory.usageNodes) {
-        if (!ts.isJsxOpeningElement(node) && !ts.isJsxSelfClosingElement(node)) continue;
+        if (!isJsxOpeningElement(node) && !isJsxSelfClosingElement(node)) continue;
         const target = functionLikeForExpression(node.tagName);
         const parameter = target?.parameters[0];
         if (!parameter) continue;
-        if (ts.isObjectBindingPattern(parameter.name)) {
+        if (isObjectBindingPattern(parameter.name)) {
           for (const element of parameter.name.elements) {
-            if (!ts.isIdentifier(element.name)) continue;
+            if (!element.name || !isIdentifier(element.name)) continue;
             const property = staticBindingElementName(element);
             if (!property) continue;
             const source = jsxPropertyInput(node, property);
-            if (source.input) addObjectInput(normalizedSymbol(element.name), source.input);
+            if (source.input) addObjectInput(semantic.symbol(element.name), source.input);
             if (!source.found && element.initializer) {
-              addObjectInput(normalizedSymbol(element.name), {
+              addObjectInput(semantic.symbol(element.name), {
                 expression: element.initializer,
                 path: []
               });
             }
           }
-        } else if (ts.isIdentifier(parameter.name)) {
-          const symbol = normalizedSymbol(parameter.name);
+        } else if (isIdentifier(parameter.name)) {
+          const symbol = semantic.symbol(parameter.name);
           if (!symbol) continue;
-          for (const property of checker.getPropertiesOfType(typeAtLocation(parameter.name))) {
+          for (const property of semantic.propertiesOfType(semantic.typeAt(parameter.name))) {
             const source = jsxPropertyInput(node, property.name);
             if (source.input) addObjectPropertyInput(symbol, property.name, source.input);
           }
@@ -545,8 +680,29 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Batches the symbol lookups object resolution makes when it follows a parameter back to its
+   * call-site and JSX inputs. The input index is complete once indexing finishes, so reading it
+   * here involves no resolution order.
+   */
+  function prefetchObjectInputSymbols(): void {
+    const sites: Node[] = [];
+    const addInputs = (inputs: Iterable<ObjectInput>): void => {
+      for (const input of inputs) {
+        const value = unwrapExpression(input.expression);
+        if (isIdentifier(value)) sites.push(value);
+      }
+    };
+    for (const inputs of objectInputs.values()) addInputs(inputs);
+    for (const properties of objectPropertyInputs.values()) {
+      for (const inputs of properties.values()) addInputs(inputs);
+    }
+    semantic.prefetchSymbols(sites);
+  }
+
+  /** Finds the attribute or spread that supplies `property` to a component element. */
   function jsxPropertyInput(
-    node: ts.JsxOpeningLikeElement,
+    node: JsxOpeningLikeElement,
     property: string
   ): { found: boolean; input?: ObjectInput } {
     // JSX applies props left-to-right; walking backward selects the value that actually reaches the
@@ -554,14 +710,14 @@ export function analyzeLoadedProjectMany(
     const properties = node.attributes.properties;
     for (let index = properties.length - 1; index >= 0; index -= 1) {
       const attribute = properties[index]!;
-      if (ts.isJsxAttribute(attribute)) {
+      if (isJsxAttribute(attribute)) {
         if (attribute.name.getText() !== property) continue;
         const expression = attribute.initializer
           ? jsxAttributeExpression(attribute.initializer)
           : undefined;
         return expression ? { found: true, input: { expression, path: [] } } : { found: true };
       }
-      if (checker.getPropertyOfType(typeAtLocation(attribute.expression), property)) {
+      if (semantic.propertyOfType(semantic.typeAt(attribute.expression), property)) {
         return {
           found: true,
           input: { expression: attribute.expression, path: [property] }
@@ -571,31 +727,37 @@ export function analyzeLoadedProjectMany(
     return { found: false };
   }
 
-  function indexParameterInput(parameter: ts.ParameterDeclaration, input: ObjectInput): void {
-    if (ts.isIdentifier(parameter.name)) {
-      addObjectInput(normalizedSymbol(parameter.name), input);
+  /**
+   * Records `input` for a parameter, or for each statically named element of a destructured
+   * parameter with that property appended to the input path.
+   */
+  function indexParameterInput(parameter: ParameterDeclaration, input: ObjectInput): void {
+    if (isIdentifier(parameter.name)) {
+      addObjectInput(semantic.symbol(parameter.name), input);
       return;
     }
-    if (!ts.isObjectBindingPattern(parameter.name)) return;
+    if (!isObjectBindingPattern(parameter.name)) return;
     for (const element of parameter.name.elements) {
-      if (!ts.isIdentifier(element.name)) continue;
+      if (!element.name || !isIdentifier(element.name)) continue;
       const property = staticBindingElementName(element);
       if (!property) continue;
-      addObjectInput(normalizedSymbol(element.name), {
+      addObjectInput(semantic.symbol(element.name), {
         expression: input.expression,
         path: [...input.path, property]
       });
     }
   }
 
-  function addObjectInput(symbol: ts.Symbol | undefined, input: ObjectInput): void {
+  /** Bindings without a symbol cannot be looked up later, so their inputs are dropped. */
+  function addObjectInput(symbol: TsSymbol | undefined, input: ObjectInput): void {
     if (!symbol) return;
     const inputs = objectInputs.get(symbol) ?? [];
     inputs.push(input);
     objectInputs.set(symbol, inputs);
   }
 
-  function addObjectPropertyInput(symbol: ts.Symbol, property: string, input: ObjectInput): void {
+  /** Records a value supplied for one prop of a props parameter that is read as a whole. */
+  function addObjectPropertyInput(symbol: TsSymbol, property: string, input: ObjectInput): void {
     const properties = objectPropertyInputs.get(symbol) ?? new Map<string, ObjectInput[]>();
     const inputs = properties.get(property) ?? [];
     inputs.push(input);
@@ -603,18 +765,21 @@ export function analyzeLoadedProjectMany(
     objectPropertyInputs.set(symbol, properties);
   }
 
+  /**
+   * Finds functions that pass one of their own parameters as the key of a translator call, so
+   * calls to them are analyzed as translation calls with the inner translator's prefix.
+   */
   function discoverTranslationWrappers(): void {
     for (const inventory of inventories) {
       for (const node of inventory.calls) {
         if (!translatorPrefix(node.expression)) continue;
         const key = node.arguments[0] ? unwrapExpression(node.arguments[0]) : undefined;
-        if (!key || !ts.isIdentifier(key)) continue;
+        if (!key || !isIdentifier(key)) continue;
         const owner = enclosingFunction(node);
         if (!owner) continue;
         const parameterIndex = owner.parameters.findIndex(
           (parameter) =>
-            ts.isIdentifier(parameter.name) &&
-            normalizedSymbol(parameter.name) === normalizedSymbol(key)
+            isIdentifier(parameter.name) && semantic.symbol(parameter.name) === semantic.symbol(key)
         );
         if (parameterIndex < 0) continue;
         const parameter = owner.parameters[parameterIndex];
@@ -629,10 +794,14 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Counts call sites per wrapper; a wrapper nobody calls keeps its inner translator call
+   * analyzed (see isAnalyzedWrapperParameter).
+   */
   function countWrapperCalls(): void {
     for (const inventory of inventories) {
       for (const node of inventory.calls) {
-        const symbol = normalizedSymbol(node.expression);
+        const symbol = semantic.symbol(node.expression);
         if (symbol && wrappers.has(symbol)) {
           wrapperCalls.set(symbol, (wrapperCalls.get(symbol) ?? 0) + 1);
         }
@@ -640,40 +809,112 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Collects the base expressions whose types `resolveObject` reads while walking access chains
+   * rooted in a translation or dictionary object.
+   *
+   * Each chain level whose base resolves asks for the base type, so a 10k-key dictionary read
+   * through `dictionary.a.b.key` costs one request per level when fetched lazily.
+   *
+   * Roots are classified with `resolveObjectSymbol`, which must run on scratch copies of the
+   * object caches (see {@link withScratchObjectCaches}).
+   */
+  function objectChainTypeTargets(inventory: SourceInventory): Node[] {
+    const targets: Node[] = [];
+    for (const node of inventory.usageNodes) {
+      if (!isPropertyAccessExpression(node) && !isElementAccessExpression(node)) continue;
+      if (isObjectChainBase(node)) continue;
+      const bases: Expression[] = [];
+      let current = unwrapExpression(node);
+      while (isPropertyAccessExpression(current) || isElementAccessExpression(current)) {
+        bases.push(current.expression);
+        current = unwrapExpression(current.expression);
+      }
+      if (!isIdentifier(current)) continue;
+      const symbol = semantic.symbol(current);
+      if (symbol && resolveObjectSymbol(symbol)) targets.push(...bases);
+    }
+    return targets;
+  }
+
+  /**
+   * Batches the contract types resolveObject compares with dictionaries when a call's returned
+   * values do not resolve: the declared return type node and, for exported targets, the
+   * signature's return type. functionLikeForCall depends only on Semantic, so this lookahead
+   * cannot change what the usage pass computes.
+   */
+  function prefetchCallTargetTypes(): void {
+    const typeNodes: TypeNode[] = [];
+    const exported: FunctionLikeDeclaration[] = [];
+    for (const inventory of inventories) {
+      for (const call of inventory.calls) {
+        const target = functionLikeForCall(call);
+        if (!target) continue;
+        if (target.type) typeNodes.push(target.type);
+        if (isExported(target)) exported.push(target);
+      }
+    }
+    semantic.prefetchTypesFromTypeNodes(typeNodes);
+    semantic.prefetchReturnTypes(exported);
+  }
+
+  /**
+   * Runs `work` against throwaway copies of the object resolution caches, then restores them.
+   *
+   * Mutually referencing variables cache a partial result for whichever symbol is resolved
+   * second, so these caches depend on resolution order. Lookahead such as type prefetching
+   * resolves symbols in a different order than the usage pass; isolating it keeps the usage
+   * pass on exactly the cache state discovery left behind. The semantic layer's caches are
+   * order-independent and keep everything the lookahead fetched.
+   */
+  function withScratchObjectCaches<T>(work: () => T): T {
+    const savedObjects = objectCache;
+    const savedSymbols = objectSymbolCache;
+    objectCache = new WeakMap();
+    objectSymbolCache = new Map(savedSymbols);
+    try {
+      return work();
+    } finally {
+      objectCache = savedObjects;
+      objectSymbolCache = savedSymbols;
+    }
+  }
+
+  /**
+   * Runs every usage check for one file in source order. The order of resolveObject calls here
+   * decides what the object caches hold, which is why lookahead uses scratch caches.
+   */
   function visitSource(inventory: SourceInventory): void {
     for (const node of inventory.usageNodes) {
-      if (ts.isCallExpression(node)) analyzeCall(node);
-      if (
-        ts.isVariableDeclaration(node) &&
-        ts.isObjectBindingPattern(node.name) &&
-        node.initializer
-      ) {
+      if (isCallExpression(node)) analyzeCall(node);
+      if (isVariableDeclaration(node) && isObjectBindingPattern(node.name) && node.initializer) {
         const object = resolveObject(node.initializer);
         if (object) analyzeBindingPattern(node.name, object, node);
         else analyzeProjectedBindingPattern(node.name, node.initializer);
       }
-      if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) analyzeTrans(node);
+      if (isJsxOpeningElement(node) || isJsxSelfClosingElement(node)) analyzeTrans(node);
       if (
-        (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+        (isPropertyAccessExpression(node) || isElementAccessExpression(node)) &&
         !isObjectChainBase(node)
       ) {
         analyzeObjectExpression(node);
       }
-      if (
-        ts.isSpreadAssignment(node) ||
-        ts.isSpreadElement(node) ||
-        ts.isJsxSpreadAttribute(node)
-      ) {
+      if (isSpreadAssignment(node) || isSpreadElement(node) || isJsxSpreadAttribute(node)) {
         analyzeSpread(node);
       }
-      if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+      if (isForInStatement(node) || isForOfStatement(node)) {
         const object = resolveObject(node.expression);
         if (object) markSubtrees(object, node.expression, 'Iteration over translation object');
       }
     }
   }
 
-  function analyzeCall(call: ts.CallExpression): void {
+  /**
+   * Translator calls mark their keys, wrapper calls mark the forwarded key, array iteration and
+   * `Object.keys`-style enumeration mark whole subtrees, and translation objects passed to
+   * functions without a local body count as escaping.
+   */
+  function analyzeCall(call: CallExpression): void {
     const prefix = translatorPrefix(call.expression);
     if (prefix) {
       const keyExpression = call.arguments[0];
@@ -733,7 +974,7 @@ export function analyzeLoadedProjectMany(
       return;
     }
 
-    const wrapper = wrappers.get(normalizedSymbol(call.expression) as ts.Symbol);
+    const wrapper = wrappers.get(semantic.symbol(call.expression) as TsSymbol);
     const argument = wrapper ? call.arguments[wrapper.keyParameter] : undefined;
     if (wrapper && argument) {
       markTranslationResolution(
@@ -760,10 +1001,14 @@ export function analyzeLoadedProjectMany(
     }
   }
 
-  function analyzeArrayReceiverCall(call: ts.CallExpression): boolean {
+  /**
+   * Iterating a translation array with a method such as `map` reads every element. The receiver
+   * must also be typed as an array, so an object key named `map` stays ordinary data.
+   */
+  function analyzeArrayReceiverCall(call: CallExpression): boolean {
     const expression = unwrapExpression(call.expression);
     if (
-      !ts.isPropertyAccessExpression(expression) ||
+      !isPropertyAccessExpression(expression) ||
       !ARRAY_ITERATION_METHODS.has(expression.name.text)
     ) {
       return false;
@@ -771,31 +1016,37 @@ export function analyzeLoadedProjectMany(
 
     const receiver = expression.expression;
     const object = resolveObject(receiver);
-    if (!object || !isArrayLikeType(typeAtLocation(receiver))) return false;
+    if (!object || !isArrayLikeType(semantic.typeAt(receiver))) return false;
 
     // Mark the receiver, not `.map`/`.find`, so a dictionary key with that name stays ordinary data.
     markSubtrees(object, call, 'Translation array iteration');
     return true;
   }
 
-  function isArrayLikeType(type: ts.Type): boolean {
-    if (type.isUnion()) return type.types.every(isArrayLikeType);
-    if (checker.isArrayType(type) || checker.isTupleType(type)) return true;
+  /** Accepts arrays, tuples, and lib `ReadonlyArray` instances, including unions of them. */
+  function isArrayLikeType(type: Type): boolean {
+    if (type.isUnionType()) return type.getTypes().every(isArrayLikeType);
+    // `Type.isTupleType` reads a flag the server ships with every type, so it needs no request.
+    if (semantic.isArrayType(type) || type.isTupleType()) return true;
 
     // ReadonlyArray references are not consistently reported by isArrayType across TS versions.
-    const reference = type as ts.TypeReference;
-    const symbol = type.getSymbol() ?? reference.target?.getSymbol();
+    const symbol =
+      type.getSymbol() ?? (type.isTypeReference() ? type.getTarget().getSymbol() : undefined);
     return Boolean(
-      symbol?.getName() === 'ReadonlyArray' &&
-        symbol.declarations?.some(({ getSourceFile }) => getSourceFile().hasNoDefaultLib)
+      symbol?.name === 'ReadonlyArray' &&
+        semantic
+          .declarations(symbol)
+          .some((declaration) => semantic.isDefaultLibrary(declaration.getSourceFile()))
     );
   }
 
-  function analyzeTrans(node: ts.JsxOpeningLikeElement): void {
-    const tagTarget = ts.isPropertyAccessExpression(node.tagName)
-      ? node.tagName.name
-      : node.tagName;
-    const tagSymbol = normalizedSymbol(tagTarget);
+  /**
+   * Handles `<Trans i18nKey>` only when `Trans` comes from react-i18next, applying the prefix of
+   * a translator passed through its `t` attribute.
+   */
+  function analyzeTrans(node: JsxOpeningLikeElement): void {
+    const tagTarget = isPropertyAccessExpression(node.tagName) ? node.tagName.name : node.tagName;
+    const tagSymbol = semantic.symbol(tagTarget);
     if (
       !isImportedName(tagSymbol, 'Trans', 'react-i18next') &&
       !isLibrarySymbol(tagSymbol, 'Trans', 'react-i18next')
@@ -803,20 +1054,20 @@ export function analyzeLoadedProjectMany(
       return;
     }
     const keyAttribute = node.attributes.properties.find(
-      (attribute): attribute is ts.JsxAttribute =>
-        ts.isJsxAttribute(attribute) && attribute.name.getText() === 'i18nKey'
+      (attribute): attribute is JsxAttribute =>
+        isJsxAttribute(attribute) && attribute.name.getText() === 'i18nKey'
     );
     if (!keyAttribute?.initializer) return;
 
     const keyExpression = jsxAttributeExpression(keyAttribute.initializer);
-    const key = ts.isStringLiteral(keyAttribute.initializer)
+    const key = isStringLiteral(keyAttribute.initializer)
       ? exact(keyAttribute.initializer.text)
       : keyExpression
         ? strings.resolve(keyExpression)
         : empty();
     const tAttribute = node.attributes.properties.find(
-      (attribute): attribute is ts.JsxAttribute =>
-        ts.isJsxAttribute(attribute) && attribute.name.getText() === 't'
+      (attribute): attribute is JsxAttribute =>
+        isJsxAttribute(attribute) && attribute.name.getText() === 't'
     );
     const suppliedTranslator = tAttribute?.initializer
       ? jsxAttributeExpression(tAttribute.initializer)
@@ -825,7 +1076,11 @@ export function analyzeLoadedProjectMany(
     markResolution(prepend(prefix ?? empty(), key), node, '<Trans i18nKey>');
   }
 
-  function analyzeObjectExpression(expression: ts.Expression): void {
+  /**
+   * Marks keys read through the outermost access of a chain on a translation or dictionary
+   * object. Values that are only stored or returned are analyzed where they are read.
+   */
+  function analyzeObjectExpression(expression: Expression): void {
     const object = resolveObject(expression);
     if (!object) return;
 
@@ -874,17 +1129,21 @@ export function analyzeLoadedProjectMany(
     }
   }
 
-  function isAnalyzedWrapperParameter(key: ts.Expression, call: ts.CallExpression): boolean {
+  /**
+   * Reports a translator call inside a wrapper whose key is the wrapper's own parameter. Each
+   * wrapper call site marks its argument instead, so the inner call is skipped unless the
+   * wrapper is exported, uncalled, or reassigns the parameter.
+   */
+  function isAnalyzedWrapperParameter(key: Expression, call: CallExpression): boolean {
     const value = unwrapExpression(key);
-    if (!ts.isIdentifier(value)) return false;
+    if (!isIdentifier(value)) return false;
     const owner = enclosingFunction(call);
     if (!owner) return false;
     const ownerSymbol = symbolForFunction(owner);
     if (!ownerSymbol || !wrappers.has(ownerSymbol) || isExported(owner)) return false;
     const parameter = owner.parameters.find(
       (candidate) =>
-        ts.isIdentifier(candidate.name) &&
-        normalizedSymbol(candidate.name) === normalizedSymbol(value)
+        isIdentifier(candidate.name) && semantic.symbol(candidate.name) === semantic.symbol(value)
     );
     return Boolean(
       parameter &&
@@ -893,26 +1152,28 @@ export function analyzeLoadedProjectMany(
     );
   }
 
-  function analyzeSpread(
-    node: ts.SpreadAssignment | ts.SpreadElement | ts.JsxSpreadAttribute
-  ): void {
+  /** A spread copies every key, so the whole spread object counts as possibly used. */
+  function analyzeSpread(node: SpreadAssignment | SpreadElement | JsxSpreadAttribute): void {
     const object = resolveObject(node.expression);
     if (object) markSubtrees(object, node, 'Spread of translation object');
   }
 
+  /** Destructuring marks each named property; a rest element marks the remaining subtree. */
   function analyzeBindingPattern(
-    pattern: ts.ObjectBindingPattern,
+    pattern: ObjectBindingPattern,
     object: ObjectResolution,
-    node: ts.Node
+    node: Node
   ): void {
     for (const element of pattern.elements) {
       if (element.dotDotDotToken) {
         markSubtrees(object, element, 'Rest destructuring of translation object');
         continue;
       }
+      // Only array holes lack a name, and this walk never sees array patterns.
+      if (!element.name) continue;
       const rawName = element.propertyName?.getText(node.getSourceFile()) ?? element.name.getText();
       const child = appendObject(object, exact(rawName.replaceAll(/['"]/g, '')));
-      if (ts.isObjectBindingPattern(element.name)) {
+      if (isObjectBindingPattern(element.name)) {
         analyzeBindingPattern(element.name, child, element);
       } else {
         const leaves = dictionaryLeaves(child.values);
@@ -929,9 +1190,13 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Destructures a value that does not resolve as a whole, such as a call returning a mixed
+   * props bag, by projecting each named property separately.
+   */
   function analyzeProjectedBindingPattern(
-    pattern: ts.ObjectBindingPattern,
-    initializer: ts.Expression
+    pattern: ObjectBindingPattern,
+    initializer: Expression
   ): void {
     for (const element of pattern.elements) {
       if (element.dotDotDotToken) continue;
@@ -939,7 +1204,7 @@ export function analyzeLoadedProjectMany(
       if (!property) continue;
       const object = resolveProjectedObject(initializer, property, new Set());
       if (!object) continue;
-      if (ts.isObjectBindingPattern(element.name)) {
+      if (element.name && isObjectBindingPattern(element.name)) {
         analyzeBindingPattern(element.name, object, element);
         continue;
       }
@@ -956,10 +1221,11 @@ export function analyzeLoadedProjectMany(
     }
   }
 
-  function resolveObject(
-    input: ts.Expression,
-    seen = new Set<ts.Node>()
-  ): ObjectResolution | undefined {
+  /**
+   * Resolves an expression to the dictionary keys it holds as a translation or dictionary
+   * object. Only top-level calls are cached, because a nested result depends on `seen`.
+   */
+  function resolveObject(input: Expression, seen = new Set<Node>()): ObjectResolution | undefined {
     if (seen.size === 0) {
       const cached = objectCache.get(input);
       if (cached !== undefined) return cached ?? undefined;
@@ -970,15 +1236,17 @@ export function analyzeLoadedProjectMany(
     return resolveObjectUncached(input, seen);
   }
 
-  function resolveObjectUncached(
-    input: ts.Expression,
-    seen: Set<ts.Node>
-  ): ObjectResolution | undefined {
+  /**
+   * Calls resolve through `returnObjects` translator calls, `useMemo` factories, local function
+   * returns and finally declared or exported return types matched against dictionary types.
+   * Identifiers resolve through their symbol, and access chains append one segment per level.
+   */
+  function resolveObjectUncached(input: Expression, seen: Set<Node>): ObjectResolution | undefined {
     const expression = unwrapExpression(input);
     if (seen.has(expression)) return undefined;
     const nextSeen = new Set(seen).add(expression);
 
-    if (ts.isCallExpression(expression)) {
+    if (isCallExpression(expression)) {
       const prefix = translatorPrefix(expression.expression);
       if (
         prefix &&
@@ -994,7 +1262,7 @@ export function analyzeLoadedProjectMany(
       if (isReactUseMemoCall(expression)) {
         const factory = expression.arguments[0];
         const value = factory ? unwrapExpression(factory) : undefined;
-        if (value && (ts.isArrowFunction(value) || ts.isFunctionExpression(value))) {
+        if (value && (isArrowFunction(value) || isFunctionExpression(value))) {
           // Restrict callback unwrapping to React's identity-preserving memo primitive; arbitrary
           // external callbacks do not guarantee that their return value becomes the call result.
           let result: ObjectResolution | undefined;
@@ -1031,15 +1299,15 @@ export function analyzeLoadedProjectMany(
       }
     }
 
-    if (ts.isIdentifier(expression)) {
-      const symbol = normalizedSymbol(expression);
-      return symbol ? resolveObjectSymbol(symbol, nextSeen) : undefined;
+    if (isIdentifier(expression)) {
+      const symbol = semantic.symbol(expression);
+      return symbol ? resolveObjectSymbol(symbol) : undefined;
     }
 
-    if (ts.isPropertyAccessExpression(expression)) {
+    if (isPropertyAccessExpression(expression)) {
       const base = resolveObject(expression.expression, nextSeen);
       if (base) {
-        if (isDefinitelyStringLike(typeAtLocation(expression.expression))) {
+        if (isDefinitelyStringLike(semantic.typeAt(expression.expression))) {
           return scalarDictionaryLeaves(base);
         }
         if (resolvesDictionaryLeaf(base)) return base;
@@ -1054,17 +1322,17 @@ export function analyzeLoadedProjectMany(
       return undefined;
     }
 
-    if (ts.isElementAccessExpression(expression)) {
+    if (isElementAccessExpression(expression)) {
       const base = resolveObject(expression.expression, nextSeen);
       if (!base || !expression.argumentExpression) return base;
-      if (isDefinitelyStringLike(typeAtLocation(expression.expression))) {
+      if (isDefinitelyStringLike(semantic.typeAt(expression.expression))) {
         return scalarDictionaryLeaves(base);
       }
       if (resolvesDictionaryLeaf(base)) return base;
       return appendObject(base, strings.resolve(expression.argumentExpression));
     }
 
-    if (ts.isConditionalExpression(expression)) {
+    if (isConditionalExpression(expression)) {
       return mergeObjectPair(
         resolveObject(expression.whenTrue, nextSeen),
         resolveObject(expression.whenFalse, nextSeen)
@@ -1072,9 +1340,9 @@ export function analyzeLoadedProjectMany(
     }
 
     if (
-      ts.isBinaryExpression(expression) &&
-      (expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
-        expression.operatorToken.kind === ts.SyntaxKind.BarBarToken)
+      isBinaryExpression(expression) &&
+      (expression.operatorToken.kind === SyntaxKind.QuestionQuestionToken ||
+        expression.operatorToken.kind === SyntaxKind.BarBarToken)
     ) {
       return mergeObjectPair(
         resolveObject(expression.left, nextSeen),
@@ -1085,10 +1353,11 @@ export function analyzeLoadedProjectMany(
     return undefined;
   }
 
-  function resolveObjectInput(
-    input: ObjectInput,
-    seen: Set<ts.Node>
-  ): ObjectResolution | undefined {
+  /**
+   * Resolves an indexed parameter input and appends its property path. When the input does not
+   * resolve as a whole, the first path segment is projected through it instead.
+   */
+  function resolveObjectInput(input: ObjectInput, seen: Set<Node>): ObjectResolution | undefined {
     const direct = resolveObject(input.expression, seen);
     if (direct) {
       return input.path.reduce((result, property) => appendObject(result, exact(property)), direct);
@@ -1104,10 +1373,11 @@ export function analyzeLoadedProjectMany(
     return result;
   }
 
+  /** Resolves one named property of an object literal, call result or variable. */
   function resolveProjectedObject(
-    input: ts.Expression,
+    input: Expression,
     property: string,
-    seen: Set<ts.Node>
+    seen: Set<Node>
   ): ObjectResolution | undefined {
     // Returned prop bags are heterogeneous, so resolving the whole object would conflate unrelated
     // prefixes. Project the requested property through each observed return/call edge instead.
@@ -1115,28 +1385,25 @@ export function analyzeLoadedProjectMany(
     if (seen.has(expression)) return undefined;
     const nextSeen = new Set(seen).add(expression);
 
-    if (ts.isObjectLiteralExpression(expression)) {
+    if (isObjectLiteralExpression(expression)) {
       let result: ObjectResolution | undefined;
       for (const member of expression.properties) {
-        if (ts.isSpreadAssignment(member)) {
+        if (isSpreadAssignment(member)) {
           const candidate = resolveProjectedObject(member.expression, property, nextSeen);
-          if (checker.getPropertyOfType(typeAtLocation(member.expression), property)) {
+          if (semantic.propertyOfType(semantic.typeAt(member.expression), property)) {
             result = candidate;
           }
           continue;
         }
         if (staticPropertyName(member.name) !== property) continue;
         let candidate: ObjectResolution | undefined;
-        if (ts.isPropertyAssignment(member)) {
+        if (isPropertyAssignment(member)) {
           candidate = resolveObject(member.initializer, nextSeen);
-        } else if (ts.isShorthandPropertyAssignment(member)) {
-          const valueSymbol = unwrapAlias(
-            checker,
-            checker.getShorthandAssignmentValueSymbol(member)
-          );
+        } else if (isShorthandPropertyAssignment(member)) {
+          const valueSymbol = semantic.aliased(semantic.shorthandValueSymbol(member));
           candidate = valueSymbol
-            ? resolveObjectSymbol(valueSymbol, nextSeen)
-            : resolveObject(member.name, nextSeen);
+            ? resolveObjectSymbol(valueSymbol)
+            : resolveObject(shorthandName(member), nextSeen);
         }
         // Explicit properties always overwrite earlier spreads/properties, including with a
         // non-translation value whose unresolved candidate intentionally clears provenance.
@@ -1145,11 +1412,11 @@ export function analyzeLoadedProjectMany(
       return result;
     }
 
-    if (ts.isCallExpression(expression)) {
+    if (isCallExpression(expression)) {
       if (isReactUseMemoCall(expression)) {
         const factory = expression.arguments[0];
         const value = factory ? unwrapExpression(factory) : undefined;
-        if (value && (ts.isArrowFunction(value) || ts.isFunctionExpression(value))) {
+        if (value && (isArrowFunction(value) || isFunctionExpression(value))) {
           // A memoized heterogeneous bag still needs property-level projection; resolving the
           // callback as one ObjectResolution would conflate its independent translation prefixes.
           let result: ObjectResolution | undefined;
@@ -1170,9 +1437,9 @@ export function analyzeLoadedProjectMany(
       return result;
     }
 
-    if (ts.isIdentifier(expression)) {
-      const symbol = normalizedSymbol(expression);
-      const declaration = symbol?.declarations?.find(ts.isVariableDeclaration);
+    if (isIdentifier(expression)) {
+      const symbol = semantic.symbol(expression);
+      const declaration = semantic.declarations(symbol).find(isVariableDeclaration);
       if (declaration?.initializer) {
         const fromDeclaration = resolveProjectedObject(declaration.initializer, property, nextSeen);
         if (fromDeclaration) return fromDeclaration;
@@ -1203,7 +1470,7 @@ export function analyzeLoadedProjectMany(
       if (fromPropertyInputs) return fromPropertyInputs;
     }
 
-    if (ts.isConditionalExpression(expression)) {
+    if (isConditionalExpression(expression)) {
       return mergeObjectPair(
         resolveProjectedObject(expression.whenTrue, property, nextSeen),
         resolveProjectedObject(expression.whenFalse, property, nextSeen)
@@ -1211,9 +1478,9 @@ export function analyzeLoadedProjectMany(
     }
 
     if (
-      ts.isBinaryExpression(expression) &&
-      (expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
-        expression.operatorToken.kind === ts.SyntaxKind.BarBarToken)
+      isBinaryExpression(expression) &&
+      (expression.operatorToken.kind === SyntaxKind.QuestionQuestionToken ||
+        expression.operatorToken.kind === SyntaxKind.BarBarToken)
     ) {
       return mergeObjectPair(
         resolveProjectedObject(expression.left, property, nextSeen),
@@ -1233,15 +1500,21 @@ export function analyzeLoadedProjectMany(
     return mergeObjects(left, right);
   }
 
-  function resolveObjectSymbol(
-    symbol: ts.Symbol,
-    _seen: Set<ts.Node>
-  ): ObjectResolution | undefined {
+  /**
+   * Resolves what a symbol holds from its variable initializer, indexed parameter inputs and
+   * destructuring source, memoized per symbol in objectSymbolCache.
+   *
+   * A symbol already being resolved yields `undefined` to cut cycles, and the symbol that closed
+   * the cycle caches that partial answer. Results therefore depend on resolution order, so
+   * lookahead must run inside withScratchObjectCaches. Each symbol starts a fresh `seen` set
+   * because the in-progress set already bounds recursion across symbols.
+   */
+  function resolveObjectSymbol(symbol: TsSymbol): ObjectResolution | undefined {
     const cached = objectSymbolCache.get(symbol);
     if (cached !== undefined) return cached ?? undefined;
     if (resolvingObjectSymbols.has(symbol)) return undefined;
     resolvingObjectSymbols.add(symbol);
-    const seen = new Set<ts.Node>();
+    const seen = new Set<Node>();
 
     try {
       const dictionaryIds = new Set<string>();
@@ -1255,20 +1528,15 @@ export function analyzeLoadedProjectMany(
       }
 
       let result: ObjectResolution | undefined;
-      const variable = symbol.declarations?.find(ts.isVariableDeclaration);
+      const variable = semantic.declarations(symbol).find(isVariableDeclaration);
       if (variable?.initializer) result = resolveObject(variable.initializer, seen);
       for (const input of objectInputs.get(symbol) ?? []) {
         const candidate = resolveObjectInput(input, seen);
         if (candidate) result = result ? mergeObjects(result, candidate) : candidate;
       }
-      const binding = symbol.declarations?.find(ts.isBindingElement);
+      const binding = semantic.declarations(symbol).find(isBindingElement);
       const declaration = binding?.parent.parent;
-      if (
-        binding &&
-        declaration &&
-        ts.isVariableDeclaration(declaration) &&
-        declaration.initializer
-      ) {
+      if (binding && declaration && isVariableDeclaration(declaration) && declaration.initializer) {
         const property = staticBindingElementName(binding);
         const candidate = property
           ? resolveProjectedObject(declaration.initializer, property, seen)
@@ -1340,21 +1608,26 @@ export function analyzeLoadedProjectMany(
     };
   }
 
-  function translatorPrefix(expression: ts.Expression): StringResolution | undefined {
-    const symbol = normalizedSymbol(expression);
+  /**
+   * Returns the key prefix a translator expression applies, or `undefined` when it is not a
+   * translator. Known translator symbols answer first; otherwise `getFixedT` calls, `hook().t`,
+   * `hook()[0]`, `i18next.t`, imported `t` and values typed as i18next's TFunction qualify.
+   */
+  function translatorPrefix(expression: Expression): StringResolution | undefined {
+    const symbol = semantic.symbol(expression);
     const known = symbol ? translators.get(symbol) : undefined;
     if (known) return known;
 
     const unwrapped = unwrapExpression(expression);
-    if (ts.isCallExpression(unwrapped) && isGetFixedTCall(unwrapped)) {
+    if (isCallExpression(unwrapped) && isGetFixedTCall(unwrapped)) {
       // i18next defines the third getFixedT argument as keyPrefix; language and namespace are separate.
       const prefix = unwrapped.arguments[2];
       return prefix ? strings.resolve(prefix) : empty();
     }
-    if (ts.isPropertyAccessExpression(unwrapped) && unwrapped.name.text === 't') {
+    if (isPropertyAccessExpression(unwrapped) && unwrapped.name.text === 't') {
       const hookPrefix = translationHookPrefix(unwrapped.expression);
       if (hookPrefix) return hookPrefix;
-      const symbol = normalizedSymbol(unwrapped.name);
+      const symbol = semantic.symbol(unwrapped.name);
       if (
         isLibrarySymbol(symbol, 't', 'i18next') ||
         isDefaultImportFrom(unwrapped.expression, 'i18next')
@@ -1363,14 +1636,14 @@ export function analyzeLoadedProjectMany(
       }
     }
     if (
-      ts.isElementAccessExpression(unwrapped) &&
+      isElementAccessExpression(unwrapped) &&
       unwrapped.argumentExpression &&
       strings.resolve(unwrapped.argumentExpression).values.has('0')
     ) {
       const hookPrefix = translationHookPrefix(unwrapped.expression);
       if (hookPrefix) return hookPrefix;
     }
-    const directSymbol = normalizedSymbol(unwrapped);
+    const directSymbol = semantic.symbol(unwrapped);
     if (
       isImportedName(directSymbol, 't', 'i18next') ||
       isLibrarySymbol(directSymbol, 't', 'i18next') ||
@@ -1381,37 +1654,45 @@ export function analyzeLoadedProjectMany(
     return undefined;
   }
 
-  function isUseTranslationCall(expression: ts.Expression): boolean {
+  /** Recognizes `useTranslation` by react-i18next import provenance, including namespaces. */
+  function isUseTranslationCall(expression: Expression): boolean {
     const unwrapped = unwrapExpression(expression);
-    if (!ts.isCallExpression(unwrapped)) return false;
+    if (!isCallExpression(unwrapped)) return false;
     const callee = unwrapExpression(unwrapped.expression);
-    const target = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
-    const symbol = normalizedSymbol(target);
+    const target = isPropertyAccessExpression(callee) ? callee.name : callee;
+    const symbol = semantic.symbol(target);
     // Name-only matching would let unrelated application hooks suppress valid unused diagnostics.
     if (isImportedName(symbol, 'useTranslation', 'react-i18next')) return true;
     if (isLibrarySymbol(symbol, 'useTranslation', 'react-i18next')) return true;
     return (
-      ts.isPropertyAccessExpression(callee) &&
+      isPropertyAccessExpression(callee) &&
       callee.name.text === 'useTranslation' &&
       isNamespaceImportFrom(callee.expression, 'react-i18next')
     );
   }
 
+  /**
+   * Returns the prefix a `useTranslation` call or project hook wrapper binds, following local
+   * aliases of the hook result. Cached per call; the `null` entry stored before resolving stops
+   * recursion through wrappers that call each other.
+   */
   function translationHookPrefix(
-    expression: ts.Expression,
-    seen = new Set<ts.Node>()
+    expression: Expression,
+    seen = new Set<Node>()
   ): StringResolution | undefined {
     const unwrapped = unwrapExpression(expression);
     if (seen.has(unwrapped)) return undefined;
     const nextSeen = new Set(seen).add(unwrapped);
-    if (ts.isIdentifier(unwrapped)) {
+    if (isIdentifier(unwrapped)) {
       // Follow local result aliases so later destructuring retains the prefix proven at hook creation.
-      const declaration = normalizedSymbol(unwrapped)?.declarations?.find(ts.isVariableDeclaration);
+      const declaration = semantic
+        .declarations(semantic.symbol(unwrapped))
+        .find(isVariableDeclaration);
       return declaration?.initializer
         ? translationHookPrefix(declaration.initializer, nextSeen)
         : undefined;
     }
-    if (!ts.isCallExpression(unwrapped)) return undefined;
+    if (!isCallExpression(unwrapped)) return undefined;
     const cached = translationHookCache.get(unwrapped);
     if (cached !== undefined) return cached ?? undefined;
 
@@ -1422,7 +1703,7 @@ export function analyzeLoadedProjectMany(
       return prefix;
     }
 
-    const symbol = normalizedSymbol(unwrapped.expression);
+    const symbol = semantic.symbol(unwrapped.expression);
     const wrapper = symbol ? translationHookWrappers.get(symbol) : undefined;
     if (!wrapper) return undefined;
     let result: StringResolution | undefined;
@@ -1441,50 +1722,60 @@ export function analyzeLoadedProjectMany(
     return result;
   }
 
-  function keyPrefixFromUseTranslation(call: ts.CallExpression): StringResolution {
+  /** An unreadable options argument makes the prefix unresolved; an absent one makes it empty. */
+  function keyPrefixFromUseTranslation(call: CallExpression): StringResolution {
     const expression = keyPrefixExpressionFromUseTranslation(call);
     return expression === null ? unresolved() : expression ? strings.resolve(expression) : empty();
   }
 
+  /**
+   * Returns the `keyPrefix` expression of a `useTranslation` call, kept unresolved so hook
+   * wrappers can resolve it per call site; `null` when unreadable, `undefined` when absent.
+   */
   function keyPrefixExpressionFromUseTranslation(
-    call: ts.CallExpression
-  ): ts.Expression | null | undefined {
+    call: CallExpression
+  ): Expression | null | undefined {
     const options = call.arguments[1];
     return options ? optionExpression(options, 'keyPrefix') : undefined;
   }
 
+  /** A wrapper prefix taken from one of its parameters resolves to the argument at this call. */
   function resolveHookPrefixArgument(
-    expression: ts.Expression,
-    wrapper: ts.FunctionLikeDeclaration,
-    call: ts.CallExpression
+    expression: Expression,
+    wrapper: FunctionLikeDeclaration,
+    call: CallExpression
   ): StringResolution {
     const value = unwrapExpression(expression);
-    if (!ts.isIdentifier(value)) return strings.resolve(value);
+    if (!isIdentifier(value)) return strings.resolve(value);
     const parameterIndex = wrapper.parameters.findIndex(
       (parameter) =>
-        ts.isIdentifier(parameter.name) &&
-        normalizedSymbol(parameter.name) === normalizedSymbol(value)
+        isIdentifier(parameter.name) && semantic.symbol(parameter.name) === semantic.symbol(value)
     );
     if (parameterIndex < 0) return strings.resolve(value);
     const argument = call.arguments[parameterIndex];
     return argument ? strings.resolve(argument) : empty();
   }
 
+  /**
+   * Finds the expression an i18next option such as `keyPrefix` or `count` is set to: `undefined`
+   * when provably absent, `null` when it cannot be determined. Members are read from the last,
+   * since later properties and spreads override earlier ones.
+   */
   function optionExpression(
-    expression: ts.Expression,
+    expression: Expression,
     option: string,
-    seen = new Set<ts.Node>()
-  ): ts.Expression | null | undefined {
+    seen = new Set<Node>()
+  ): Expression | null | undefined {
     const value = unwrapExpression(expression);
     if (seen.has(value)) return undefined;
     const nextSeen = new Set(seen).add(value);
-    if (ts.isIdentifier(value)) {
-      const declaration = normalizedSymbol(value)?.declarations?.find(ts.isVariableDeclaration);
+    if (isIdentifier(value)) {
+      const declaration = semantic.declarations(semantic.symbol(value)).find(isVariableDeclaration);
       return declaration?.initializer
         ? optionExpression(declaration.initializer, option, nextSeen)
         : null;
     }
-    if (ts.isCallExpression(value)) {
+    if (isCallExpression(value)) {
       const target = functionLikeForCall(value);
       if (!target?.body) return null;
       let returned = false;
@@ -1496,40 +1787,49 @@ export function analyzeLoadedProjectMany(
       }
       return returned ? undefined : null;
     }
-    if (!ts.isObjectLiteralExpression(value)) return null;
+    if (!isObjectLiteralExpression(value)) return null;
     for (let index = value.properties.length - 1; index >= 0; index -= 1) {
       const property = value.properties[index]!;
-      if (ts.isSpreadAssignment(property)) {
+      if (isSpreadAssignment(property)) {
         const spread = optionExpression(property.expression, option, nextSeen);
         if (spread !== undefined) return spread;
         continue;
       }
-      if (ts.isShorthandPropertyAssignment(property) && property.name.text === option) {
-        const valueSymbol = checker.getShorthandAssignmentValueSymbol(property);
-        for (const declaration of valueSymbol?.declarations ?? []) {
+      if (isShorthandPropertyAssignment(property) && shorthandName(property).text === option) {
+        // The value symbol stays unaliased. An imported binding is declared by its import
+        // specifier, so the shorthand name itself becomes the option expression; following the
+        // alias would return a declaration from the exporting module.
+        const valueSymbol = semantic.shorthandValueSymbol(property);
+        for (const declaration of semantic.declarations(valueSymbol)) {
           if (
-            (ts.isParameter(declaration) || ts.isVariableDeclaration(declaration)) &&
-            ts.isIdentifier(declaration.name)
+            (isParameterDeclaration(declaration) || isVariableDeclaration(declaration)) &&
+            isIdentifier(declaration.name)
           ) {
             return declaration.name;
           }
         }
-        return property.name;
+        return shorthandName(property);
       }
-      if (!ts.isPropertyAssignment(property)) continue;
+      if (!isPropertyAssignment(property)) continue;
       const name = staticPropertyName(property.name);
       if (name === option) return property.initializer;
-      if (name === undefined && ts.isComputedPropertyName(property.name)) return null;
+      if (name === undefined && isComputedPropertyName(property.name)) return null;
     }
     return undefined;
   }
 
-  function callBooleanOption(call: ts.CallExpression, option: string): BooleanOptionResolution {
+  /**
+   * Reads a boolean option such as `returnObjects` across every options argument of a call;
+   * `'unknown'` when any argument may set it at runtime.
+   */
+  function callBooleanOption(call: CallExpression, option: string): BooleanOptionResolution {
     let unresolvedOption = false;
     for (const argument of call.arguments.slice(1)) {
       const value = unwrapExpression(argument);
-      if (ts.isIdentifier(value)) {
-        const declaration = normalizedSymbol(value)?.declarations?.find(ts.isVariableDeclaration);
+      if (isIdentifier(value)) {
+        const declaration = semantic
+          .declarations(semantic.symbol(value))
+          .find(isVariableDeclaration);
         if (declaration?.initializer) {
           const configured = booleanOption(declaration.initializer, option);
           if (configured === 'true') return 'true';
@@ -1543,10 +1843,10 @@ export function analyzeLoadedProjectMany(
         if (configured === 'true') return 'true';
         if (configured === 'false' || configured === 'absent') continue;
         if (
-          ts.isObjectLiteralExpression(value) ||
-          ts.isCallExpression(value) ||
-          ts.isPropertyAccessExpression(value) ||
-          ts.isElementAccessExpression(value)
+          isObjectLiteralExpression(value) ||
+          isCallExpression(value) ||
+          isPropertyAccessExpression(value) ||
+          isElementAccessExpression(value)
         ) {
           unresolvedOption = true;
         }
@@ -1555,41 +1855,45 @@ export function analyzeLoadedProjectMany(
     return unresolvedOption ? 'unknown' : 'absent';
   }
 
-  function booleanOption(expression: ts.Expression, option: string): BooleanOptionResolution {
+  /**
+   * Reads one boolean option from an options expression, following variables to their
+   * initializers. Members are read from the last, so later definitions win.
+   */
+  function booleanOption(expression: Expression, option: string): BooleanOptionResolution {
     const value = unwrapExpression(expression);
-    if (ts.isIdentifier(value)) {
-      const declaration = normalizedSymbol(value)?.declarations?.find(ts.isVariableDeclaration);
+    if (isIdentifier(value)) {
+      const declaration = semantic.declarations(semantic.symbol(value)).find(isVariableDeclaration);
       return declaration?.initializer ? booleanOption(declaration.initializer, option) : 'unknown';
     }
-    if (!ts.isObjectLiteralExpression(value)) {
-      return ts.isStringLiteralLike(value) || ts.isNumericLiteral(value) ? 'absent' : 'unknown';
+    if (!isObjectLiteralExpression(value)) {
+      return isStringLiteralLikeNode(value) || isNumericLiteral(value) ? 'absent' : 'unknown';
     }
     let unresolvedSpread = false;
     for (let index = value.properties.length - 1; index >= 0; index -= 1) {
       const property = value.properties[index]!;
-      if (ts.isSpreadAssignment(property)) {
+      if (isSpreadAssignment(property)) {
         const spread = booleanOption(property.expression, option);
         if (spread === 'true' || spread === 'false') return spread;
         if (spread === 'unknown') unresolvedSpread = true;
         continue;
       }
-      if (ts.isShorthandPropertyAssignment(property) && property.name.text === option) {
+      if (isShorthandPropertyAssignment(property) && shorthandName(property).text === option) {
         if (unresolvedSpread) return 'unknown';
-        const declaration = normalizedSymbol(property.name)?.declarations?.find(
-          ts.isVariableDeclaration
-        );
+        const declaration = semantic
+          .declarations(semantic.symbol(property.name))
+          .find(isVariableDeclaration);
         if (!declaration?.initializer) return 'unknown';
         const initializer = unwrapExpression(declaration.initializer);
-        if (initializer.kind === ts.SyntaxKind.TrueKeyword) return 'true';
-        if (initializer.kind === ts.SyntaxKind.FalseKeyword) return 'false';
+        if (initializer.kind === SyntaxKind.TrueKeyword) return 'true';
+        if (initializer.kind === SyntaxKind.FalseKeyword) return 'false';
         return 'unknown';
       }
-      if (!ts.isPropertyAssignment(property)) continue;
+      if (!isPropertyAssignment(property)) continue;
       const name = staticPropertyName(property.name);
       if (name === option) {
         if (unresolvedSpread) return 'unknown';
-        if (property.initializer.kind === ts.SyntaxKind.TrueKeyword) return 'true';
-        if (property.initializer.kind === ts.SyntaxKind.FalseKeyword) return 'false';
+        if (property.initializer.kind === SyntaxKind.TrueKeyword) return 'true';
+        if (property.initializer.kind === SyntaxKind.FalseKeyword) return 'false';
         return 'unknown';
       }
       if (name === undefined) unresolvedSpread = true;
@@ -1597,12 +1901,14 @@ export function analyzeLoadedProjectMany(
     return unresolvedSpread ? 'unknown' : 'absent';
   }
 
-  function addTranslator(symbol: ts.Symbol | undefined, prefix: StringResolution): void {
-    const normalized = unwrapAlias(checker, symbol);
+  /** Keys translators by alias-resolved symbol, so an import and its target share one entry. */
+  function addTranslator(symbol: TsSymbol | undefined, prefix: StringResolution): void {
+    const normalized = semantic.aliased(symbol);
     if (normalized) translators.set(normalized, prefix);
   }
 
-  function markResolution(resolution: StringResolution, node: ts.Node, reason: string): void {
+  /** Marks a resolved `<Trans i18nKey>`; an unbounded key becomes an unresolved warning. */
+  function markResolution(resolution: StringResolution, node: Node, reason: string): void {
     markKeys([...resolution.values], 'used', node, reason);
     for (const pattern of resolution.patterns)
       markPattern(pattern, node, `${reason}: dynamic pattern`);
@@ -1614,10 +1920,14 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /**
+   * Marks the keys of a translator or wrapper call. With count, context or ordinal options,
+   * i18next looks up suffixed variants, so candidates are expanded per dictionary and locale.
+   */
   function markTranslationResolution(
     resolution: StringResolution,
     variants: TranslationVariantOptions,
-    node: ts.Node,
+    node: Node,
     reason: string
   ): void {
     const facts = factsForNode(node);
@@ -1670,7 +1980,11 @@ export function analyzeLoadedProjectMany(
     }
   }
 
-  function translationOptions(call: ts.CallExpression): TranslationVariantOptions {
+  /**
+   * Extracts the options that select i18next key variants. A `count` that is not number-typed
+   * selects no plural forms, and one that may be anything marks all of them possibly used.
+   */
+  function translationOptions(call: CallExpression): TranslationVariantOptions {
     const options = call.arguments[1];
     if (!options) return {};
     const count = optionExpression(options, 'count');
@@ -1681,9 +1995,9 @@ export function analyzeLoadedProjectMany(
         ? {}
         : count === null
           ? { count: null }
-          : countType(typeAtLocation(count)) === 'number'
+          : countType(semantic.typeAt(count)) === 'number'
             ? { count: strings.resolve(count) }
-            : countType(typeAtLocation(count)) === 'unknown'
+            : countType(semantic.typeAt(count)) === 'unknown'
               ? { count: null }
               : {}),
       ...(context === undefined
@@ -1695,28 +2009,34 @@ export function analyzeLoadedProjectMany(
             ordinal:
               ordinal === null
                 ? null
-                : ordinal.kind === ts.SyntaxKind.TrueKeyword
+                : ordinal.kind === SyntaxKind.TrueKeyword
                   ? true
-                  : ordinal.kind === ts.SyntaxKind.FalseKeyword
+                  : ordinal.kind === SyntaxKind.FalseKeyword
                     ? false
                     : null
           })
     };
   }
 
-  function countType(type: ts.Type): 'number' | 'none' | 'unknown' {
-    if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return 'unknown';
-    if (type.isUnion()) {
-      const kinds = new Set(type.types.map(countType));
+  /**
+   * Classifies a `count` option's type for plural expansion: `'number'` selects plural forms
+   * from the count's values and `'none'` selects none. `any`, `unknown`, or numbers mixed with
+   * other members give `'unknown'`, which marks every plural form possibly used.
+   */
+  function countType(type: Type): 'number' | 'none' | 'unknown' {
+    if (type.flags & (TypeFlags.Any | TypeFlags.Unknown)) return 'unknown';
+    if (type.isUnionType()) {
+      const kinds = new Set(type.getTypes().map(countType));
       if (kinds.has('unknown') || (kinds.has('number') && kinds.has('none'))) return 'unknown';
       return kinds.has('number') ? 'number' : 'none';
     }
-    return type.flags & (ts.TypeFlags.Number | ts.TypeFlags.NumberLiteral) ? 'number' : 'none';
+    return type.flags & (TypeFlags.Number | TypeFlags.NumberLiteral) ? 'number' : 'none';
   }
 
+  /** Used when a translation object escapes key-level analysis: everything below may be read. */
   function markSubtrees(
     resolution: StringResolution & { dictionaryIds?: ReadonlySet<string> },
-    node: ts.Node,
+    node: Node,
     reason: string
   ): void {
     for (const value of resolution.values)
@@ -1733,9 +2053,10 @@ export function analyzeLoadedProjectMany(
     }
   }
 
+  /** Records a possibly used prefix observation that covers every key below `prefix`. */
   function markSubtree(
     prefix: string,
-    node: ts.Node,
+    node: Node,
     reason: string,
     dictionaryIds?: ReadonlySet<string>
   ): void {
@@ -1749,9 +2070,10 @@ export function analyzeLoadedProjectMany(
     });
   }
 
+  /** Records a possibly used wildcard observation, as produced by dynamic key segments. */
   function markPattern(
     pattern: string,
-    node: ts.Node,
+    node: Node,
     reason: string,
     dictionaryIds?: ReadonlySet<string>
   ): void {
@@ -1764,10 +2086,11 @@ export function analyzeLoadedProjectMany(
     });
   }
 
+  /** Records exact key observations that share one evidence location. */
   function markKeys(
     candidateKeys: Iterable<string>,
     confidence: 'used' | 'possibly-used',
-    node: ts.Node,
+    node: Node,
     reason: string,
     dictionaryIds?: ReadonlySet<string>
   ): void {
@@ -1823,7 +2146,11 @@ export function analyzeLoadedProjectMany(
     facts.translationObjectCasts.push(evidence);
   }
 
-  function factsForNode(node: ts.Node): SourceUsageFacts {
+  /**
+   * Files facts under the file of the node that produced them, so the cache can replay them
+   * per file. A file outside the analyzed set gets its bucket on first use.
+   */
+  function factsForNode(node: Node): SourceUsageFacts {
     const fileName = path.resolve(node.getSourceFile().fileName);
     let facts = freshFacts.get(fileName);
     if (!facts) {
@@ -1838,8 +2165,12 @@ export function analyzeLoadedProjectMany(
     return facts;
   }
 
+  /**
+   * Evidence holds a project-relative path and 1-based line and column, so it survives the
+   * cache and lint can relocate it after the compiler process closes.
+   */
   function evidenceFor(
-    node: ts.Node,
+    node: Node,
     confidence: 'used' | 'possibly-used',
     reason: string
   ): UsageEvidence {
@@ -1854,24 +2185,8 @@ export function analyzeLoadedProjectMany(
     };
   }
 
-  function normalizedSymbol(node: ts.Node): ts.Symbol | undefined {
-    const cached = normalizedSymbolCache.get(node);
-    if (cached !== undefined) return cached ?? undefined;
-    const target = ts.isPropertyAccessExpression(node) ? node.name : node;
-    const symbol = unwrapAlias(checker, checker.getSymbolAtLocation(target));
-    normalizedSymbolCache.set(node, symbol ?? null);
-    return symbol;
-  }
-
-  function typeAtLocation(node: ts.Node): ts.Type {
-    const cached = expressionTypeCache.get(node);
-    if (cached) return cached;
-    const type = checker.getTypeAtLocation(node);
-    expressionTypeCache.set(node, type);
-    return type;
-  }
-
-  function returnExpressionsCached(node: ts.FunctionLikeDeclaration): readonly ts.Expression[] {
+  /** Uses the inventory's return index and walks the body only for functions outside it. */
+  function returnExpressionsCached(node: FunctionLikeDeclaration): readonly Expression[] {
     const cached = returnExpressionCache.get(node);
     if (cached) return cached;
     const indexed = indexedReturns.get(node);
@@ -1880,13 +2195,17 @@ export function analyzeLoadedProjectMany(
     return expressions;
   }
 
+  /**
+   * A reassigned parameter no longer carries the caller's key, which disqualifies its function
+   * as a wrapper. Uses the assignment index for inventoried functions and a body walk otherwise.
+   */
   function parameterIsReassignedCached(
-    parameter: ts.ParameterDeclaration,
-    owner: ts.FunctionLikeDeclaration
+    parameter: ParameterDeclaration,
+    owner: FunctionLikeDeclaration
   ): boolean {
     const cached = reassignmentCache.get(parameter);
     if (cached !== undefined) return cached;
-    const symbol = ts.isIdentifier(parameter.name) ? normalizedSymbol(parameter.name) : undefined;
+    const symbol = isIdentifier(parameter.name) ? semantic.symbol(parameter.name) : undefined;
     const indexed = symbol
       ? (assignmentIndex.get(symbol) ?? []).some((assignment) => assignment.owner === owner)
       : false;
@@ -1896,30 +2215,36 @@ export function analyzeLoadedProjectMany(
     return result;
   }
 
-  function functionLikeForCall(call: ts.CallExpression): ts.FunctionLikeDeclaration | undefined {
+  /** Resolves the function a call invokes; see functionLikeForExpression. */
+  function functionLikeForCall(call: CallExpression): FunctionLikeDeclaration | undefined {
     return functionLikeForExpression(call.expression);
   }
 
-  function functionLikeForExpression(expression: ts.Node): ts.FunctionLikeDeclaration | undefined {
+  /**
+   * Resolves a callee or JSX tag to a function: a function-like declaration, a function or arrow
+   * initializer, or the render callback of `forwardRef`. Its answers depend only on Semantic,
+   * so prefetch lookahead may call it in any order.
+   */
+  function functionLikeForExpression(expression: Node): FunctionLikeDeclaration | undefined {
     const cached = functionLikeCache.get(expression);
     if (cached !== undefined) return cached ?? undefined;
-    const symbol = normalizedSymbol(expression);
-    for (const declaration of symbol?.declarations ?? []) {
+    const symbol = semantic.symbol(expression);
+    for (const declaration of semantic.declarations(symbol)) {
       if (isConcreteFunctionLike(declaration)) {
         functionLikeCache.set(expression, declaration);
         return declaration;
       }
-      if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+      if (isVariableDeclaration(declaration) && declaration.initializer) {
         const initializer = unwrapExpression(declaration.initializer);
-        if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)) {
+        if (isArrowFunction(initializer) || isFunctionExpression(initializer)) {
           functionLikeCache.set(expression, initializer);
           return initializer;
         }
-        if (ts.isCallExpression(initializer) && isReactForwardRefCall(initializer)) {
+        if (isCallExpression(initializer) && isReactForwardRefCall(initializer)) {
           const render = initializer.arguments[0]
             ? unwrapExpression(initializer.arguments[0])
             : undefined;
-          if (render && (ts.isArrowFunction(render) || ts.isFunctionExpression(render))) {
+          if (render && (isArrowFunction(render) || isFunctionExpression(render))) {
             // Restrict this to proven transparent React wrappers. Arbitrary higher-order functions
             // may store, transform, or ignore callbacks, so matching callback and response types is
             // not enough to prove value provenance. Resolving signatures for every call also added
@@ -1935,40 +2260,49 @@ export function analyzeLoadedProjectMany(
     return undefined;
   }
 
-  function symbolForFunction(node: ts.FunctionLikeDeclaration): ts.Symbol | undefined {
-    if (node.name) return normalizedSymbol(node.name);
-    if (ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) {
-      return normalizedSymbol(node.parent.name);
+  /**
+   * Returns the symbol hooks and wrappers are registered under: the function's own name, or the
+   * variable an anonymous function initializes. Callers reach the same symbol through their
+   * callee, so lookups by call site match.
+   */
+  function symbolForFunction(node: FunctionLikeDeclaration): TsSymbol | undefined {
+    const name = functionName(node);
+    if (name) return semantic.symbol(name);
+    if (isVariableDeclaration(node.parent) && isIdentifier(node.parent.name)) {
+      return semantic.symbol(node.parent.name);
     }
     return undefined;
   }
 
   /** Declaration-only factories are rare enough to resolve without typing every arbitrary call. */
-  function dictionaryIdsForDeclaredType(typeNode: ts.TypeNode): ReadonlySet<string> {
-    return dictionaryIdsForType(checker.getTypeFromTypeNode(typeNode));
+  function dictionaryIdsForDeclaredType(typeNode: TypeNode): ReadonlySet<string> {
+    return dictionaryIdsForType(semantic.typeFromTypeNode(typeNode));
   }
 
-  function dictionaryIdsForFunctionReturn(target: ts.FunctionLikeDeclaration): ReadonlySet<string> {
+  /** Matches a function's declared or inferred return type to dictionaries, once per function. */
+  function dictionaryIdsForFunctionReturn(target: FunctionLikeDeclaration): ReadonlySet<string> {
     const cached = dictionaryReturnIdsCache.get(target);
     if (cached) return cached;
     // Dictionary identity belongs to the function contract, not each invocation; resolving the
     // declaration once avoids re-checking large call expressions throughout the project.
-    const signature = checker.getSignatureFromDeclaration(target);
-    const ids = signature
-      ? dictionaryIdsForType(checker.getReturnTypeOfSignature(signature))
-      : new Set<string>();
+    const ids = dictionaryIdsForType(
+      semantic.returnType(semantic.signatureFromDeclaration(target))
+    );
     dictionaryReturnIdsCache.set(target, ids);
     return ids;
   }
 
-  function dictionaryIdsForType(type: ts.Type): ReadonlySet<string> {
-    const typeSymbol = unwrapAlias(checker, type.aliasSymbol ?? type.getSymbol());
+  /**
+   * Matches a type to dictionaries by identity or by its alias-resolved alias or type symbol.
+   * Unresolvable aliases map to `undefined`, so they never match each other.
+   */
+  function dictionaryIdsForType(type: Type): ReadonlySet<string> {
+    const typeSymbol = semantic.aliased(type.getAliasSymbol() ?? type.getSymbol());
     const ids = new Set<string>();
     for (const target of dictionaries) {
       const dictionaryType = target.info.declaredType;
-      const dictionarySymbol = unwrapAlias(
-        checker,
-        dictionaryType.aliasSymbol ?? dictionaryType.getSymbol()
+      const dictionarySymbol = semantic.aliased(
+        dictionaryType.getAliasSymbol() ?? dictionaryType.getSymbol()
       );
       if (type === dictionaryType || (typeSymbol && typeSymbol === dictionarySymbol)) {
         ids.add(target.id);
@@ -1989,61 +2323,75 @@ export function analyzeLoadedProjectMany(
     return leaves;
   }
 
+  /**
+   * Reports an import of `importedName` from `moduleName`. The import statement proves package
+   * origin even when the package's own declarations are never resolved.
+   */
   function isImportedName(
-    symbol: ts.Symbol | undefined,
+    symbol: TsSymbol | undefined,
     importedName: string,
     moduleName: string
   ): boolean {
+    // Only alias symbols carry ImportSpecifier declarations. Checking the flag first avoids
+    // resolving the declarations of every callee, which would transfer lib.dom.d.ts for a lone
+    // `console.log` call.
+    if (!symbol || (symbol.flags & SymbolFlags.Alias) === 0) return false;
     return Boolean(
-      symbol?.declarations?.some((declaration) => {
-        if (!ts.isImportSpecifier(declaration)) return false;
+      semantic.declarations(symbol).some((declaration) => {
+        if (!isImportSpecifier(declaration)) return false;
         const originalName = declaration.propertyName?.text ?? declaration.name.text;
         const importDeclaration = declaration.parent.parent.parent;
         return (
           originalName === importedName &&
-          ts.isImportDeclaration(importDeclaration) &&
-          ts.isStringLiteral(importDeclaration.moduleSpecifier) &&
+          isImportDeclaration(importDeclaration) &&
+          isStringLiteral(importDeclaration.moduleSpecifier) &&
           importDeclaration.moduleSpecifier.text === moduleName
         );
       })
     );
   }
 
-  function isGetFixedTCall(call: ts.CallExpression): boolean {
+  /**
+   * Recognizes i18next `getFixedT` calls. The callee symbol stays raw because isImportedName
+   * needs the ImportSpecifier, and isLibrarySymbol unwraps on its own.
+   */
+  function isGetFixedTCall(call: CallExpression): boolean {
     const callee = unwrapExpression(call.expression);
-    const target = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
-    const symbol = checker.getSymbolAtLocation(target);
+    const target = isPropertyAccessExpression(callee) ? callee.name : callee;
+    const symbol = semantic.rawSymbol(target);
     if (isImportedName(symbol, 'getFixedT', 'i18next')) return true;
     if (isLibrarySymbol(symbol, 'getFixedT', 'i18next')) return true;
     return (
-      ts.isPropertyAccessExpression(callee) &&
+      isPropertyAccessExpression(callee) &&
       callee.name.text === 'getFixedT' &&
       (isDefaultImportFrom(callee.expression, 'i18next') ||
         isNamespaceImportFrom(callee.expression, 'i18next'))
     );
   }
 
-  function isReactUseMemoCall(call: ts.CallExpression): boolean {
+  /** Recognizes React `useMemo` calls, keeping the raw callee symbol as isGetFixedTCall does. */
+  function isReactUseMemoCall(call: CallExpression): boolean {
     const callee = unwrapExpression(call.expression);
-    const target = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
-    const symbol = checker.getSymbolAtLocation(target);
+    const target = isPropertyAccessExpression(callee) ? callee.name : callee;
+    const symbol = semantic.rawSymbol(target);
     if (isImportedName(symbol, 'useMemo', 'react') || isLibrarySymbol(symbol, 'useMemo', 'react')) {
       return true;
     }
     return (
-      ts.isPropertyAccessExpression(callee) &&
+      isPropertyAccessExpression(callee) &&
       callee.name.text === 'useMemo' &&
       (isDefaultImportFrom(callee.expression, 'react') ||
         isNamespaceImportFrom(callee.expression, 'react'))
     );
   }
 
-  function isReactForwardRefCall(call: ts.CallExpression): boolean {
+  /** Recognizes React `forwardRef`, whose render callback receives the wrapper's props as-is. */
+  function isReactForwardRefCall(call: CallExpression): boolean {
     const callee = unwrapExpression(call.expression);
-    const target = ts.isPropertyAccessExpression(callee) ? callee.name : callee;
+    const target = isPropertyAccessExpression(callee) ? callee.name : callee;
     // Keep the import alias here: @types/react declares `forwardRef` under namespace React, so
     // unwrapping first loses the ImportSpecifier that proves its package origin.
-    const symbol = checker.getSymbolAtLocation(target);
+    const symbol = semantic.rawSymbol(target);
     if (
       isImportedName(symbol, 'forwardRef', 'react') ||
       isLibrarySymbol(symbol, 'forwardRef', 'react')
@@ -2051,14 +2399,20 @@ export function analyzeLoadedProjectMany(
       return true;
     }
     return (
-      ts.isPropertyAccessExpression(callee) &&
+      isPropertyAccessExpression(callee) &&
       callee.name.text === 'forwardRef' &&
       (isDefaultImportFrom(callee.expression, 'react') ||
         isNamespaceImportFrom(callee.expression, 'react'))
     );
   }
 
-  function isI18nextTFunction(expression: ts.Expression): boolean {
+  /**
+   * Reports a value typed as i18next's TFunction, for translators that come from declarations
+   * only, such as a typed prop. A syntactic provenance check runs first, so arbitrary callees
+   * are never typed; the type must then have a call signature and lead to i18next's `TFunction`
+   * or a `t` member. Cached per expression.
+   */
+  function isI18nextTFunction(expression: Expression): boolean {
     const cached = i18nextTFunctionCache.get(expression);
     if (cached !== undefined) return cached;
     if (!hasPlausibleI18nextTProvenance(expression)) {
@@ -2066,19 +2420,19 @@ export function analyzeLoadedProjectMany(
       return false;
     }
     // Type provenance supports declaration-only TFunction values without accepting structural lookalikes.
-    const type = typeAtLocation(expression);
+    const type = semantic.typeAt(expression);
     if (type.getCallSignatures().length === 0) {
       i18nextTFunctionCache.set(expression, false);
       return false;
     }
-    const symbols = [type.aliasSymbol, type.getSymbol()];
+    const symbols = [type.getAliasSymbol(), type.getSymbol()];
     if (
       symbols.some(
         (symbol) =>
           symbol?.name === 'TFunction' &&
-          symbol.declarations?.some((declaration) =>
-            declarationBelongsToPackage(declaration, 'i18next')
-          )
+          semantic
+            .declarations(symbol)
+            .some((declaration) => declarationBelongsToPackage(declaration, 'i18next'))
       )
     ) {
       i18nextTFunctionCache.set(expression, true);
@@ -2086,23 +2440,23 @@ export function analyzeLoadedProjectMany(
     }
     if (
       symbols.some((symbol) =>
-        symbol?.declarations?.some((declaration) =>
-          declarationHasI18nextTProvenance(declaration, new Set())
-        )
+        semantic
+          .declarations(symbol)
+          .some((declaration) => declarationHasI18nextTProvenance(declaration, new Set()))
       )
     ) {
       i18nextTFunctionCache.set(expression, true);
       return true;
     }
     const result = type.getCallSignatures().some((signature) => {
-      const declaration = signature.getDeclaration();
+      const declaration = semantic.signatureDeclaration(signature);
       if (!declaration || !declarationBelongsToPackage(declaration, 'i18next')) return false;
-      let current: ts.Node | undefined = declaration;
+      let current: Node | undefined = declaration;
       while (current) {
         if (
-          ((ts.isInterfaceDeclaration(current) || ts.isTypeAliasDeclaration(current)) &&
+          ((isInterfaceDeclaration(current) || isTypeAliasDeclaration(current)) &&
             current.name.text === 'TFunction') ||
-          (ts.isPropertySignature(current) && current.name.getText() === 't')
+          (isPropertySignatureDeclaration(current) && current.name.getText() === 't')
         ) {
           return true;
         }
@@ -2114,27 +2468,32 @@ export function analyzeLoadedProjectMany(
     return result;
   }
 
-  function hasPlausibleI18nextTProvenance(expression: ts.Expression): boolean {
+  /** Syntactic gate in front of the type lookup in isI18nextTFunction. */
+  function hasPlausibleI18nextTProvenance(expression: Expression): boolean {
     return expressionHasI18nextTProvenance(unwrapExpression(expression), new Set());
   }
 
-  function expressionHasI18nextTProvenance(expression: ts.Expression, seen: Set<ts.Node>): boolean {
+  /**
+   * Follows calls, returned values, forwarded parameters and declarations to a value that could
+   * come from i18next. `seen` is shared across the walk to stop cycles.
+   */
+  function expressionHasI18nextTProvenance(expression: Expression, seen: Set<Node>): boolean {
     const value = unwrapExpression(expression);
     if (seen.has(value)) return false;
     seen.add(value);
 
-    if (ts.isCallExpression(value)) {
+    if (isCallExpression(value)) {
       if (isGetFixedTCall(value)) return true;
       const target = functionLikeForCall(value);
       if (!target) return false;
       if (target.type && typeNodeHasI18nextTProvenance(target.type, seen)) return true;
       for (const returned of returnExpressionsCached(target)) {
         const returnedValue = unwrapExpression(returned);
-        if (ts.isIdentifier(returnedValue)) {
+        if (isIdentifier(returnedValue)) {
           const parameterIndex = target.parameters.findIndex(
             (parameter) =>
-              ts.isIdentifier(parameter.name) &&
-              normalizedSymbol(parameter.name) === normalizedSymbol(returnedValue)
+              isIdentifier(parameter.name) &&
+              semantic.symbol(parameter.name) === semantic.symbol(returnedValue)
           );
           const argument = parameterIndex >= 0 ? value.arguments[parameterIndex] : undefined;
           if (argument && expressionHasI18nextTProvenance(argument, seen)) return true;
@@ -2144,57 +2503,55 @@ export function analyzeLoadedProjectMany(
       return false;
     }
 
-    const symbol = normalizedSymbol(value);
+    const symbol = semantic.symbol(value);
     if (!symbol) return false;
     if (translators.has(symbol)) return true;
-    return (
-      symbol.declarations?.some((declaration) =>
-        declarationHasI18nextTProvenance(declaration, seen)
-      ) ?? false
-    );
+    return semantic
+      .declarations(symbol)
+      .some((declaration) => declarationHasI18nextTProvenance(declaration, seen));
   }
 
-  function declarationHasI18nextTProvenance(
-    declaration: ts.Declaration,
-    seen: Set<ts.Node>
-  ): boolean {
+  /**
+   * Checks a declaration's annotation, initializer, destructuring source, alias target or
+   * heritage for i18next translator provenance. Untyped callback parameters pass, since only the
+   * checker knows their contextual type.
+   */
+  function declarationHasI18nextTProvenance(declaration: Declaration, seen: Set<Node>): boolean {
     if (seen.has(declaration)) return false;
     seen.add(declaration);
     if (isI18nextTranslatorDeclaration(declaration)) return true;
     if (
-      ts.isParameter(declaration) &&
-      !declaration.type &&
-      (ts.isArrowFunction(declaration.parent) || ts.isFunctionExpression(declaration.parent)) &&
-      ts.isCallExpression(declaration.parent.parent) &&
+      isParameterDeclaration(declaration) &&
+      !writtenType(declaration.type) &&
+      (isArrowFunction(declaration.parent) || isFunctionExpression(declaration.parent)) &&
+      isCallExpression(declaration.parent.parent) &&
       declaration.parent.parent.arguments.includes(declaration.parent)
     ) {
       // Contextual callback types are available only through the checker at the call site.
       return true;
     }
 
-    if (
-      (ts.isVariableDeclaration(declaration) ||
-        ts.isParameter(declaration) ||
-        ts.isPropertyDeclaration(declaration) ||
-        ts.isPropertySignature(declaration)) &&
-      declaration.type &&
-      typeNodeHasI18nextTProvenance(declaration.type, seen)
-    ) {
-      return true;
-    }
-    if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+    const annotation =
+      isVariableDeclaration(declaration) ||
+      isParameterDeclaration(declaration) ||
+      isPropertyDeclaration(declaration) ||
+      isPropertySignatureDeclaration(declaration)
+        ? writtenType(declaration.type)
+        : undefined;
+    if (annotation && typeNodeHasI18nextTProvenance(annotation, seen)) return true;
+    if (isVariableDeclaration(declaration) && declaration.initializer) {
       return expressionHasI18nextTProvenance(declaration.initializer, seen);
     }
-    if (ts.isBindingElement(declaration)) {
+    if (isBindingElement(declaration)) {
       const variable = declaration.parent.parent;
-      return ts.isVariableDeclaration(variable) && variable.initializer
+      return isVariableDeclaration(variable) && variable.initializer
         ? expressionHasI18nextTProvenance(variable.initializer, seen)
         : false;
     }
-    if (ts.isTypeAliasDeclaration(declaration)) {
+    if (isTypeAliasDeclaration(declaration)) {
       return typeNodeHasI18nextTProvenance(declaration.type, seen);
     }
-    if (ts.isInterfaceDeclaration(declaration)) {
+    if (isInterfaceDeclaration(declaration)) {
       return (
         declaration.heritageClauses?.some((clause) =>
           clause.types.some((type) => typeNodeHasI18nextTProvenance(type, seen))
@@ -2204,21 +2561,22 @@ export function analyzeLoadedProjectMany(
     return false;
   }
 
-  function isI18nextTranslatorDeclaration(declaration: ts.Declaration): boolean {
+  /** Reports a declaration in i18next's typings that is, or sits inside, TFunction or `t`. */
+  function isI18nextTranslatorDeclaration(declaration: Declaration): boolean {
     if (!declarationBelongsToPackage(declaration, 'i18next')) return false;
-    let current: ts.Node | undefined = declaration;
+    let current: Node | undefined = declaration;
     while (current) {
       if (
-        ((ts.isInterfaceDeclaration(current) || ts.isTypeAliasDeclaration(current)) &&
+        ((isInterfaceDeclaration(current) || isTypeAliasDeclaration(current)) &&
           current.name.text === 'TFunction') ||
-        ((ts.isVariableDeclaration(current) || ts.isFunctionDeclaration(current)) &&
+        ((isVariableDeclaration(current) || isFunctionDeclaration(current)) &&
           current.name &&
-          ts.isIdentifier(current.name) &&
+          isIdentifier(current.name) &&
           current.name.text === 't') ||
-        ((ts.isPropertyDeclaration(current) ||
-          ts.isPropertySignature(current) ||
-          ts.isMethodDeclaration(current) ||
-          ts.isMethodSignature(current)) &&
+        ((isPropertyDeclaration(current) ||
+          isPropertySignatureDeclaration(current) ||
+          isMethodDeclaration(current) ||
+          isMethodSignatureDeclaration(current)) &&
           current.name &&
           staticPropertyName(current.name) === 't')
       ) {
@@ -2229,93 +2587,106 @@ export function analyzeLoadedProjectMany(
     return false;
   }
 
-  function typeNodeHasI18nextTProvenance(typeNode: ts.TypeNode, seen: Set<ts.Node>): boolean {
+  /**
+   * Follows type references and heritage expressions to an i18next translator declaration.
+   * Heritage clause entries are typed apart from type nodes, so both are accepted.
+   */
+  function typeNodeHasI18nextTProvenance(
+    typeNode: TypeNode | HeritageClauseElement,
+    seen: Set<Node>
+  ): boolean {
     if (seen.has(typeNode)) return false;
     seen.add(typeNode);
-    if (ts.isParenthesizedTypeNode(typeNode)) {
+    if (isParenthesizedTypeNode(typeNode)) {
       return typeNodeHasI18nextTProvenance(typeNode.type, seen);
     }
-    if (ts.isUnionTypeNode(typeNode) || ts.isIntersectionTypeNode(typeNode)) {
+    if (isUnionTypeNode(typeNode) || isIntersectionTypeNode(typeNode)) {
       return typeNode.types.some((type) => typeNodeHasI18nextTProvenance(type, seen));
     }
-    const typeName = ts.isTypeReferenceNode(typeNode)
+    const typeName = isTypeReferenceNode(typeNode)
       ? typeNode.typeName
-      : ts.isExpressionWithTypeArguments(typeNode)
+      : isExpressionWithTypeArguments(typeNode)
         ? typeNode.expression
         : undefined;
     if (!typeName) return false;
-    const symbol = unwrapAlias(checker, checker.getSymbolAtLocation(typeName));
-    return (
-      symbol?.declarations?.some((declaration) =>
-        declarationHasI18nextTProvenance(declaration, seen)
-      ) ?? false
-    );
+    // The lookup must target the type name node as written. semantic.symbol would query only
+    // the `B` of an `extends a.B` property access, so the alias is unwrapped here instead.
+    const symbol = semantic.aliased(semantic.rawSymbol(typeName));
+    return semantic
+      .declarations(symbol)
+      .some((declaration) => declarationHasI18nextTProvenance(declaration, seen));
   }
 
-  function couldBeTranslationHookResult(
-    expression: ts.Expression,
-    seen = new Set<ts.Node>()
-  ): boolean {
+  /**
+   * Cheap gate in front of translationHookPrefix: a `useTranslation` call, a call to a known
+   * hook wrapper, or a variable initialized with either.
+   */
+  function couldBeTranslationHookResult(expression: Expression, seen = new Set<Node>()): boolean {
     const value = unwrapExpression(expression);
     if (seen.has(value)) return false;
     seen.add(value);
-    if (ts.isIdentifier(value)) {
-      const declaration = normalizedSymbol(value)?.declarations?.find(ts.isVariableDeclaration);
+    if (isIdentifier(value)) {
+      const declaration = semantic.declarations(semantic.symbol(value)).find(isVariableDeclaration);
       return Boolean(
         declaration?.initializer && couldBeTranslationHookResult(declaration.initializer, seen)
       );
     }
-    if (!ts.isCallExpression(value)) return false;
+    if (!isCallExpression(value)) return false;
     if (isUseTranslationCall(value)) return true;
-    const symbol = normalizedSymbol(value.expression);
+    const symbol = semantic.symbol(value.expression);
     return Boolean(symbol && translationHookWrappers.has(symbol));
   }
 
-  function isPotentialTranslatorExpression(expression: ts.Expression): boolean {
+  /**
+   * Gate in front of translatorPrefix for variable initializers and call arguments, so only
+   * values with plausible translator provenance pay for full prefix resolution.
+   */
+  function isPotentialTranslatorExpression(expression: Expression): boolean {
     const value = unwrapExpression(expression);
     if (
-      !ts.isIdentifier(value) &&
-      !ts.isCallExpression(value) &&
-      !ts.isPropertyAccessExpression(value) &&
-      !ts.isElementAccessExpression(value)
+      !isIdentifier(value) &&
+      !isCallExpression(value) &&
+      !isPropertyAccessExpression(value) &&
+      !isElementAccessExpression(value)
     ) {
       return false;
     }
-    if (ts.isCallExpression(value)) {
+    if (isCallExpression(value)) {
       return isGetFixedTCall(value) || expressionHasI18nextTProvenance(value, new Set());
     }
-    const symbol = normalizedSymbol(value);
+    const symbol = semantic.symbol(value);
     if (symbol && translators.has(symbol)) return true;
-    if (ts.isPropertyAccessExpression(value) && value.name.text === 't') {
+    if (isPropertyAccessExpression(value) && value.name.text === 't') {
       return (
         couldBeTranslationHookResult(value.expression) ||
         isDefaultImportFrom(value.expression, 'i18next') ||
-        isLibrarySymbol(checker.getSymbolAtLocation(value.name), 't', 'i18next') ||
+        isLibrarySymbol(semantic.rawSymbol(value.name), 't', 'i18next') ||
         expressionHasI18nextTProvenance(value, new Set())
       );
     }
     if (
-      ts.isElementAccessExpression(value) &&
+      isElementAccessExpression(value) &&
       value.argumentExpression &&
-      ((ts.isNumericLiteral(value.argumentExpression) && value.argumentExpression.text === '0') ||
-        (ts.isStringLiteral(value.argumentExpression) && value.argumentExpression.text === '0'))
+      ((isNumericLiteral(value.argumentExpression) && value.argumentExpression.text === '0') ||
+        (isStringLiteral(value.argumentExpression) && value.argumentExpression.text === '0'))
     ) {
       return couldBeTranslationHookResult(value.expression);
     }
     return (
-      isImportedName(checker.getSymbolAtLocation(value), 't', 'i18next') ||
+      isImportedName(semantic.rawSymbol(value), 't', 'i18next') ||
       expressionHasI18nextTProvenance(value, new Set())
     );
   }
 
+  /** Applies a call-level `keyPrefix`; a literal `null` or `undefined` keeps the bound prefix. */
   function mergePrefixOverride(
     boundPrefix: StringResolution,
-    expression: ts.Expression
+    expression: Expression
   ): StringResolution {
     const value = unwrapExpression(expression);
     if (
-      value.kind === ts.SyntaxKind.NullKeyword ||
-      (ts.isIdentifier(value) && value.text === 'undefined')
+      value.kind === SyntaxKind.NullKeyword ||
+      (isIdentifier(value) && value.text === 'undefined')
     ) {
       return boundPrefix;
     }
@@ -2324,29 +2695,37 @@ export function analyzeLoadedProjectMany(
     return override.complete ? override : merge(boundPrefix, override);
   }
 
+  /**
+   * Reports whether `symbol`, after alias resolution, is `exportedName` declared by `packageName`.
+   * Callers may pass raw symbols, so the unwrap happens here.
+   */
   function isLibrarySymbol(
-    symbol: ts.Symbol | undefined,
+    symbol: TsSymbol | undefined,
     exportedName: string,
     packageName: string
   ): boolean {
-    const normalized = unwrapAlias(checker, symbol);
+    const normalized = semantic.aliased(symbol);
     return Boolean(
       normalized?.name === exportedName &&
-        normalized.declarations?.some((declaration) =>
-          declarationBelongsToPackage(declaration, packageName)
-        )
+        semantic
+          .declarations(normalized)
+          .some((declaration) => declarationBelongsToPackage(declaration, packageName))
     );
   }
 
-  function declarationBelongsToPackage(declaration: ts.Node, packageName: string): boolean {
-    // Installed declarations and ambient test/consumer declarations encode package ownership differently.
+  /**
+   * Reports a declaration from `packageName`: installed typings under
+   * `node_modules/<package>/`, or an ambient `declare module '<package>'` block, as tests and
+   * projects without the package installed use. Reads only the node and its file path.
+   */
+  function declarationBelongsToPackage(declaration: Node, packageName: string): boolean {
     const marker = `${path.sep}node_modules${path.sep}${packageName}${path.sep}`;
     if (path.resolve(declaration.getSourceFile().fileName).includes(marker)) return true;
-    let current: ts.Node | undefined = declaration;
+    let current: Node | undefined = declaration;
     while (current) {
       if (
-        ts.isModuleDeclaration(current) &&
-        ts.isStringLiteral(current.name) &&
+        isModuleDeclaration(current) &&
+        isStringLiteral(current.name) &&
         current.name.text === packageName
       ) {
         return true;
@@ -2356,30 +2735,38 @@ export function analyzeLoadedProjectMany(
     return false;
   }
 
-  function isDefaultImportFrom(expression: ts.Expression, packageName: string): boolean {
-    const symbol = checker.getSymbolAtLocation(unwrapExpression(expression));
+  /**
+   * Reports a default import binding from `packageName`. The lookup stays raw because the import
+   * clause declares the alias symbol, never its target.
+   */
+  function isDefaultImportFrom(expression: Expression, packageName: string): boolean {
+    const symbol = semantic.rawSymbol(unwrapExpression(expression));
     return Boolean(
-      symbol?.declarations?.some((declaration) => {
-        if (!ts.isImportClause(declaration)) return false;
+      semantic.declarations(symbol).some((declaration) => {
+        if (!isImportClause(declaration)) return false;
         const importDeclaration = declaration.parent;
         return (
-          ts.isImportDeclaration(importDeclaration) &&
-          ts.isStringLiteral(importDeclaration.moduleSpecifier) &&
+          isImportDeclaration(importDeclaration) &&
+          isStringLiteral(importDeclaration.moduleSpecifier) &&
           importDeclaration.moduleSpecifier.text === packageName
         );
       })
     );
   }
 
-  function isNamespaceImportFrom(expression: ts.Expression, packageName: string): boolean {
-    const symbol = checker.getSymbolAtLocation(unwrapExpression(expression));
+  /**
+   * Reports a namespace import binding from `packageName`. The lookup stays raw because the
+   * namespace import declares the alias symbol, never its target.
+   */
+  function isNamespaceImportFrom(expression: Expression, packageName: string): boolean {
+    const symbol = semantic.rawSymbol(unwrapExpression(expression));
     return Boolean(
-      symbol?.declarations?.some((declaration) => {
-        if (!ts.isNamespaceImport(declaration)) return false;
+      semantic.declarations(symbol).some((declaration) => {
+        if (!isNamespaceImport(declaration)) return false;
         const importDeclaration = declaration.parent.parent;
         return (
-          ts.isImportDeclaration(importDeclaration) &&
-          ts.isStringLiteral(importDeclaration.moduleSpecifier) &&
+          isImportDeclaration(importDeclaration) &&
+          isStringLiteral(importDeclaration.moduleSpecifier) &&
           importDeclaration.moduleSpecifier.text === packageName
         );
       })
@@ -2387,89 +2774,119 @@ export function analyzeLoadedProjectMany(
   }
 }
 
-function staticPropertyName(name: ts.PropertyName): string | undefined {
-  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) {
+/** Returns a member name known without the checker, including literal computed names. */
+function staticPropertyName(name: PropertyName): string | undefined {
+  if (isIdentifier(name) || isStringLiteral(name) || isNumericLiteral(name)) {
     return name.text;
   }
-  if (ts.isComputedPropertyName(name)) {
+  if (isComputedPropertyName(name)) {
     const expression = unwrapExpression(name.expression);
-    if (ts.isStringLiteral(expression) || ts.isNumericLiteral(expression)) return expression.text;
+    if (isStringLiteral(expression) || isNumericLiteral(expression)) return expression.text;
   }
   return undefined;
 }
 
-function staticBindingElementName(element: ts.BindingElement): string | undefined {
+/** Returns the property a binding element reads: its property name, else its own name. */
+function staticBindingElementName(element: BindingElement): string | undefined {
   if (element.propertyName) return staticPropertyName(element.propertyName);
-  return ts.isIdentifier(element.name) ? element.name.text : undefined;
+  return element.name && isIdentifier(element.name) ? element.name.text : undefined;
 }
 
-function isDefinitelyStringLike(type: ts.Type): boolean {
-  if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return false;
-  if (type.flags & ts.TypeFlags.StringLike) return true;
-  if (type.isUnion()) return type.types.length > 0 && type.types.every(isDefinitelyStringLike);
-  if (type.isIntersection()) return type.types.some(isDefinitelyStringLike);
+/**
+ * Returns the identifier of a shorthand property. The parser only produces identifiers there,
+ * but the AST types the name through the shared member base as any property name.
+ */
+function shorthandName(property: ShorthandPropertyAssignment): Identifier {
+  return property.name as Identifier;
+}
+
+/**
+ * Returns the declared name of a function-like node. Constructor and arrow function types have
+ * no `name` member, so they are excluded before reading it.
+ */
+function functionName(node: FunctionLikeDeclaration): PropertyName | undefined {
+  return isConstructorDeclaration(node) || isArrowFunction(node) ? undefined : node.name;
+}
+
+/**
+ * Reports a type whose values are all strings. An access on such a base, as in
+ * `dictionary.title.length`, reads a string member, so it marks the dictionary leaf instead of
+ * appending `length` as a key segment. `any` and `unknown` never qualify; a union needs every
+ * member to qualify and an intersection one.
+ */
+function isDefinitelyStringLike(type: Type): boolean {
+  if (type.flags & (TypeFlags.Any | TypeFlags.Unknown)) return false;
+  if (type.flags & TypeFlags.StringLike) return true;
+  if (type.isUnionType()) {
+    const types = type.getTypes();
+    return types.length > 0 && types.every(isDefinitelyStringLike);
+  }
+  if (type.isIntersectionType()) return type.getTypes().some(isDefinitelyStringLike);
   return false;
 }
 
+/** Returns the `t` member of a returned object literal, which makes its function a hook. */
 function returnedTranslatorProperty(
-  property: ts.ObjectLiteralElementLike,
-  source: ts.SourceFile
-): ts.Expression | undefined {
-  if (ts.isShorthandPropertyAssignment(property) && property.name.text === 't')
-    return property.name;
-  if (!ts.isPropertyAssignment(property)) return undefined;
+  property: ObjectLiteralElementLike,
+  source: SourceFile
+): Expression | undefined {
+  if (isShorthandPropertyAssignment(property) && shorthandName(property).text === 't')
+    return shorthandName(property);
+  if (!isPropertyAssignment(property)) return undefined;
   const name = property.name.getText(source).replaceAll(/['"]/g, '');
   return name === 't' ? property.initializer : undefined;
 }
 
-function isEnumerationCall(call: ts.CallExpression): boolean {
+/** `Object.keys`, `values` and `entries` read every key of their argument at runtime. */
+function isEnumerationCall(call: CallExpression): boolean {
   const expression = unwrapExpression(call.expression);
   return (
-    ts.isPropertyAccessExpression(expression) &&
+    isPropertyAccessExpression(expression) &&
     expression.expression.getText() === 'Object' &&
     ['keys', 'values', 'entries'].includes(expression.name.text)
   );
 }
 
-function isObjectChainBase(node: ts.Expression): boolean {
+/** Reports the receiver of a further access; only the outermost access of a chain is analyzed. */
+function isObjectChainBase(node: Expression): boolean {
   const parent = node.parent;
   return (
-    (ts.isPropertyAccessExpression(parent) && parent.expression === node) ||
-    (ts.isElementAccessExpression(parent) && parent.expression === node)
+    (isPropertyAccessExpression(parent) && parent.expression === node) ||
+    (isElementAccessExpression(parent) && parent.expression === node)
   );
 }
 
-function isAliasOrReturn(node: ts.Expression): boolean {
+/** Reports a value that is only stored or returned; it is analyzed where it is later read. */
+function isAliasOrReturn(node: Expression): boolean {
   const parent = node.parent;
   return (
-    (ts.isVariableDeclaration(parent) && parent.initializer === node) ||
-    (ts.isBinaryExpression(parent) &&
+    (isVariableDeclaration(parent) && parent.initializer === node) ||
+    (isBinaryExpression(parent) &&
       parent.right === node &&
-      parent.operatorToken.kind === ts.SyntaxKind.EqualsToken) ||
-    ts.isReturnStatement(parent) ||
-    (ts.isArrowFunction(parent) && parent.body === node)
+      parent.operatorToken.kind === SyntaxKind.EqualsToken) ||
+    isReturnStatement(parent) ||
+    (isArrowFunction(parent) && parent.body === node)
   );
 }
 
-function translationObjectCast(
-  call: ts.CallExpression
-): ts.AsExpression | ts.TypeAssertion | undefined {
-  let expression: ts.Expression = call;
-  let result: ts.AsExpression | ts.TypeAssertion | undefined;
+/**
+ * Returns the outermost source cast around a `returnObjects` call, looking through parentheses,
+ * `!` and `satisfies`, so `--remove` deletes every chained cast.
+ */
+function translationObjectCast(call: CallExpression): AsExpression | TypeAssertion | undefined {
+  let expression: Expression = call;
+  let result: AsExpression | TypeAssertion | undefined;
   while (true) {
     const parent = expression.parent;
-    if (
-      (ts.isAsExpression(parent) || ts.isTypeAssertionExpression(parent)) &&
-      parent.expression === expression
-    ) {
-      result = parent;
+    if ((isAsExpression(parent) || isTypeAssertion(parent)) && parent.expression === expression) {
+      if (isSourceAssertion(parent)) result = parent;
       expression = parent;
       continue;
     }
     if (
-      (ts.isParenthesizedExpression(parent) ||
-        ts.isNonNullExpression(parent) ||
-        ts.isSatisfiesExpression(parent)) &&
+      (isParenthesizedExpression(parent) ||
+        isNonNullExpression(parent) ||
+        isSatisfiesExpression(parent)) &&
       parent.expression === expression
     ) {
       expression = parent;
@@ -2479,64 +2896,77 @@ function translationObjectCast(
   }
 }
 
+/**
+ * Returns an options argument cast through `any`, `unknown` or `never`, which hides
+ * `returnObjects: true` from the call's type and is reported for removal.
+ */
 function unsafeTranslationArgumentCast(
-  argument: ts.Expression
-): ts.AsExpression | ts.TypeAssertion | undefined {
-  let expression = argument;
-  while (
-    ts.isParenthesizedExpression(expression) ||
-    ts.isNonNullExpression(expression) ||
-    ts.isSatisfiesExpression(expression)
-  ) {
-    expression = expression.expression;
-  }
-  if (!ts.isAsExpression(expression) && !ts.isTypeAssertionExpression(expression)) return undefined;
+  argument: Expression
+): AsExpression | TypeAssertion | undefined {
+  let expression = skipCastWrappers(argument);
+  if (!isSourceAssertion(expression)) return undefined;
   const outermost = expression;
-  while (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
+  while (isSourceAssertion(expression)) {
     if (
-      expression.type.kind === ts.SyntaxKind.AnyKeyword ||
-      expression.type.kind === ts.SyntaxKind.UnknownKeyword ||
-      expression.type.kind === ts.SyntaxKind.NeverKeyword
+      expression.type.kind === SyntaxKind.AnyKeyword ||
+      expression.type.kind === SyntaxKind.UnknownKeyword ||
+      expression.type.kind === SyntaxKind.NeverKeyword
     ) {
       return outermost;
     }
-    expression = expression.expression;
-    while (
-      ts.isParenthesizedExpression(expression) ||
-      ts.isNonNullExpression(expression) ||
-      ts.isSatisfiesExpression(expression)
-    ) {
-      expression = expression.expression;
-    }
+    expression = skipCastWrappers(expression.expression);
   }
   return undefined;
 }
 
-function isUnconsumedObjectCall(call: ts.CallExpression): boolean {
-  let value: ts.Expression = call;
+/**
+ * Skips wrappers that sit between casts without being casts themselves: parentheses, `!`,
+ * `satisfies`, and JSDoc type comments that JavaScript files parse as assertions.
+ */
+function skipCastWrappers(input: Expression): Expression {
+  let expression = input;
   while (
-    ts.isParenthesizedExpression(value.parent) ||
-    ts.isAsExpression(value.parent) ||
-    ts.isTypeAssertionExpression(value.parent) ||
-    ts.isNonNullExpression(value.parent) ||
-    ts.isSatisfiesExpression(value.parent)
+    isParenthesizedExpression(expression) ||
+    isNonNullExpression(expression) ||
+    isSatisfiesExpression(expression) ||
+    ((isAsExpression(expression) || isTypeAssertion(expression)) && !isSourceAssertion(expression))
+  ) {
+    expression = expression.expression;
+  }
+  return expression;
+}
+
+/**
+ * Reports a `returnObjects` call whose object escapes property-level analysis. Storing it in a
+ * variable, accessing it, or returning it from a non-exported function keeps it analyzable,
+ * since the variable, the access or the function's callers are analyzed instead.
+ */
+function isUnconsumedObjectCall(call: CallExpression): boolean {
+  let value: Expression = call;
+  while (
+    isParenthesizedExpression(value.parent) ||
+    isAsExpression(value.parent) ||
+    isTypeAssertion(value.parent) ||
+    isNonNullExpression(value.parent) ||
+    isSatisfiesExpression(value.parent)
   ) {
     value = value.parent;
   }
   const parent = value.parent;
-  if (ts.isReturnStatement(parent) || (ts.isArrowFunction(parent) && parent.body === value)) {
+  if (isReturnStatement(parent) || (isArrowFunction(parent) && parent.body === value)) {
     const owner = enclosingFunction(call);
     return !owner || isExported(owner);
   }
   return !(
-    (ts.isVariableDeclaration(parent) && parent.initializer === value) ||
-    (ts.isPropertyAccessExpression(parent) && parent.expression === value) ||
-    (ts.isElementAccessExpression(parent) && parent.expression === value)
+    (isVariableDeclaration(parent) && parent.initializer === value) ||
+    (isPropertyAccessExpression(parent) && parent.expression === value) ||
+    (isElementAccessExpression(parent) && parent.expression === value)
   );
 }
 
-function enclosingFunction(node: ts.Node): ts.FunctionLikeDeclaration | undefined {
-  let current: ts.Node | undefined = node.parent;
+/** Returns the innermost concrete function around a node, which scopes wrapper checks. */
+function enclosingFunction(node: Node): FunctionLikeDeclaration | undefined {
+  let current: Node | undefined = node.parent;
   while (current) {
     if (isConcreteFunctionLike(current)) return current;
     current = current.parent;
@@ -2544,57 +2974,70 @@ function enclosingFunction(node: ts.Node): ts.FunctionLikeDeclaration | undefine
   return undefined;
 }
 
+/**
+ * Name-based reassignment check for functions outside the assignment index. Nested functions
+ * are not searched.
+ */
 function parameterIsReassigned(
-  parameter: ts.ParameterDeclaration,
-  owner: ts.FunctionLikeDeclaration
+  parameter: ParameterDeclaration,
+  owner: FunctionLikeDeclaration
 ): boolean {
-  if (!ts.isIdentifier(parameter.name) || !owner.body) return false;
+  if (!isIdentifier(parameter.name) || !owner.body) return false;
   const sourceName = parameter.name.text;
   let reassigned = false;
-  function visit(node: ts.Node): void {
-    const left = ts.isBinaryExpression(node) ? unwrapExpression(node.left) : undefined;
+  /** Stops at the first matching assignment and at nested function boundaries. */
+  function visit(node: Node): void {
+    const left = isBinaryExpression(node) ? unwrapExpression(node.left) : undefined;
     if (
-      ts.isBinaryExpression(node) &&
-      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      isBinaryExpression(node) &&
+      node.operatorToken.kind === SyntaxKind.EqualsToken &&
       left &&
-      ts.isIdentifier(left) &&
+      isIdentifier(left) &&
       left.text === sourceName
     ) {
       reassigned = true;
       return;
     }
-    if (node !== owner.body && ts.isFunctionLike(node)) return;
-    ts.forEachChild(node, visit);
+    if (node !== owner.body && isSignatureDeclaration(node)) return;
+    node.forEachChild(visit);
   }
   visit(owner.body);
   return reassigned;
 }
 
-function isExported(node: ts.Node): boolean {
-  return Boolean(
-    ts.canHaveModifiers(node) &&
-      ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
-  );
+/**
+ * Reports a direct `export` modifier. The modifier list also holds decorators, which the kind
+ * check skips. Only the node's own modifiers count, so the arrow function of
+ * `export const f = () => ...` is not reported as exported.
+ */
+function isExported(node: FunctionLikeDeclaration): boolean {
+  return Boolean(node.modifiers?.some((modifier) => modifier.kind === SyntaxKind.ExportKeyword));
 }
 
-function returnExpressions(node: ts.FunctionLikeDeclaration): ts.Expression[] {
+/**
+ * Collects a function's returned values, mirroring the inventory's return index for functions
+ * that were not inventoried.
+ */
+function returnExpressions(node: FunctionLikeDeclaration): Expression[] {
   if (!node.body) return [];
-  if (!ts.isBlock(node.body)) return [node.body];
-  const expressions: ts.Expression[] = [];
-  function visit(child: ts.Node): void {
-    if (ts.isReturnStatement(child) && child.expression) {
+  if (!isBlock(node.body)) return [node.body];
+  const expressions: Expression[] = [];
+  /** Skips nested functions, whose returns belong to them. */
+  function visit(child: Node): void {
+    if (isReturnStatement(child) && child.expression) {
       expressions.push(child.expression);
       return;
     }
-    if (child !== node.body && ts.isFunctionLike(child)) return;
-    ts.forEachChild(child, visit);
+    if (child !== node.body && isSignatureDeclaration(child)) return;
+    child.forEachChild(visit);
   }
   visit(node.body);
   return expressions;
 }
 
-function jsxAttributeExpression(initializer: ts.JsxAttributeValue): ts.Expression | undefined {
-  return ts.isJsxExpression(initializer) ? initializer.expression : undefined;
+/** Returns the expression of a `{...}` attribute value; string attributes have none. */
+function jsxAttributeExpression(initializer: JsxAttributeValue): Expression | undefined {
+  return isJsxExpression(initializer) ? initializer.expression : undefined;
 }
 
 function signatureOf(resolution: StringResolution): string {
@@ -2635,14 +3078,142 @@ function observationIdentity(observation: UsageObservation): string {
   ]);
 }
 
-function isConcreteFunctionLike(node: ts.Node): node is ts.FunctionLikeDeclaration {
+/** Function-like nodes that can own a body; signatures and function types are excluded. */
+function isConcreteFunctionLike(node: Node): node is FunctionLikeDeclaration {
   return (
-    ts.isFunctionDeclaration(node) ||
-    ts.isMethodDeclaration(node) ||
-    ts.isConstructorDeclaration(node) ||
-    ts.isGetAccessorDeclaration(node) ||
-    ts.isSetAccessorDeclaration(node) ||
-    ts.isFunctionExpression(node) ||
-    ts.isArrowFunction(node)
+    isFunctionDeclaration(node) ||
+    isMethodDeclaration(node) ||
+    isConstructorDeclaration(node) ||
+    isGetAccessorDeclaration(node) ||
+    isSetAccessorDeclaration(node) ||
+    isFunctionExpression(node) ||
+    isArrowFunction(node)
   );
+}
+
+/**
+ * Lists the nodes that discovery and usage analysis later hand to `semantic.symbol` or
+ * `semantic.rawSymbol`, so one batched request answers them before the first lookup.
+ *
+ * Every entry must be the exact node a later lookup receives, because the caches are keyed by
+ * node identity. `semantic.symbol` reads a property access through its name, so the name is
+ * collected in that case. A missed node falls back to a single request, so this list affects
+ * request count and never results. Extra entries still cost server time: resolving a property
+ * name type-checks its receiver, so property accesses are listed only where a lookup always
+ * follows.
+ *
+ * Key types are not prefetched. No key type lookup is unconditional, and string resolution
+ * deliberately skips typing keys declared with expensive i18next types; batching key types up
+ * front would force exactly those computations. Other types are batched elsewhere:
+ * `objectChainTypeTargets` collects the base types of access chains rooted in a dictionary or
+ * translation object, and `prefetchCallTargetTypes` the return types of call targets.
+ */
+function collectSemanticTargets(inventory: SourceInventory): Node[] {
+  const targets: Node[] = [];
+  const addSymbolSite = (node: Node): void => {
+    targets.push(isPropertyAccessExpression(node) ? node.name : node);
+  };
+  const addIdentifier = (node: Node | undefined): void => {
+    if (node && isIdentifier(node)) targets.push(node);
+  };
+  // expressionHasI18nextTProvenance looks up non-call initializers and returned values. Property
+  // accesses are left out: resolving their names type-checks the receiver, which costs more
+  // than the single requests it would save.
+  const addProvenanceSite = (expression: Expression): void => {
+    const value = unwrapExpression(expression);
+    if (!isCallExpression(value) && !isPropertyAccessExpression(value)) targets.push(value);
+  };
+  const addParameterNames = (owner: FunctionLikeDeclaration): void => {
+    for (const parameter of owner.parameters) {
+      addIdentifier(parameter.name);
+      if (!isObjectBindingPattern(parameter.name)) continue;
+      for (const element of parameter.name.elements) addIdentifier(element.name);
+    }
+  };
+
+  for (const call of inventory.calls) {
+    // Wrapper, translator, and target lookups use the callee as written; library checks such as
+    // isGetFixedTCall use it unwrapped. Both forms are usually the same node.
+    addSymbolSite(call.expression);
+    addSymbolSite(unwrapExpression(call.expression));
+    // Arguments reach resolveObject for external calls and translator propagation for local ones.
+    // Property access arguments are prefetched by propagateTranslatorParameters instead, and
+    // only for calls with a local target.
+    for (const argument of call.arguments) addIdentifier(unwrapExpression(argument));
+  }
+
+  for (const node of inventory.usageNodes) {
+    if (isJsxOpeningElement(node) || isJsxSelfClosingElement(node)) {
+      addSymbolSite(node.tagName);
+    } else if (isPropertyAccessExpression(node) || isElementAccessExpression(node)) {
+      // resolveObject walks an access chain down to its root before any symbol lookup.
+      let base = unwrapExpression(node.expression);
+      while (isPropertyAccessExpression(base) || isElementAccessExpression(base)) {
+        base = unwrapExpression(base.expression);
+      }
+      addIdentifier(base);
+    } else if (
+      isSpreadAssignment(node) ||
+      isSpreadElement(node) ||
+      isJsxSpreadAttribute(node) ||
+      isForInStatement(node) ||
+      isForOfStatement(node)
+    ) {
+      addIdentifier(unwrapExpression(node.expression));
+    } else if (isVariableDeclaration(node) && node.initializer) {
+      addIdentifier(unwrapExpression(node.initializer));
+    }
+  }
+
+  for (const node of inventory.translatorCandidates) {
+    if (!node.initializer) continue;
+    const initializer = unwrapExpression(node.initializer);
+    addSymbolSite(initializer);
+    // isPotentialTranslatorExpression also looks up a property access as a whole.
+    if (isPropertyAccessExpression(initializer)) targets.push(initializer);
+    addIdentifier(node.name);
+    if (isObjectBindingPattern(node.name)) {
+      for (const element of node.name.elements) addIdentifier(element.name);
+    } else if (isArrayBindingPattern(node.name)) {
+      const first = node.name.elements[0];
+      if (first && isBindingElement(first)) addIdentifier(first.name);
+    }
+  }
+
+  for (const assignment of inventory.assignments) addIdentifier(unwrapExpression(assignment.left));
+  for (const initializer of inventory.variableInitializers) addProvenanceSite(initializer);
+  for (const returned of inventory.returnsByFunction.values()) {
+    for (const expression of returned) addProvenanceSite(expression);
+  }
+
+  for (const owner of inventory.functions) {
+    // symbolForFunction keys hooks and wrappers by the function name, or by the variable name
+    // for anonymous function and arrow initializers.
+    const name = functionName(owner);
+    if (name) targets.push(name);
+    else if (isVariableDeclaration(owner.parent)) addIdentifier(owner.parent.name);
+    addParameterNames(owner);
+  }
+
+  return targets;
+}
+
+/**
+ * Lists the shorthand properties whose value symbol analysis reads: those of returned object
+ * literals, which hook wrapper discovery inspects for `t`, and those of object literal call
+ * arguments, which option and projected-object resolution read. Like
+ * {@link collectSemanticTargets}, this list affects request count and never results.
+ */
+function collectShorthandTargets(inventory: SourceInventory): Node[] {
+  const targets: Node[] = [];
+  const addObject = (expression: Expression): void => {
+    const value = unwrapExpression(expression);
+    if (!isObjectLiteralExpression(value)) return;
+    for (const property of value.properties) {
+      if (isShorthandPropertyAssignment(property)) targets.push(property);
+    }
+  };
+  for (const returned of inventory.returnsByFunction.values()) returned.forEach(addObject);
+  for (const call of inventory.calls) call.arguments.forEach(addObject);
+  return targets;
 }

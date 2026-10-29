@@ -3,13 +3,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import ts from '@typescript/typescript6';
+import { ScriptTarget } from 'typescript/ast';
+import { ModuleKind, ModuleResolutionKind } from 'typescript/sync';
 import { readDictionary } from '../dist/dictionary.js';
 import {
   applyDictionaryRemoval,
   planDictionaryRemoval,
   validateAndGroupEdits
 } from '../dist/dictionary-removal.js';
+import { openProgram } from './helpers.mjs';
 
 function temporaryDictionary(t, source, files = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'unused18n-removal-'));
@@ -22,40 +24,40 @@ function temporaryDictionary(t, source, files = {}) {
   return dictionaryPath;
 }
 
-function openDictionary(dictionaryPath) {
+function openDictionary(t, dictionaryPath) {
   const directory = path.dirname(dictionaryPath);
   const rootNames = fs
     .readdirSync(directory)
     .filter((fileName) => fileName.endsWith('.ts'))
     .map((fileName) => path.join(directory, fileName));
-  const program = ts.createProgram(rootNames, {
+  const { program, semantic } = openProgram(t, rootNames, {
     allowImportingTsExtensions: true,
-    module: ts.ModuleKind.NodeNext,
-    moduleResolution: ts.ModuleResolutionKind.NodeNext,
-    target: ts.ScriptTarget.ES2022
+    module: ModuleKind.NodeNext,
+    moduleResolution: ModuleResolutionKind.NodeNext,
+    target: ScriptTarget.ES2022
   });
   const syntacticDiagnostics = program.getSyntacticDiagnostics();
   assert.deepEqual(
-    syntacticDiagnostics.map((diagnostic) => diagnostic.messageText),
+    syntacticDiagnostics.map((diagnostic) => diagnostic.text),
     []
   );
-  return readDictionary(program, program.getTypeChecker(), dictionaryPath, 'dictionary');
+  return readDictionary(semantic, dictionaryPath, 'dictionary');
 }
 
-function removeKeys(dictionaryPath, keys) {
-  const dictionary = openDictionary(dictionaryPath);
+function removeKeys(t, dictionaryPath, keys) {
+  const dictionary = openDictionary(t, dictionaryPath);
   const result = planDictionaryRemoval(dictionary, new Set(keys));
   assert.equal(result.ok, true, result.ok ? undefined : JSON.stringify(result.failures));
   applyDictionaryRemoval(result.plan);
   return {
     source: fs.readFileSync(dictionaryPath, 'utf8'),
-    dictionary: openDictionary(dictionaryPath)
+    dictionary: openDictionary(t, dictionaryPath)
   };
 }
 
-function expectRefusal(dictionaryPath, keys, expectedBarrier) {
+function expectRefusal(t, dictionaryPath, keys, expectedBarrier) {
   const original = fs.readFileSync(dictionaryPath, 'utf8');
-  const result = planDictionaryRemoval(openDictionary(dictionaryPath), new Set(keys));
+  const result = planDictionaryRemoval(openDictionary(t, dictionaryPath), new Set(keys));
   assert.equal(result.ok, false);
   assert.ok(result.failures.some((failure) => failure.barriers.includes(expectedBarrier)));
   assert.equal(fs.readFileSync(dictionaryPath, 'utf8'), original);
@@ -76,7 +78,7 @@ test('removes middle, adjacent, and trailing properties with comma-aware ranges'
 `
   );
 
-  const { source, dictionary } = removeKeys(dictionaryPath, [
+  const { source, dictionary } = removeKeys(t, dictionaryPath, [
     'middle',
     'adjacentA',
     'adjacentB',
@@ -103,7 +105,7 @@ export const dictionary = {
 `
   );
 
-  const { dictionary, source } = removeKeys(dictionaryPath, ['nested.remove', 'shorthand']);
+  const { dictionary, source } = removeKeys(t, dictionaryPath, ['nested.remove', 'shorthand']);
 
   assert.deepEqual([...dictionary.keys], ['nested.keep', 'last']);
   assert.match(source, /keep: 'keep'/);
@@ -125,7 +127,7 @@ test('collapses a safe parent when every active descendant is unused', (t) => {
 `
   );
 
-  const { dictionary, source } = removeKeys(dictionaryPath, ['group.first', 'group.second']);
+  const { dictionary, source } = removeKeys(t, dictionaryPath, ['group.first', 'group.second']);
 
   assert.deepEqual([...dictionary.keys], ['survivor']);
   assert.doesNotMatch(source, /group:/);
@@ -144,7 +146,7 @@ test('removes an array-valued property when every element is unused', (t) => {
 `
   );
 
-  const { dictionary, source } = removeKeys(dictionaryPath, [
+  const { dictionary, source } = removeKeys(t, dictionaryPath, [
     'group.examples.0',
     'group.examples.1',
     'group.examples.2'
@@ -164,22 +166,16 @@ test('removes every root property without leaving an invalid trailing comma', (t
 }
 `
   );
-  const dictionary = openDictionary(dictionaryPath);
+  const dictionary = openDictionary(t, dictionaryPath);
   const result = planDictionaryRemoval(dictionary, new Set(dictionary.keys));
   assert.equal(result.ok, true);
   applyDictionaryRemoval(result.plan);
 
   const source = fs.readFileSync(dictionaryPath, 'utf8');
-  const sourceFile = ts.createSourceFile(
-    dictionaryPath,
-    source,
-    ts.ScriptTarget.ES2022,
-    true,
-    ts.ScriptKind.TS
-  );
-  assert.deepEqual(sourceFile.parseDiagnostics, []);
+  const { program } = openProgram(t, [dictionaryPath], { target: ScriptTarget.ES2022 });
+  assert.deepEqual(program.getSyntacticDiagnostics(dictionaryPath), []);
   assert.match(source, /dictionary = \{\s*\}/);
-  assert.deepEqual([...openDictionary(dictionaryPath).keys], []);
+  assert.deepEqual([...openDictionary(t, dictionaryPath).keys], []);
 });
 
 test('refuses array-index and computed-property removals', (t) => {
@@ -188,7 +184,7 @@ test('refuses array-index and computed-property removals', (t) => {
     `export const dictionary = { list: ['first', 'second'] }
 `
   );
-  expectRefusal(arrayPath, ['list.0'], 'array');
+  expectRefusal(t, arrayPath, ['list.0'], 'array');
 
   const computedPath = temporaryDictionary(
     t,
@@ -196,7 +192,7 @@ test('refuses array-index and computed-property removals', (t) => {
 export const dictionary = { [name]: 'value', keep: 'keep' }
 `
   );
-  expectRefusal(computedPath, ['computed'], 'computed-property');
+  expectRefusal(t, computedPath, ['computed'], 'computed-property');
 });
 
 test('refuses imported and shared source property removals', (t) => {
@@ -207,14 +203,14 @@ export const dictionary = { imported }
 `,
     { 'shared.ts': `export const imported = { leaf: 'value' }\n` }
   );
-  expectRefusal(importedPath, ['imported.leaf'], 'imported-declaration');
+  expectRefusal(t, importedPath, ['imported.leaf'], 'imported-declaration');
 
   const reexportedPath = temporaryDictionary(
     t,
     `export { imported as dictionary } from './shared.ts'\n`,
     { 'shared.ts': `export const imported = { leaf: 'value' }\n` }
   );
-  expectRefusal(reexportedPath, ['leaf'], 'imported-declaration');
+  expectRefusal(t, reexportedPath, ['leaf'], 'imported-declaration');
 
   const sharedPath = temporaryDictionary(
     t,
@@ -222,7 +218,7 @@ export const dictionary = { imported }
 export const dictionary = { shared }
 `
   );
-  expectRefusal(sharedPath, ['shared.remove'], 'shared-source-property');
+  expectRefusal(t, sharedPath, ['shared.remove'], 'shared-source-property');
 });
 
 test('refuses an edit that would reveal an overwritten value', (t) => {
@@ -236,7 +232,7 @@ test('refuses an edit that would reveal an overwritten value', (t) => {
 `
   );
 
-  expectRefusal(dictionaryPath, ['duplicate'], 'overwrite');
+  expectRefusal(t, dictionaryPath, ['duplicate'], 'overwrite');
 });
 
 test('refuses removals that could reveal values behind unknown spreads', (t) => {
@@ -246,7 +242,7 @@ test('refuses removals that could reveal values behind unknown spreads', (t) => 
 export const dictionary = { ...shared, removable: 'fallback' }
 `
   );
-  expectRefusal(beforeSpread, ['removable'], 'spread');
+  expectRefusal(t, beforeSpread, ['removable'], 'spread');
 
   const afterSpread = temporaryDictionary(
     t,
@@ -254,7 +250,7 @@ export const dictionary = { ...shared, removable: 'fallback' }
 export const dictionary = { removable: 'fallback', ...shared }
 `
   );
-  expectRefusal(afterSpread, ['removable'], 'spread');
+  expectRefusal(t, afterSpread, ['removable'], 'spread');
 });
 
 test('rejects a stale plan before changing the source file', (t) => {
@@ -262,7 +258,7 @@ test('rejects a stale plan before changing the source file', (t) => {
     t,
     `export const dictionary = { remove: 'remove', keep: 'keep' }\n`
   );
-  const result = planDictionaryRemoval(openDictionary(dictionaryPath), new Set(['remove']));
+  const result = planDictionaryRemoval(openDictionary(t, dictionaryPath), new Set(['remove']));
   assert.equal(result.ok, true);
   const changed = `// changed after planning\n${fs.readFileSync(dictionaryPath, 'utf8')}`;
   fs.writeFileSync(dictionaryPath, changed);
@@ -277,8 +273,8 @@ test('rejects a stale plan before changing the source file', (t) => {
 test('rejects a stale multi-file plan before changing either dictionary', (t) => {
   const first = temporaryDictionary(t, `export const dictionary = { unused: 'first' }\n`);
   const second = temporaryDictionary(t, `export const dictionary = { unused: 'second' }\n`);
-  const firstPlan = planDictionaryRemoval(openDictionary(first), new Set(['unused']));
-  const secondPlan = planDictionaryRemoval(openDictionary(second), new Set(['unused']));
+  const firstPlan = planDictionaryRemoval(openDictionary(t, first), new Set(['unused']));
+  const secondPlan = planDictionaryRemoval(openDictionary(t, second), new Set(['unused']));
   assert.equal(firstPlan.ok, true);
   assert.equal(secondPlan.ok, true);
   const firstBefore = fs.readFileSync(first, 'utf8');

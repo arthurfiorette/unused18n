@@ -5,9 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import ts from '@typescript/typescript6';
+import { DiagnosticCategory } from 'typescript/sync';
 import { analyzeProject } from '../dist/analyzer.js';
 import { DiagnosticCode, lint } from '../dist/index.js';
+import { loadProject } from '../dist/project.js';
+import { diagnosticSource, temporaryProject } from './helpers.mjs';
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const projectFixture = path.join(fixtures, 'project');
@@ -26,15 +28,6 @@ function diagnostics(project = projectFixture) {
   return [...lint(options(project))];
 }
 
-function temporaryProject(t, sourceFiles) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'unused18n-lint-'));
-  t.after(() => fs.rmSync(directory, { force: true, recursive: true }));
-  for (const [fileName, source] of Object.entries(sourceFiles)) {
-    fs.writeFileSync(path.join(directory, fileName), source);
-  }
-  return directory;
-}
-
 test('lint is a lazy diagnostic generator', () => {
   const result = lint(options());
 
@@ -50,7 +43,7 @@ test('build emits JavaScript and declaration source maps', () => {
 test('emits only statically unused dictionary leaves as error diagnostics', () => {
   const unused = diagnostics()
     .filter(({ code }) => code === DiagnosticCode.UnusedKey)
-    .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]);
+    .map(({ text }) => String(text).match(/"(.+)"/)?.[1]);
 
   assert.deepEqual(unused, [
     'configuredObject.stale',
@@ -65,9 +58,7 @@ test('emits only statically unused dictionary leaves as error diagnostics', () =
   assert.ok(
     diagnostics()
       .filter(({ code }) => code === DiagnosticCode.UnusedKey)
-      .every(
-        ({ category, source }) => category === ts.DiagnosticCategory.Error && source === 'unused18n'
-      )
+      .every(({ category, source }) => category === DiagnosticCategory.Error && source === 'U18N')
   );
 });
 
@@ -130,20 +121,11 @@ test('locates unused keys and unresolved runtime calls in their source files', (
   const unresolved = result.find(({ code }) => code === DiagnosticCode.UnresolvedReference);
   const unused = result.find(({ code }) => code === DiagnosticCode.UnusedKey);
 
-  assert.equal(unresolved?.file?.fileName, path.join(unsafeFixture, 'usage.ts'));
-  assert.equal(unresolved?.file?.getLineAndCharacterOfPosition(unresolved.start ?? 0).line + 1, 6);
-  assert.equal(
-    unresolved?.file?.text.slice(
-      unresolved.start,
-      (unresolved.start ?? 0) + (unresolved.length ?? 0)
-    ),
-    't(key)'
-  );
-  assert.equal(unused?.file?.fileName, path.join(unsafeFixture, 'dictionary.ts'));
-  assert.equal(
-    unused?.file?.text.slice(unused.start, (unused.start ?? 0) + (unused.length ?? 0)),
-    'arbitrary'
-  );
+  assert.equal(unresolved?.fileName, path.join(unsafeFixture, 'usage.ts'));
+  assert.equal((unresolved?.startPosition?.line ?? -1) + 1, 6);
+  assert.equal(diagnosticSource(unresolved), 't(key)');
+  assert.equal(unused?.fileName, path.join(unsafeFixture, 'dictionary.ts'));
+  assert.equal(diagnosticSource(unused), 'arbitrary');
 });
 
 test('yields native project diagnostics and stops before dictionary analysis', (t) => {
@@ -176,7 +158,7 @@ dictionary.used
   assert.deepEqual(
     result
       .filter(({ code }) => code === DiagnosticCode.UnusedKey)
-      .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]),
+      .map(({ text }) => String(text).match(/"(.+)"/)?.[1]),
     ['unused']
   );
 
@@ -224,7 +206,7 @@ dictionary.used
   assert.deepEqual(
     result
       .filter(({ code }) => code === DiagnosticCode.UnusedKey)
-      .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]),
+      .map(({ text }) => String(text).match(/"(.+)"/)?.[1]),
     ['unused']
   );
 });
@@ -255,7 +237,7 @@ Object.keys(messages.categories)
   assert.deepEqual(
     result
       .filter(({ code }) => code === DiagnosticCode.UnusedKey)
-      .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]),
+      .map(({ text }) => String(text).match(/"(.+)"/)?.[1]),
     ['common.unused']
   );
 
@@ -284,10 +266,7 @@ test('rejects named exports for JSON dictionaries', (t) => {
 
   assert.equal(result.length, 1);
   assert.equal(result[0]?.code, DiagnosticCode.ConfigurationFailure);
-  assert.match(
-    String(result[0]?.messageText),
-    /JSON dictionaries only expose the "default" export/
-  );
+  assert.match(String(result[0]?.text), /JSON dictionaries only expose the "default" export/);
 });
 
 test('removes unused JSON object properties while preserving valid JSON', (t) => {
@@ -330,7 +309,7 @@ test('malformed JSON stays unchanged and wholly unused JSON array properties are
     ...lint({ project: malformedProject, dictionary: malformedPath, remove: true })
   ];
 
-  assert.ok(malformed.some(({ category }) => category === ts.DiagnosticCategory.Error));
+  assert.ok(malformed.some(({ category }) => category === DiagnosticCategory.Error));
   assert.ok(malformed.every(({ code }) => code !== DiagnosticCode.RemovedKey));
   assert.equal(fs.readFileSync(malformedPath, 'utf8'), malformedBefore);
 
@@ -382,7 +361,7 @@ messages.used
   }
 });
 
-test('lints JSON under Classic module resolution without overriding the resolver', (t) => {
+test('passes through the compiler error for removed Classic module resolution', (t) => {
   const project = temporaryProject(t, {
     'tsconfig.json': JSON.stringify({
       compilerOptions: { ignoreDeprecations: '6.0', moduleResolution: 'Classic' },
@@ -393,8 +372,11 @@ test('lints JSON under Classic module resolution without overriding the resolver
   });
   const result = [...lint({ project, dictionary: path.join(project, 'messages.json') })];
 
+  // TypeScript 7 removed Classic resolution, so the option error stops linting before analysis.
   assert.equal(result.length, 1);
-  assert.equal(result[0]?.code, DiagnosticCode.UnusedKey);
+  assert.equal(result[0]?.code, 5108);
+  assert.equal(result[0]?.category, DiagnosticCategory.Error);
+  assert.equal(result[0]?.source, undefined);
 });
 
 test('accepts empty JSON objects and rejects scalar JSON roots', (t) => {
@@ -418,7 +400,7 @@ test('accepts empty JSON objects and rejects scalar JSON roots', (t) => {
       ...lint({ project: scalarProject, dictionary: path.join(scalarProject, 'messages.json') })
     ];
     assert.equal(result.at(-1)?.code, DiagnosticCode.ConfigurationFailure);
-    assert.match(String(result.at(-1)?.messageText), /must resolve to an object or array/);
+    assert.match(String(result.at(-1)?.text), /must resolve to an object or array/);
   }
 });
 
@@ -451,7 +433,7 @@ test('syntax errors prevent --remove from changing the dictionary', (t) => {
   const before = fs.readFileSync(dictionaryPath, 'utf8');
   const result = [...lint({ ...options(project), remove: true })];
 
-  assert.ok(result.some(({ category }) => category === ts.DiagnosticCategory.Error));
+  assert.ok(result.some(({ category }) => category === DiagnosticCategory.Error));
   assert.equal(fs.readFileSync(dictionaryPath, 'utf8'), before);
 });
 
@@ -502,7 +484,7 @@ test('Oclif exits 1 for unused keys and 2 for invalid flags', () => {
 
   assert.equal(unused.status, 1);
   assert.match(unused.stderr, /Summary: 3 unused/);
-  assert.match(unused.stderr, /TS95002/);
+  assert.match(unused.stderr, /U18N95002/);
   assert.equal(invalid.status, 2);
   assert.match(invalid.stderr, /Missing required option.*dictionary/s);
 });
@@ -590,19 +572,19 @@ test('defaults the project and infers unambiguous dictionary exports', () => {
     { cwd: project, encoding: 'utf8' }
   );
 
-  assert.match(String(defaultResult[0]?.messageText), /defaultUnused/);
-  assert.match(String(soleResult[0]?.messageText), /soleUnused/);
-  assert.match(String(typedSoleResult[0]?.messageText), /typedSoleUnused/);
-  assert.match(String(explicitResult[0]?.messageText), /firstUnused/);
-  assert.match(String(ambiguousResult[0]?.messageText), /multiple exports exist/);
-  assert.match(String(emptyResult[0]?.messageText), /module has no exports/);
+  assert.match(String(defaultResult[0]?.text), /defaultUnused/);
+  assert.match(String(soleResult[0]?.text), /soleUnused/);
+  assert.match(String(typedSoleResult[0]?.text), /typedSoleUnused/);
+  assert.match(String(explicitResult[0]?.text), /firstUnused/);
+  assert.match(String(ambiguousResult[0]?.text), /multiple exports exist/);
+  assert.match(String(emptyResult[0]?.text), /module has no exports/);
   assert.deepEqual(
     factoryResult
       .filter(({ code }) => code === DiagnosticCode.UnusedKey)
-      .map(({ messageText }) => String(messageText)),
+      .map(({ text }) => String(text)),
     ['Translation key "unusedThroughFactory" is unused.']
   );
-  assert.match(String(emptySelectorResult[0]?.messageText), /Export "" not found/);
+  assert.match(String(emptySelectorResult[0]?.text), /Export "" not found/);
   assert.equal(cliResult.status, 1);
   assert.match(cliResult.stderr, /Summary: 1 unused/);
 });
@@ -616,7 +598,7 @@ test('reports a missing default project as a configuration diagnostic', () => {
   );
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /TS95005/);
+  assert.match(result.stderr, /U18N95005/);
   assert.match(result.stderr, /tsconfig\.json/);
 });
 
@@ -625,7 +607,7 @@ test('groups maximal fully-unused object subtrees with complete source ranges', 
   const result = [
     ...lint({ project, dictionary: path.join(project, 'dictionary.ts'), cache: false })
   ].filter(({ code }) => code === DiagnosticCode.UnusedKey);
-  const messages = result.map(({ messageText }) => String(messageText));
+  const messages = result.map(({ text }) => String(text));
 
   assert.deepEqual(messages, [
     'Translation subtree "complete" is unused.',
@@ -638,9 +620,121 @@ test('groups maximal fully-unused object subtrees with complete source ranges', 
     'Translation key "spreadMixed.unused" is unused.'
   ]);
   const complete = result[0];
-  assert.match(
-    complete.file.text.slice(complete.start, complete.start + complete.length),
-    /^complete: \{[\s\S]*second: 'Second'[\s\S]*\}$/
+  assert.match(diagnosticSource(complete), /^complete: \{[\s\S]*second: 'Second'[\s\S]*\}$/);
+  assert.ok(result.every(({ category }) => category === DiagnosticCategory.Error));
+});
+
+/**
+ * Returns the analysis status of every key of `dictionary.ts` in `project`.
+ *
+ * @param {string} project Project directory.
+ */
+function keyStatuses(project) {
+  const { keys } = analyzeProject({ project, dictionary: path.join(project, 'dictionary.ts') });
+  return Object.fromEntries(keys.map(({ key, status }) => [key, status]));
+}
+
+/**
+ * Returns the quoted key of every unused-key diagnostic.
+ *
+ * @param {import('typescript/sync').Diagnostic[]} result
+ */
+function unusedKeys(result) {
+  return result
+    .filter(({ code }) => code === DiagnosticCode.UnusedKey)
+    .map(({ text }) => String(text).match(/"(.+)"/)?.[1]);
+}
+
+test('keys used only inside a referenced project stay unused', () => {
+  const app = path.join(fixtures, 'project-references', 'app');
+
+  assert.deepEqual(keyStatuses(app), { fromApp: 'used', fromLib: 'unused', unused: 'unused' });
+  assert.deepEqual(unusedKeys([...lint({ ...options(app), cache: false })]), ['fromLib', 'unused']);
+
+  // The referenced project contributes its built declarations; its sources would be analyzed
+  // as application code and count `fromLib` as used.
+  const loaded = loadProject(app);
+  try {
+    const fileNames = loaded.fileNames.map((fileName) => fileName.replaceAll('\\', '/'));
+    assert.ok(fileNames.some((fileName) => fileName.endsWith('/lib/out/labels.d.ts')));
+    assert.ok(fileNames.every((fileName) => !fileName.endsWith('/lib/labels.ts')));
+    assert.deepEqual(
+      loaded.sourceFiles.map(({ fileName }) => path.basename(fileName)),
+      ['dictionary.ts', 'usage.ts']
+    );
+  } finally {
+    loaded[Symbol.dispose]();
+  }
+});
+
+test('a .d.<extension>.ts file is a declaration file and its usages do not count', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({
+      compilerOptions: { strict: true, module: 'NodeNext', skipLibCheck: true, noEmit: true },
+      include: ['*.ts']
+    }),
+    'dictionary.ts': `export const dictionary = { a: 'A', b: 'B' };\n`,
+    'x.d.foo.bar.ts': `import { dictionary } from './dictionary.js';
+declare function use(v: unknown): void;
+use(dictionary.a);
+export {};
+`
+  });
+
+  assert.deepEqual(keyStatuses(project), { a: 'unused', b: 'unused' });
+});
+
+test('malformed tsconfig JSON and a missing extends target yield compiler diagnostics', (t) => {
+  const dictionary = `export const dictionary = { unused: 'unused' }\n`;
+  const malformed = temporaryProject(t, {
+    'tsconfig.json': '{ "compilerOptions": { ',
+    'dictionary.ts': dictionary
+  });
+  const missingBase = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ extends: './missing.json', include: ['*.ts'] }),
+    'dictionary.ts': dictionary
+  });
+
+  for (const [project, code] of [
+    [malformed, 1005],
+    [missingBase, 5083]
+  ]) {
+    assert.deepEqual(
+      diagnostics(project).map(({ category, code, source }) => ({ category, code, source })),
+      [{ category: DiagnosticCategory.Error, code, source: undefined }]
+    );
+  }
+});
+
+// Permission bits do not block reads on Windows or for root.
+const permissionsUnenforced = process.platform === 'win32' || process.getuid?.() === 0;
+
+test('an unreadable tsconfig yields a compiler diagnostic', {
+  skip: permissionsUnenforced
+}, (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['*.ts'] }),
+    'dictionary.ts': `export const dictionary = { unused: 'unused' }\n`
+  });
+  fs.chmodSync(path.join(project, 'tsconfig.json'), 0o000);
+
+  assert.deepEqual(
+    diagnostics(project).map(({ category, code, source }) => ({ category, code, source })),
+    [{ category: DiagnosticCategory.Error, code: 5083, source: undefined }]
   );
-  assert.ok(result.every(({ category }) => category === ts.DiagnosticCategory.Error));
+});
+
+test('diagnostic source lines exclude a U+2028 line terminator', (t) => {
+  const project = temporaryProject(t, {
+    'tsconfig.json': JSON.stringify({ include: ['*.ts'] }),
+    'dictionary.ts': `export const dictionary = {\n  used: 'Used',\n  unused: 'Unused',\u2028  other: 'Other'\n}\n`,
+    'usage.ts': `import { dictionary } from './dictionary.js'
+dictionary.used
+dictionary.other
+`
+  });
+  const unused = diagnostics(project).filter(({ code }) => code === DiagnosticCode.UnusedKey);
+
+  assert.equal(unused.length, 1);
+  assert.deepEqual(unused[0]?.sourceLines, [{ line: 2, text: "  unused: 'Unused'," }]);
 });

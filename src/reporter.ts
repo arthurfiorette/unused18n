@@ -1,4 +1,10 @@
-import ts from '@typescript/typescript6';
+import os from 'node:os';
+import {
+  type Diagnostic,
+  type FormatDiagnosticsHost,
+  formatDiagnostics,
+  formatDiagnosticsWithColorAndContext
+} from 'typescript/sync';
 import type { CacheEvent } from './cache.js';
 import { DiagnosticCode } from './diagnostic-codes.js';
 import type { LintEvent } from './lint.js';
@@ -14,8 +20,15 @@ export interface ReporterOptions {
 
 export interface Reporter {
   event(event: LintEvent): void;
-  diagnostic(diagnostic: ts.Diagnostic): void;
+  diagnostic(diagnostic: Diagnostic): void;
 }
+
+/** Paths print relative to the working directory, and lines end with the platform newline. */
+const formatHost: FormatDiagnosticsHost = {
+  getCanonicalFileName: (fileName) => fileName,
+  getCurrentDirectory: () => process.cwd(),
+  getNewLine: () => os.EOL
+};
 
 /** Operational output is sampled synchronously because timers cannot run during compiler traversal. */
 export function createReporter(options: ReporterOptions): Reporter {
@@ -40,6 +53,10 @@ export function createReporter(options: ReporterOptions): Reporter {
   }
 
   return {
+    /**
+     * Summaries always print. Progress is throttled, and stage timings, semantic counts and
+     * cache details print only at debug level, except cache errors.
+     */
     event(event) {
       if (event.type === 'summary') {
         const values = [
@@ -91,10 +108,22 @@ export function createReporter(options: ReporterOptions): Reporter {
         }
         return;
       }
+      if (event.type === 'semantic') {
+        if (options.level === 'debug') {
+          operational(
+            `Semantic requests: single=${event.singleRequests} batch=${event.batchRequests}`
+          );
+        }
+        return;
+      }
       if (options.level === 'debug' || event.event.type === 'error') {
         operational(formatCacheEvent(event.event));
       }
     },
+    /**
+     * Unused and removed keys appear only as summary counts. Every other diagnostic prints in
+     * TypeScript's format, with code frames when color is enabled.
+     */
     diagnostic(diagnostic) {
       if (
         diagnostic.code === DiagnosticCode.UnusedKey ||
@@ -102,15 +131,10 @@ export function createReporter(options: ReporterOptions): Reporter {
       ) {
         return;
       }
-      const host: ts.FormatDiagnosticsHost = {
-        getCanonicalFileName: (fileName) => fileName,
-        getCurrentDirectory: () => process.cwd(),
-        getNewLine: () => ts.sys.newLine
-      };
       options.write(
         (color
-          ? ts.formatDiagnosticsWithColorAndContext([diagnostic], host)
-          : ts.formatDiagnostic(diagnostic, host)
+          ? formatDiagnosticsWithColorAndContext([diagnostic], formatHost)
+          : formatDiagnostics([diagnostic], formatHost)
         ).trimEnd()
       );
     }

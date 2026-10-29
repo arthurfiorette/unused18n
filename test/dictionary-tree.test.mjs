@@ -3,9 +3,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import ts from '@typescript/typescript6';
+import { ScriptTarget } from 'typescript/ast';
+import { ModuleKind, ModuleResolutionKind } from 'typescript/sync';
 import { readDictionary } from '../dist/dictionary.js';
 import { ActiveDictionaryTree } from '../dist/dictionary-tree.js';
+import { openProgram } from './helpers.mjs';
 
 function source(keyPrefix, marker = keyPrefix) {
   return {
@@ -126,18 +128,13 @@ export const dictionary = {
   fs.writeFileSync(dictionaryPath, dictionarySource);
   fs.writeFileSync(importedPath, `export const imported = { leaf: 'imported' }\n`);
 
-  const program = ts.createProgram([dictionaryPath, importedPath], {
-    module: ts.ModuleKind.NodeNext,
-    moduleResolution: ts.ModuleResolutionKind.NodeNext,
-    target: ts.ScriptTarget.ES2022
+  const { program, semantic } = openProgram(t, [dictionaryPath, importedPath], {
+    module: ModuleKind.NodeNext,
+    moduleResolution: ModuleResolutionKind.NodeNext,
+    target: ScriptTarget.ES2022
   });
   assert.deepEqual(program.getSyntacticDiagnostics(), []);
-  const dictionary = readDictionary(
-    program,
-    program.getTypeChecker(),
-    dictionaryPath,
-    'dictionary'
-  );
+  const dictionary = readDictionary(semantic, dictionaryPath, 'dictionary');
 
   assert.deepEqual(
     [...dictionary.keys],

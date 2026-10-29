@@ -10,6 +10,8 @@ Find unused keys in TypeScript and JSON [i18next](https://www.i18next.com/) dict
 npm install --save-dev unused18n
 ```
 
+`unused18n` installs `typescript@beta` (TypeScript 7.1) as a dependency. TypeScript 7.1 runs the compiler as a native Go child process, and npm installs the binary for your platform through TypeScript's optional dependencies, so installs with `--omit=optional` cannot run `unused18n`. Supported platforms are the ones TypeScript publishes binaries for.
+
 ## Quick start
 
 Given a JSON dictionary:
@@ -41,8 +43,10 @@ npx unused18n lint \
 `unused18n` reports the unused key at its declaration:
 
 ```text
-src/i18n/en.json:4:5 - error TS95001: Translation key "common.cancel" is unused.
+src/i18n/en.json:4:5 - error U18N95001: Translation key "common.cancel" is unused.
 ```
+
+`unused18n` diagnostics print with the `U18N` prefix. Compiler diagnostics from your project, such as syntax errors, keep the `TS` prefix.
 
 ### Dictionary formats
 
@@ -54,7 +58,7 @@ src/i18n/en.json:4:5 - error TS95001: Translation key "common.cancel" is unused.
 
 TypeScript exports must resolve statically to an object or array. Application files must be included in the selected TypeScript project. JSON dictionaries work without enabling `resolveJsonModule` in your `tsconfig.json`.
 
-When an entire object subtree is unused, one `TS95001` diagnostic covers the complete property instead of reporting every leaf.
+When an entire object subtree is unused, one `U18N95001` diagnostic covers the complete property instead of reporting every leaf.
 
 ### Multiple locales
 
@@ -137,7 +141,7 @@ Array and readonly-tuple iteration through standard receiver methods such as `ma
 
 Dictionary paths use `.` separators. i18next namespaces and custom `keySeparator` behavior are not interpreted. Unbounded runtime keys produce source-located warnings; they do not mark unrelated dictionary keys as used, and warnings alone do not fail the command.
 
-Calls with `returnObjects: true` should use the dictionary type inferred by i18next. Wrapping the returned object in `as SomeType` or a type assertion emits `TS95006`; casts remain transparent to usage analysis but can hide dictionary drift from the application type checker. Run `--remove` to delete these assertions automatically.
+Calls with `returnObjects: true` should use the dictionary type inferred by i18next. Wrapping the returned object in `as SomeType` or a type assertion emits `U18N95006`; casts remain transparent to usage analysis but can hide dictionary drift from the application type checker. Run `--remove` to delete these assertions automatically.
 
 ## Remove unused keys
 
@@ -148,7 +152,7 @@ npx unused18n lint \
   --remove
 ```
 
-Removal preserves unrelated formatting and comments. It is all-or-nothing across dictionary keys and `TS95006` cast fixes: if any edit cannot be applied safely, every source remains unchanged. A wholly unused array-valued object property is removed as one unit; individual array elements, computed properties, shared or imported objects, unresolved spreads, and ambiguous overwrites must be removed manually.
+Removal preserves unrelated formatting and comments. It is all-or-nothing across dictionary keys and `U18N95006` cast fixes: if any edit cannot be applied safely, every source remains unchanged. A wholly unused array-valued object property is removed as one unit; individual array elements, computed properties, shared or imported objects, unresolved spreads, and ambiguous overwrites must be removed manually.
 
 Before using `--remove`, ensure every dictionary is tracked by Git or another version-control system and that you can restore its previous revision. Successful removal does not retain a long-lived backup after the atomic replacement completes.
 
@@ -183,12 +187,12 @@ Use `--config=<path>` to load a different JSON file. Without it, `unused18n` loo
 | `-e, --export <name>`     | TypeScript export name; omission prefers `default`, then one value export |
 | `--[no-]remove`           | Enable or override config-file removal                        |
 | `--max-expansions <n>`    | Maximum number of finite key combinations; defaults to `1000` |
-| `--no-cache`              | Disable persistent caching                                    |
+| `--no-cache`              | Disable the persistent analysis cache                         |
 | `--cache-dir <path>`      | Override the cache directory                                  |
 | `--[no-]cache-stats`      | Enable or override config-file cache statistics               |
 | `--log-level <level>`     | Operational output: `silent`, `info`, or `debug`              |
 
-Caching is enabled by default under `<tsconfig-directory>/node_modules/.cache/unused18n`. The directory can be safely deleted. Cache failures fall back to a normal analysis without changing diagnostics or exit status.
+Caching is enabled by default under `<tsconfig-directory>/node_modules/.cache/unused18n`. The cache stores per-file analysis results, so unchanged files are not analyzed again; the TypeScript program is still built on every run. The directory can be safely deleted. Cache failures fall back to a normal analysis without changing diagnostics or exit status.
 
 Run `npx unused18n help` for command help or `npx unused18n autocomplete` to configure shell completion.
 
@@ -202,20 +206,24 @@ Run `npx unused18n help` for command help or `npx unused18n autocomplete` to con
 
 ## Programmatic API
 
-`lint()` returns a lazy generator of standard TypeScript diagnostics:
+`lint()` returns a lazy generator of TypeScript 7.1 diagnostics:
 
 ```ts
-import { DiagnosticCode, lint } from 'unused18n';
+import { type Diagnostic, DiagnosticCode, lint } from 'unused18n';
 
 for (const diagnostic of lint({
   project: './tsconfig.json',
   dictionaries: './src/i18n/*.json'
 })) {
   if (diagnostic.code === DiagnosticCode.UnusedKey) {
-    console.log(diagnostic.file?.fileName, diagnostic.messageText);
+    console.log(diagnostic.fileName, diagnostic.text);
   }
 }
 ```
+
+Every `Diagnostic` has `code`, `category`, `text`, and `pos`/`end` offsets, plus an optional `source` prefix and nested `messageChain`. Diagnostics attached to a file also carry `fileName`, zero-based `startPosition` and `endPosition` line/character pairs, and the `sourceLines` used to render a code frame. `unused18n` diagnostics set `source` to `'U18N'`. Diagnostics are plain data and stay valid after iteration ends.
+
+`lint()` starts the compiler process on the first `next()` call and closes it before yielding the first diagnostic, or when loading or analysis throws. Stopping iteration early, with or without `return()`, leaves no compiler process running.
 
 ### `LintOptions`
 
@@ -233,7 +241,15 @@ for (const diagnostic of lint({
 | `onEvent`          | `(event: LintEvent) => void`  | No callback                                          |
 | `now`              | `() => number`                | `performance.now`                                    |
 
-The package exports `lint`, `DiagnosticCode`, and the `LintOptions`, `Unused18nConfig`, `LintEvent`, `LogLevel`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary. `LintEvent` includes final key statistics plus start/end timestamps for the `project`, `dictionary`, `discovery`, `usage`, `replay`, and `removal` stages; the CLI prints stage durations only at debug level.
+The package exports `lint`, `DiagnosticCode`, and the `Diagnostic`, `LintOptions`, `Unused18nConfig`, `LintEvent`, `LogLevel`, and `CacheEvent` types. Iteration performs project loading and analysis; with `remove: true`, it may also update the dictionary. `LintEvent` includes final key statistics plus start/end timestamps for the `project`, `dictionary`, `discovery`, `usage`, `replay`, and `removal` stages. After analysis, a `semantic` event reports how many semantic lookups missed the cache and were resolved one at a time (`singleRequests`) and how many batched lookups ran (`batchRequests`). They approximate compiler requests: some counted lookups are answered without one, and queries on type and symbol objects are not counted. The CLI prints stage durations and semantic request counts only at debug level (`--log-level debug` or `--cache-stats`).
+
+## Migrating from 0.2
+
+- TypeScript 7.1 replaces TypeScript 6, which is no longer supported. `typescript@beta` is a runtime dependency, and its native compiler binary comes from TypeScript's per-platform optional dependencies. Your `tsconfig.json` must be valid for TypeScript 7: options that 7.x removed, such as `moduleResolution: "classic"`, are reported as compiler errors. The Node.js requirement is unchanged.
+- `lint()` yields TypeScript 7.1 `Diagnostic` objects. Replace `file.fileName` with `fileName`, `start` and `length` with `pos` and `end`, and `messageText` with `text` plus `messageChain`. Import the type with `import type { Diagnostic } from 'unused18n'`.
+- The CLI prints `unused18n` diagnostics with the `U18N` prefix, as in `error U18N95001: ...`, instead of `TS95001`. Numeric codes and `DiagnosticCode` values are unchanged, so update only scripts that match the printed text.
+- The persistent compiler cache is removed. The cache directory now holds only per-file analysis results. Entries written by 0.2 are ignored and rebuilt on the next run, and leftover `compiler-*.tsbuildinfo` files can be deleted.
+- `LintEvent` has a new `semantic` variant. Exhaustive `switch` statements over `event.type` need a case for it.
 
 ## Performance benchmarks
 

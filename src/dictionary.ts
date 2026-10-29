@@ -1,6 +1,39 @@
 import path from 'node:path';
-import ts from '@typescript/typescript6';
+import {
+  type Expression,
+  InternalSymbolName,
+  isArrayLiteralExpression,
+  isAsExpression,
+  isComputedPropertyName,
+  isExportAssignment,
+  isExpression,
+  isExpressionStatement,
+  isGetAccessorDeclaration,
+  isIdentifier,
+  isMethodDeclaration,
+  isNonNullExpression,
+  isNumericLiteral,
+  isObjectLiteralExpression,
+  isParenthesizedExpression,
+  isPrivateIdentifier,
+  isPropertyAssignment,
+  isSatisfiesExpression,
+  isSetAccessorDeclaration,
+  isShorthandPropertyAssignment,
+  isSpreadAssignment,
+  isStringLiteralLikeNode,
+  isTypeAssertion,
+  isVariableDeclaration,
+  type Node,
+  type ObjectLiteralElementLike,
+  type PropertyName,
+  type ShorthandPropertyAssignment,
+  type SourceFile,
+  type VariableDeclaration
+} from 'typescript/ast';
+import type { Symbol as TsSymbol, Type } from 'typescript/sync';
 import { ActiveDictionaryTree } from './dictionary-tree.js';
+import type { Semantic } from './semantic.js';
 
 /** A condition that prevents a source property from being removed without ambiguity. */
 export type DictionaryRemovalBarrier =
@@ -14,7 +47,7 @@ export type DictionaryRemovalBarrier =
 /** One property on the winning source path, ordered from the dictionary root to the leaf. */
 export interface DictionarySourceProperty {
   /** The original AST node; removal never synthesizes or prints a replacement node. */
-  readonly node: ts.ObjectLiteralElementLike;
+  readonly node: ObjectLiteralElementLike;
   /** The flattened prefix covered by removing this property. */
   readonly keyPrefix: string;
   /** Conditions that make this specific property boundary unsafe to remove. */
@@ -24,7 +57,7 @@ export interface DictionarySourceProperty {
 /** Source provenance for the value currently visible at a flattened dictionary key. */
 export interface DictionaryKeySource {
   /** The active leaf expression after object overwrite semantics have been applied. */
-  readonly valueNode: ts.Expression;
+  readonly valueNode: Expression;
   /** Candidate removal boundaries from the dictionary root to the active leaf. */
   readonly propertyChain: readonly DictionarySourceProperty[];
 }
@@ -32,35 +65,37 @@ export interface DictionaryKeySource {
 /** The flattened dictionary and source provenance needed for read-only removal planning. */
 export interface DictionaryInfo {
   readonly exportName: string;
-  readonly sourceFile: ts.SourceFile;
-  readonly declaration: ts.Node;
-  readonly symbol: ts.Symbol;
-  readonly type: ts.Type;
+  readonly sourceFile: SourceFile;
+  readonly declaration: Node;
+  readonly symbol: TsSymbol;
   /** Exported value type, preserving explicit shared dictionary aliases across locale files. */
-  readonly declaredType: ts.Type;
+  readonly declaredType: Type;
   /** Active flattened keys after spreads and later properties have overwritten earlier values. */
   readonly keys: ReadonlySet<string>;
   /** Active key provenance with the same overwrite semantics as {@link keys}. */
   readonly keySources: ReadonlyMap<string, DictionaryKeySource>;
 }
 
-/** Resolves and flattens one exported dictionary while retaining active source provenance. */
+/**
+ * Resolves and flattens one exported dictionary while retaining active source provenance.
+ *
+ * @param semantic Checker facade of the program that contains the dictionary file.
+ * @param dictionaryPath Dictionary module or JSON file, resolved against the working directory.
+ * @param exportName Export to read; inferred from `default` or a sole value export when omitted.
+ */
 export function readDictionary(
-  program: ts.Program,
-  checker: ts.TypeChecker,
+  semantic: Semantic,
   dictionaryPath: string,
   exportName?: string
 ): DictionaryInfo {
   const absolutePath = path.resolve(dictionaryPath);
-  const sourceFile = program
-    .getSourceFiles()
-    .find((source) => path.resolve(source.fileName) === absolutePath);
+  const sourceFile = semantic.sourceFile(absolutePath);
   if (!sourceFile)
     throw new Error(`Dictionary is not part of the TypeScript program: ${absolutePath}`);
 
-  let declaration: ts.Node;
-  let initializer: ts.Expression;
-  let symbol: ts.Symbol;
+  let declaration: Node;
+  let initializer: Expression;
+  let symbol: TsSymbol;
   if (path.extname(absolutePath).toLowerCase() === '.json') {
     try {
       JSON.parse(sourceFile.text);
@@ -74,10 +109,12 @@ export function readDictionary(
         `JSON dictionaries only expose the "default" export; received "${exportName}"`
       );
     }
-    const statement = sourceFile.statements.find(ts.isExpressionStatement);
-    // TypeScript binds JSON's synthetic `export=` here but omits the field from its public type.
-    const sourceSymbol = (sourceFile as ts.SourceFile & { readonly symbol?: ts.Symbol }).symbol;
-    const jsonSymbol = sourceSymbol?.exports?.get(ts.InternalSymbolName.ExportEquals);
+    const statement = sourceFile.statements.find(isExpressionStatement);
+    // A JSON file binds one synthetic `export=` symbol, reachable only through the file symbol.
+    const jsonSymbol = semantic
+      .symbolOfNode(sourceFile)
+      ?.getExports()
+      .get(InternalSymbolName.ExportEquals);
     if (!statement || !jsonSymbol) {
       throw new Error(`JSON dictionary could not be resolved: ${absolutePath}`);
     }
@@ -86,10 +123,11 @@ export function readDictionary(
     symbol = jsonSymbol;
     exportName = 'default';
   } else {
-    const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
-    const exports = moduleSymbol ? checker.getExportsOfModule(moduleSymbol) : [];
+    const moduleSymbol = semantic.rawSymbol(sourceFile);
+    const exports = moduleSymbol ? semantic.exportsOfModule(moduleSymbol) : [];
+    // Only the handle's presence matters here, so it is never resolved.
     const valueExports = exports.filter(
-      (candidate) => unwrapAlias(checker, candidate)?.valueDeclaration
+      (candidate) => semantic.aliased(candidate)?.valueDeclaration
     );
     let exported =
       exportName !== undefined
@@ -109,13 +147,15 @@ export function readDictionary(
     }
     exportName = exported.name;
 
-    const resolvedSymbol = unwrapAlias(checker, exported);
-    if (!resolvedSymbol) throw new Error(`Export "${exportName}" could not be resolved`);
-    const variableDeclaration = resolvedSymbol.declarations?.find(ts.isVariableDeclaration);
-    const exportAssignment = resolvedSymbol.declarations?.find(ts.isExportAssignment);
+    const resolvedSymbol = semantic.aliased(exported);
+    const resolvedDeclarations = semantic.declarations(resolvedSymbol);
+    const variableDeclaration = resolvedDeclarations.find(isVariableDeclaration);
+    const exportAssignment = resolvedDeclarations.find(isExportAssignment);
     const resolvedDeclaration = variableDeclaration ?? exportAssignment;
     const resolvedInitializer = variableDeclaration?.initializer ?? exportAssignment?.expression;
-    if (!resolvedDeclaration || !resolvedInitializer) {
+    // An unresolvable alias makes `aliased` return `undefined`, which reports the same error as
+    // an export without an initialized declaration.
+    if (!resolvedSymbol || !resolvedDeclaration || !resolvedInitializer) {
       throw new Error(
         `Export "${exportName}" must resolve to an initialized dictionary expression`
       );
@@ -126,26 +166,24 @@ export function readDictionary(
   }
 
   const activeDictionary = new ActiveDictionaryTree();
-  flattenExpression(initializer, [], [], activeDictionary, checker, sourceFile, new Set(), false);
+  flattenExpression(initializer, [], [], activeDictionary, semantic, sourceFile, new Set(), false);
   const keySources = activeDictionary.toKeySources();
-  if (keySources.size === 0 && !isDictionaryContainer(initializer, checker, new Set())) {
+  if (keySources.size === 0 && !isDictionaryContainer(initializer, semantic, new Set())) {
     throw new Error(`Dictionary export "${exportName}" must resolve to an object or array`);
   }
-  let dictionaryType: ts.Type | undefined;
-  let declaredType: ts.Type | undefined;
+  let declaredType: Type | undefined;
 
   return {
     exportName,
     sourceFile,
     declaration,
     symbol,
-    get type() {
-      // Most translation-call analyses never inspect dictionary object identity.
-      if (!dictionaryType) dictionaryType = checker.getTypeAtLocation(initializer);
-      return dictionaryType;
-    },
+    /**
+     * Lazy because most analyses never compare dictionary types and each query is an IPC call.
+     * Only analysis reads it, while the compiler process is still open.
+     */
     get declaredType() {
-      if (!declaredType) declaredType = checker.getTypeOfSymbolAtLocation(symbol, declaration);
+      if (!declaredType) declaredType = semantic.typeOfSymbolAtLocation(symbol, declaration);
       return declaredType;
     },
     keys: new Set(keySources.keys()),
@@ -153,43 +191,43 @@ export function readDictionary(
   };
 }
 
-function isDictionaryContainer(
-  input: ts.Expression,
-  checker: ts.TypeChecker,
-  seen: Set<ts.Node>
-): boolean {
+/** Returns whether an expression is, or names a variable initialized with, an object or array. */
+function isDictionaryContainer(input: Expression, semantic: Semantic, seen: Set<Node>): boolean {
   const expression = unwrapExpression(input);
   if (seen.has(expression)) return false;
   seen.add(expression);
   try {
-    if (ts.isObjectLiteralExpression(expression) || ts.isArrayLiteralExpression(expression))
-      return true;
-    if (!ts.isIdentifier(expression)) return false;
-    const declaration = declarationForExpression(expression, checker);
+    if (isObjectLiteralExpression(expression) || isArrayLiteralExpression(expression)) return true;
+    if (!isIdentifier(expression)) return false;
+    const declaration = declarationForExpression(expression, semantic);
     return declaration?.initializer
-      ? isDictionaryContainer(declaration.initializer, checker, seen)
+      ? isDictionaryContainer(declaration.initializer, semantic, seen)
       : false;
   } finally {
     seen.delete(expression);
   }
 }
 
+/**
+ * Records every leaf under `prefix` into `activeDictionary`, applying spread and overwrite order
+ * and tagging each property on the path with the barriers that make its removal unsafe.
+ */
 function flattenExpression(
-  input: ts.Expression,
+  input: Expression,
   prefix: string[],
   propertyChain: DictionarySourceProperty[],
   activeDictionary: ActiveDictionaryTree,
-  checker: ts.TypeChecker,
-  dictionarySourceFile: ts.SourceFile,
-  seen: Set<ts.Node>,
+  semantic: Semantic,
+  dictionarySourceFile: SourceFile,
+  seen: Set<Node>,
   sharedSource: boolean
 ): void {
   const expression = unwrapExpression(input);
   if (seen.has(expression)) return;
   seen.add(expression);
   try {
-    if (ts.isIdentifier(expression)) {
-      const declaration = declarationForExpression(expression, checker);
+    if (isIdentifier(expression)) {
+      const declaration = declarationForExpression(expression, semantic);
       if (declaration?.initializer) {
         const imported = declaration.getSourceFile() !== dictionarySourceFile;
         flattenExpression(
@@ -197,7 +235,7 @@ function flattenExpression(
           prefix,
           imported ? addBarrier(propertyChain, 'imported-declaration') : propertyChain,
           activeDictionary,
-          checker,
+          semantic,
           dictionarySourceFile,
           seen,
           sharedSource || propertyChain.length > 0
@@ -206,12 +244,12 @@ function flattenExpression(
       }
     }
 
-    if (ts.isObjectLiteralExpression(expression)) {
+    if (isObjectLiteralExpression(expression)) {
       const encounteredNames = new Set<string>();
       let unresolvedSpreadBefore = false;
       for (const property of expression.properties) {
-        if (ts.isSpreadAssignment(property)) {
-          const spreadNames = objectPropertyNames(property.expression, checker, new Set());
+        if (isSpreadAssignment(property)) {
+          const spreadNames = objectPropertyNames(property.expression, semantic, new Set());
           if (spreadNames) {
             for (const name of spreadNames) encounteredNames.add(name);
           } else {
@@ -223,7 +261,7 @@ function flattenExpression(
             prefix,
             addBarrier(propertyChain, 'spread'),
             activeDictionary,
-            checker,
+            semantic,
             dictionarySourceFile,
             seen,
             true
@@ -231,8 +269,8 @@ function flattenExpression(
           continue;
         }
 
-        if (ts.isPropertyAssignment(property)) {
-          const name = propertyName(property.name, checker);
+        if (isPropertyAssignment(property)) {
+          const name = propertyName(property.name, semantic);
           if (name === undefined) continue;
           prefix.push(name);
           try {
@@ -244,7 +282,7 @@ function flattenExpression(
               keyPrefix: prefix.join('.'),
               barriers: sourceBarriers(property, dictionarySourceFile, sharedSource)
             };
-            const computed = ts.isComputedPropertyName(property.name);
+            const computed = isComputedPropertyName(property.name);
             if (computed) sourceProperty = withBarrier(sourceProperty, 'computed-property');
             if (overwritten) sourceProperty = withBarrier(sourceProperty, 'overwrite');
             if (unresolvedSpreadBefore) sourceProperty = withBarrier(sourceProperty, 'spread');
@@ -254,7 +292,7 @@ function flattenExpression(
               prefix,
               computed ? addBarrier(nextPropertyChain, 'computed-property') : nextPropertyChain,
               activeDictionary,
-              checker,
+              semantic,
               dictionarySourceFile,
               seen,
               sharedSource
@@ -265,7 +303,9 @@ function flattenExpression(
           continue;
         }
 
-        if (ts.isShorthandPropertyAssignment(property)) {
+        if (isShorthandPropertyAssignment(property)) {
+          // The parser only builds identifier names here, but the AST type admits any PropertyName.
+          if (!isIdentifier(property.name)) continue;
           const name = property.name.text;
           prefix.push(name);
           try {
@@ -279,7 +319,7 @@ function flattenExpression(
             };
             if (overwritten) sourceProperty = withBarrier(sourceProperty, 'overwrite');
             if (unresolvedSpreadBefore) sourceProperty = withBarrier(sourceProperty, 'spread');
-            const declaration = declarationForShorthand(property, checker);
+            const declaration = declarationForShorthand(property, semantic);
             if (declaration?.initializer) {
               const imported = declaration.getSourceFile() !== dictionarySourceFile;
               const nextPropertyChain = [...propertyChain, sourceProperty];
@@ -290,7 +330,7 @@ function flattenExpression(
                   ? addBarrier(nextPropertyChain, 'imported-declaration')
                   : nextPropertyChain,
                 activeDictionary,
-                checker,
+                semantic,
                 dictionarySourceFile,
                 seen,
                 true
@@ -301,7 +341,7 @@ function flattenExpression(
                 prefix,
                 [...propertyChain, sourceProperty],
                 activeDictionary,
-                checker,
+                semantic,
                 dictionarySourceFile,
                 seen,
                 sharedSource
@@ -315,11 +355,11 @@ function flattenExpression(
       return;
     }
 
-    if (ts.isArrayLiteralExpression(expression)) {
+    if (isArrayLiteralExpression(expression)) {
       const blockedChain = addBarrier(propertyChain, 'array');
       for (let index = 0; index < expression.elements.length; index += 1) {
         const element = expression.elements[index];
-        if (!element || !ts.isExpression(element)) continue;
+        if (!element || !isExpression(element)) continue;
         prefix.push(String(index));
         try {
           flattenExpression(
@@ -327,7 +367,7 @@ function flattenExpression(
             prefix,
             blockedChain,
             activeDictionary,
-            checker,
+            semantic,
             dictionarySourceFile,
             seen,
             sharedSource
@@ -351,38 +391,39 @@ function flattenExpression(
   }
 }
 
+/** Returns the statically known member names of an object, or `undefined` when any is unknown. */
 function objectPropertyNames(
-  input: ts.Expression,
-  checker: ts.TypeChecker,
-  seen: Set<ts.Node>
+  input: Expression,
+  semantic: Semantic,
+  seen: Set<Node>
 ): Set<string> | undefined {
   const expression = unwrapExpression(input);
   if (seen.has(expression)) return undefined;
   seen.add(expression);
-  if (ts.isIdentifier(expression)) {
-    const declaration = declarationForExpression(expression, checker);
+  if (isIdentifier(expression)) {
+    const declaration = declarationForExpression(expression, semantic);
     return declaration?.initializer
-      ? objectPropertyNames(declaration.initializer, checker, seen)
+      ? objectPropertyNames(declaration.initializer, semantic, seen)
       : undefined;
   }
-  if (!ts.isObjectLiteralExpression(expression)) return undefined;
+  if (!isObjectLiteralExpression(expression)) return undefined;
 
   const names = new Set<string>();
   for (const property of expression.properties) {
-    if (ts.isSpreadAssignment(property)) {
-      const spreadNames = objectPropertyNames(property.expression, checker, new Set(seen));
+    if (isSpreadAssignment(property)) {
+      const spreadNames = objectPropertyNames(property.expression, semantic, new Set(seen));
       if (!spreadNames) return undefined;
       for (const name of spreadNames) names.add(name);
       continue;
     }
     if (
-      ts.isPropertyAssignment(property) ||
-      ts.isShorthandPropertyAssignment(property) ||
-      ts.isMethodDeclaration(property) ||
-      ts.isGetAccessorDeclaration(property) ||
-      ts.isSetAccessorDeclaration(property)
+      isPropertyAssignment(property) ||
+      isShorthandPropertyAssignment(property) ||
+      isMethodDeclaration(property) ||
+      isGetAccessorDeclaration(property) ||
+      isSetAccessorDeclaration(property)
     ) {
-      const name = propertyName(property.name, checker);
+      const name = propertyName(property.name, semantic);
       if (name === undefined) return undefined;
       names.add(name);
     }
@@ -406,9 +447,13 @@ function withBarrier(
     : { ...property, barriers: [...property.barriers, barrier] };
 }
 
+/**
+ * Barriers that follow from where a property is declared: inside an object other code shares,
+ * or in a file other than the dictionary.
+ */
 function sourceBarriers(
-  property: ts.ObjectLiteralElementLike,
-  dictionarySourceFile: ts.SourceFile,
+  property: ObjectLiteralElementLike,
+  dictionarySourceFile: SourceFile,
   sharedSource: boolean
 ): DictionaryRemovalBarrier[] {
   const barriers: DictionaryRemovalBarrier[] = [];
@@ -417,50 +462,44 @@ function sourceBarriers(
   return barriers;
 }
 
-function propertyName(name: ts.PropertyName, checker: ts.TypeChecker): string | undefined {
-  if (ts.isIdentifier(name) || ts.isPrivateIdentifier(name)) return name.text;
-  if (ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) return name.text;
-  if (ts.isComputedPropertyName(name)) {
-    const type = checker.getTypeAtLocation(name.expression);
-    if (type.isStringLiteral() || type.isNumberLiteral()) return String(type.value);
+/** Returns the static name of an object member, reading computed names from literal types. */
+function propertyName(name: PropertyName, semantic: Semantic): string | undefined {
+  if (isIdentifier(name) || isPrivateIdentifier(name)) return name.text;
+  if (isStringLiteralLikeNode(name) || isNumericLiteral(name)) return name.text;
+  if (isComputedPropertyName(name)) {
+    const type = semantic.typeAt(name.expression);
+    if (type.isStringLiteralType() || type.isNumberLiteralType()) return String(type.value);
   }
   return undefined;
 }
 
+/** Returns the variable declaration an identifier refers to, following import aliases. */
 function declarationForExpression(
-  expression: ts.Expression,
-  checker: ts.TypeChecker
-): ts.VariableDeclaration | undefined {
-  const symbol = checker.getSymbolAtLocation(expression);
-  return unwrapAlias(checker, symbol)?.declarations?.find(ts.isVariableDeclaration);
+  expression: Expression,
+  semantic: Semantic
+): VariableDeclaration | undefined {
+  const symbol = semantic.aliased(semantic.rawSymbol(expression));
+  return semantic.declarations(symbol).find(isVariableDeclaration);
 }
 
+/** Returns the variable declaration a shorthand property reads, following import aliases. */
 function declarationForShorthand(
-  property: ts.ShorthandPropertyAssignment,
-  checker: ts.TypeChecker
-): ts.VariableDeclaration | undefined {
-  const symbol = checker.getShorthandAssignmentValueSymbol(property);
-  return unwrapAlias(checker, symbol)?.declarations?.find(ts.isVariableDeclaration);
-}
-
-/** Resolves a TypeScript alias symbol when one exists. */
-export function unwrapAlias(
-  checker: ts.TypeChecker,
-  symbol: ts.Symbol | undefined
-): ts.Symbol | undefined {
-  if (!symbol) return undefined;
-  return symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+  property: ShorthandPropertyAssignment,
+  semantic: Semantic
+): VariableDeclaration | undefined {
+  const symbol = semantic.aliased(semantic.shorthandValueSymbol(property));
+  return semantic.declarations(symbol).find(isVariableDeclaration);
 }
 
 /** Removes transparent TypeScript expression wrappers without changing the underlying AST. */
-export function unwrapExpression(expression: ts.Expression): ts.Expression {
+export function unwrapExpression(expression: Expression): Expression {
   let current = expression;
   while (
-    ts.isParenthesizedExpression(current) ||
-    ts.isAsExpression(current) ||
-    ts.isTypeAssertionExpression(current) ||
-    ts.isNonNullExpression(current) ||
-    ts.isSatisfiesExpression(current)
+    isParenthesizedExpression(current) ||
+    isAsExpression(current) ||
+    isTypeAssertion(current) ||
+    isNonNullExpression(current) ||
+    isSatisfiesExpression(current)
   ) {
     current = current.expression;
   }

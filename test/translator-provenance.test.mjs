@@ -14,7 +14,7 @@ test('recognizes proven first-party translators without accepting name-only look
   ];
   const unused = diagnostics
     .filter(({ code }) => code === DiagnosticCode.UnusedKey)
-    .map(({ messageText }) => String(messageText).match(/"(.+)"/)?.[1]);
+    .map(({ text }) => text.match(/"(.+)"/)?.[1]);
 
   assert.deepEqual(unused, [
     'dynamic',
@@ -31,9 +31,8 @@ test('recognizes proven first-party translators without accepting name-only look
   assert.ok(diagnostics.some(({ code }) => code === DiagnosticCode.UnresolvedReference));
   assert.equal(
     diagnostics.some(
-      ({ code, file }) =>
-        code === DiagnosticCode.UnresolvedReference &&
-        file?.fileName.endsWith('instance-methods.ts')
+      ({ code, fileName }) =>
+        code === DiagnosticCode.UnresolvedReference && fileName?.endsWith('instance-methods.ts')
     ),
     false
   );
@@ -44,10 +43,10 @@ test('replays callback interpolation options without losing literal keys', (t) =
   t.after(() => fs.rmSync(cacheDir, { force: true, recursive: true }));
   const options = { project, dictionary: path.join(project, 'dictionary.ts') };
   const portable = (diagnostics) =>
-    diagnostics.map(({ category, code, messageText }) => ({
+    diagnostics.map(({ category, code, text }) => ({
       category,
       code,
-      message: String(messageText)
+      message: text
     }));
 
   const uncached = portable([...lint({ ...options, cache: false })]);
