@@ -1,6 +1,6 @@
 # Performance benchmarks
 
-Use the benchmark suite to compare direct `lint()` calls on the same machine and otherwise-idle system. CLI parsing, diagnostic rendering, and subprocess startup are intentionally excluded.
+Use the benchmark suite to compare direct `lint()` calls on the same machine and otherwise-idle system. CLI parsing, diagnostic rendering, and CLI subprocess startup are intentionally excluded. Each `lint()` call starts and closes its own native TypeScript compiler process, so that cost is included.
 
 ## Generate a deterministic project
 
@@ -34,7 +34,7 @@ pnpm bench:synthetic -- \
 ```
 
 Mitata runs with manual GC exposed, handles warm-up and sampling, and reports estimated heap usage. Remove-mode setup restores the original dictionary outside the measured function before every iteration.
-Pass `--cache` to make mitata's calibration call populate the normal persistent cache before measured direct `lint()` calls.
+Pass `--cache` to make mitata's calibration call populate the persistent per-file analysis cache before measured direct `lint()` calls.
 Use `--cache-dir <path>` to isolate benchmark cache state from the target project's normal cache.
 For minute-scale real projects, pass `--samples 1`; this uses mitata's low-level `measure()` API to avoid the default twelve-sample calibration loop while still calling `lint()` directly.
 
@@ -51,7 +51,7 @@ pnpm bench:analyzer -- \
   --export default
 ```
 
-The inventory case parses its source outside the measured traversal result, while the analyzer case includes project loading and all lint stages.
+The inventory case parses its source outside the measured traversal result, while the analyzer case includes project loading and all lint stages. The analyzer case also prints the semantic layer's compiler request counts (`singleRequests` and `batchRequests`) next to wall time.
 
 ## Active dictionary benchmark
 
@@ -85,8 +85,15 @@ Record unprofiled mitata results here with the machine, Node version, scenario, 
 | Apple M4 Pro | 24.16.0 | Direct `lint()` warm cached remove | 10,000 | 297.40 ms | 297.40 ms | 297.40 ms |
 | Apple M4 Pro | 24.16.0 | Direct `lint()` warm cached remove | 20,000 | 424.39 ms | 424.39 ms | 424.39 ms |
 | Apple M4 Pro | 24.16.0 | Direct `lint()` warm cached remove | 40,000 | 724.04 ms | 724.04 ms | 724.04 ms |
-
-The minute-scale rows use one measured mitata sample after its calibration call. Synthetic removal grows `1.43x` from `10K → 20K` and `1.71x` from `20K → 40K`, below the `2.5x` scaling limit.
 | Apple M4 Pro | 24.16.0 | Direct `lint()` remove | 1,000 | 103.54 ms | 104.16 ms | 105.47 ms |
 | Apple M4 Pro | 24.16.0 | Direct `inventorySource()` | 1,000 | 773.09 µs | 791.92 µs | 877.21 µs |
 | Apple M4 Pro | 24.16.0 | Direct `lint()` sparse analyzer | 1,000 | 94.18 ms | 94.23 ms | 95.44 ms |
+| Apple M4 Pro | 24.22.1 | TypeScript 7.1 direct `lint()` cold read, no cache (generated) | 1,000 | 92 ms | — | — |
+| Apple M4 Pro | 24.22.1 | TypeScript 7.1 direct `lint()` cold read, no cache (generated) | 10,000 | 389 ms | — | — |
+| Apple M4 Pro | 24.22.1 | TypeScript 7.1 direct `lint()` cold read, no cache (300-file react-i18next hook project) | — | 298 ms | — | — |
+
+The minute-scale rows use one measured mitata sample after its calibration call. Synthetic removal grows `1.43x` from `10K -> 20K` and `1.71x` from `20K -> 40K`, below the `2.5x` scaling limit.
+
+The Node 24.16.0 rows were measured on 0.2.x with TypeScript 6, where warm cached runs also reused the `.tsbuildinfo` compiler cache. That cache was removed in 1.0, so warm runs now reuse only per-file analysis results.
+
+The TypeScript 7.1 rows report the median of three cold direct `lint()` calls without cache in the Average column. On the same machine, v0.2.2 measured 211 ms for 1,000 generated keys, 1163 ms for 10,000 generated keys, and 776 ms for the react-i18next hook project. Fixture output is identical to v0.2.2.
